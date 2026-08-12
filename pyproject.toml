@@ -1,0 +1,34 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "restricted-decision-trees"
+version = "0.1.0"
+description = "Native C++ implementation of Restricted Decision Trees (RDT), a depth-by-depth greedy decision tree for staged decision systems"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [
+    { name = "Amrit Nath Mishra" },
+]
+keywords = ["decision-tree", "machine-learning", "interpretable-ml", "staged-decision-systems"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["numpy>=1.19"]
+
+[project.urls]
+Homepage = "https://github.com/amritnm/restricted-decision-trees"
+Repository = "https://github.com/amritnm/restricted-decision-trees"
+
+[tool.scikit-build]
+wheel.packages = ["python/rdt"]
+build.verbose = true
+logging.level = "INFO"

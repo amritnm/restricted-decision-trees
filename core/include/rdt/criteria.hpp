@@ -22,90 +22,128 @@
 // sum-of-squares are updated incrementally while sweeping the split point,
 // instead of re-scanning all n samples with a boolean mask for every
 // candidate threshold the way the Python reference does.
+//
+// Every criterion function accepts an optional `weights` (nullptr = every
+// sample has weight 1.0, which is arithmetically identical to the original
+// unweighted formulas -- verified by the existing Catch2/pytest suites
+// passing unchanged). `min_samples_split`/`min_samples_leaf` stay literal
+// sample *counts*, unaffected by weights, matching sklearn's convention
+// (weighted-count leaf constraints are a separate, not-yet-added parameter).
 namespace rdt {
 
-inline double gini_from_counts(const std::vector<long long>& counts, std::size_t n) {
-    if (n == 0) return 0.0;
+inline double gini_from_counts(const std::vector<double>& weighted_counts, double total_weight) {
+    if (total_weight <= 0.0) return 0.0;
     double sum_sq = 0.0;
-    for (long long c : counts) {
-        double p = static_cast<double>(c) / static_cast<double>(n);
+    for (double c : weighted_counts) {
+        double p = c / total_weight;
         sum_sq += p * p;
     }
     return 1.0 - sum_sq;
 }
 
-inline double entropy_from_counts(const std::vector<long long>& counts, std::size_t n) {
-    if (n == 0) return 0.0;
+inline double entropy_from_counts(const std::vector<double>& weighted_counts, double total_weight) {
+    if (total_weight <= 0.0) return 0.0;
     double h = 0.0;
-    for (long long c : counts) {
-        double p = static_cast<double>(c) / static_cast<double>(n);
+    for (double c : weighted_counts) {
+        double p = c / total_weight;
         h -= p * std::log2(p + 1e-10);
     }
     return h;
 }
 
-inline double mse_from_sums(double sum, double sum_sq, std::size_t n) {
-    if (n == 0) return 0.0;
-    double mean = sum / static_cast<double>(n);
-    return sum_sq / static_cast<double>(n) - mean * mean;
+inline double mse_from_sums(double weighted_sum, double weighted_sum_sq, double total_weight) {
+    if (total_weight <= 0.0) return 0.0;
+    double mean = weighted_sum / total_weight;
+    return weighted_sum_sq / total_weight - mean * mean;
 }
 
-inline double mae_from_values(std::vector<double> values) {
-    if (values.empty()) return 0.0;
-    std::sort(values.begin(), values.end());
-    std::size_t n = values.size();
-    double median = (n % 2 == 1)
-        ? values[n / 2]
-        : (values[n / 2 - 1] + values[n / 2]) / 2.0;
+// `value_weight` need not be pre-sorted; sorted internally by value.
+// Reduces exactly to the unweighted median (average-the-two-middle-values
+// for even n) when every weight is 1.0.
+inline double mae_from_weighted_values(std::vector<std::pair<double, double>> value_weight) {
+    if (value_weight.empty()) return 0.0;
+    std::sort(value_weight.begin(), value_weight.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    double total_weight = 0.0;
+    for (const auto& vw : value_weight) total_weight += vw.second;
+    if (total_weight <= 0.0) return 0.0;
+
+    const double half = total_weight / 2.0;
+    double median = value_weight.back().first;
+    double cum = 0.0;
+    for (std::size_t i = 0; i < value_weight.size(); ++i) {
+        cum += value_weight[i].second;
+        if (cum > half) {
+            median = value_weight[i].first;
+            break;
+        }
+        if (cum == half) {
+            median = (i + 1 < value_weight.size())
+                ? (value_weight[i].first + value_weight[i + 1].first) / 2.0
+                : value_weight[i].first;
+            break;
+        }
+    }
+
     double total = 0.0;
-    for (double v : values) total += std::abs(v - median);
-    return total / static_cast<double>(n);
+    for (const auto& vw : value_weight) total += vw.second * std::abs(vw.first - median);
+    return total / total_weight;
 }
 
 // Public, testable impurity functions operating on an arbitrary index list.
 // Not used in the hot threshold-search loop (see find_best_threshold below),
 // which maintains equivalent running aggregates incrementally instead.
-inline double gini(const VectorView& y, const std::vector<std::uint32_t>& indices) {
-    std::unordered_map<double, long long> class_counts;
-    for (auto idx : indices) class_counts[y[idx]]++;
-    std::vector<long long> counts;
+inline double gini(const VectorView& y, const std::vector<std::uint32_t>& indices,
+                    const VectorView* weights = nullptr) {
+    std::unordered_map<double, double> class_counts;
+    for (auto idx : indices) class_counts[y[idx]] += weights ? (*weights)[idx] : 1.0;
+    std::vector<double> counts;
     counts.reserve(class_counts.size());
-    for (auto& kv : class_counts) counts.push_back(kv.second);
-    return gini_from_counts(counts, indices.size());
+    double total = 0.0;
+    for (auto& kv : class_counts) { counts.push_back(kv.second); total += kv.second; }
+    return gini_from_counts(counts, total);
 }
 
-inline double entropy(const VectorView& y, const std::vector<std::uint32_t>& indices) {
-    std::unordered_map<double, long long> class_counts;
-    for (auto idx : indices) class_counts[y[idx]]++;
-    std::vector<long long> counts;
+inline double entropy(const VectorView& y, const std::vector<std::uint32_t>& indices,
+                       const VectorView* weights = nullptr) {
+    std::unordered_map<double, double> class_counts;
+    for (auto idx : indices) class_counts[y[idx]] += weights ? (*weights)[idx] : 1.0;
+    std::vector<double> counts;
     counts.reserve(class_counts.size());
-    for (auto& kv : class_counts) counts.push_back(kv.second);
-    return entropy_from_counts(counts, indices.size());
+    double total = 0.0;
+    for (auto& kv : class_counts) { counts.push_back(kv.second); total += kv.second; }
+    return entropy_from_counts(counts, total);
 }
 
-inline double mse(const VectorView& y, const std::vector<std::uint32_t>& indices) {
-    double sum = 0.0, sum_sq = 0.0;
+inline double mse(const VectorView& y, const std::vector<std::uint32_t>& indices,
+                   const VectorView* weights = nullptr) {
+    double sum = 0.0, sum_sq = 0.0, total_weight = 0.0;
     for (auto idx : indices) {
         double v = y[idx];
-        sum += v;
-        sum_sq += v * v;
+        double w = weights ? (*weights)[idx] : 1.0;
+        sum += w * v;
+        sum_sq += w * v * v;
+        total_weight += w;
     }
-    return mse_from_sums(sum, sum_sq, indices.size());
+    return mse_from_sums(sum, sum_sq, total_weight);
 }
 
-inline double mae(const VectorView& y, const std::vector<std::uint32_t>& indices) {
-    std::vector<double> values;
-    values.reserve(indices.size());
-    for (auto idx : indices) values.push_back(y[idx]);
-    return mae_from_values(std::move(values));
+inline double mae(const VectorView& y, const std::vector<std::uint32_t>& indices,
+                   const VectorView* weights = nullptr) {
+    std::vector<std::pair<double, double>> value_weight;
+    value_weight.reserve(indices.size());
+    for (auto idx : indices) value_weight.emplace_back(y[idx], weights ? (*weights)[idx] : 1.0);
+    return mae_from_weighted_values(std::move(value_weight));
 }
 
-inline double impurity(Criterion c, const VectorView& y, const std::vector<std::uint32_t>& indices) {
+inline double impurity(Criterion c, const VectorView& y, const std::vector<std::uint32_t>& indices,
+                        const VectorView* weights = nullptr) {
     switch (c) {
-        case Criterion::Gini: return gini(y, indices);
-        case Criterion::Entropy: return entropy(y, indices);
-        case Criterion::MSE: return mse(y, indices);
-        case Criterion::MAE: return mae(y, indices);
+        case Criterion::Gini: return gini(y, indices, weights);
+        case Criterion::Entropy: return entropy(y, indices, weights);
+        case Criterion::MSE: return mse(y, indices, weights);
+        case Criterion::MAE: return mae(y, indices, weights);
     }
     return 0.0;
 }
@@ -117,7 +155,9 @@ struct ThresholdResult {
 };
 
 // Best split threshold (and its impurity improvement) for one feature at one
-// node. `indices` are the sample indices belonging to the node.
+// node. `indices` are the sample indices belonging to the node. `weights`
+// (nullptr = uniform 1.0) are indexed the same way as `y`/`X`, i.e. by the
+// original sample index, not by position within `indices`.
 inline ThresholdResult find_best_threshold(
     const MatrixView& X,
     const VectorView& y,
@@ -125,19 +165,22 @@ inline ThresholdResult find_best_threshold(
     int feature_idx,
     Criterion criterion,
     int min_samples_split,
-    int min_samples_leaf) {
+    int min_samples_leaf,
+    const VectorView* weights = nullptr) {
 
     ThresholdResult result;
     const std::size_t n = indices.size();
     if (static_cast<int>(n) < min_samples_split) return result;
 
-    std::vector<std::pair<double, double>> pairs; // (feature_value, y_value)
-    pairs.reserve(n);
-    for (auto idx : indices) pairs.emplace_back(X(idx, feature_idx), y[idx]);
-    std::sort(pairs.begin(), pairs.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
+    struct SamplePoint { double x, y, w; };
+    std::vector<SamplePoint> pts;
+    pts.reserve(n);
+    for (auto idx : indices) {
+        pts.push_back({X(idx, feature_idx), y[idx], weights ? (*weights)[idx] : 1.0});
+    }
+    std::sort(pts.begin(), pts.end(), [](const auto& a, const auto& b) { return a.x < b.x; });
 
-    if (pairs.front().first == pairs.back().first) return result; // < 2 unique values
+    if (pts.front().x == pts.back().x) return result; // < 2 unique values
 
     double best_improvement = -std::numeric_limits<double>::infinity();
     double best_threshold = 0.0;
@@ -146,35 +189,40 @@ inline ThresholdResult find_best_threshold(
     if (criterion == Criterion::Gini || criterion == Criterion::Entropy) {
         std::unordered_map<double, int> class_index;
         std::vector<int> sample_class(n);
-        std::vector<long long> total_counts;
+        std::vector<double> total_counts;
         for (std::size_t i = 0; i < n; ++i) {
-            double label = pairs[i].second;
+            double label = pts[i].y;
             auto it = class_index.find(label);
             int idx;
             if (it == class_index.end()) {
                 idx = static_cast<int>(total_counts.size());
                 class_index.emplace(label, idx);
-                total_counts.push_back(0);
+                total_counts.push_back(0.0);
             } else {
                 idx = it->second;
             }
             sample_class[i] = idx;
-            total_counts[idx]++;
+            total_counts[idx] += pts[i].w;
         }
+        double total_weight = 0.0;
+        for (double c : total_counts) total_weight += c;
 
         const double parent_impurity = (criterion == Criterion::Gini)
-            ? gini_from_counts(total_counts, n)
-            : entropy_from_counts(total_counts, n);
+            ? gini_from_counts(total_counts, total_weight)
+            : entropy_from_counts(total_counts, total_weight);
 
-        std::vector<long long> left_counts(total_counts.size(), 0);
-        std::vector<long long> right_counts = total_counts;
+        std::vector<double> left_counts(total_counts.size(), 0.0);
+        std::vector<double> right_counts = total_counts;
+        double left_weight = 0.0, right_weight = total_weight;
 
         for (std::size_t i = 0; i + 1 < n; ++i) {
             int cls = sample_class[i];
-            left_counts[cls]++;
-            right_counts[cls]--;
+            left_counts[cls] += pts[i].w;
+            right_counts[cls] -= pts[i].w;
+            left_weight += pts[i].w;
+            right_weight -= pts[i].w;
 
-            if (pairs[i].first == pairs[i + 1].first) continue; // not a real boundary
+            if (pts[i].x == pts[i + 1].x) continue; // not a real boundary
 
             std::size_t n_left = i + 1;
             std::size_t n_right = n - n_left;
@@ -182,36 +230,38 @@ inline ThresholdResult find_best_threshold(
                 static_cast<int>(n_right) < min_samples_leaf) continue;
 
             double left_imp = (criterion == Criterion::Gini)
-                ? gini_from_counts(left_counts, n_left)
-                : entropy_from_counts(left_counts, n_left);
+                ? gini_from_counts(left_counts, left_weight)
+                : entropy_from_counts(left_counts, left_weight);
             double right_imp = (criterion == Criterion::Gini)
-                ? gini_from_counts(right_counts, n_right)
-                : entropy_from_counts(right_counts, n_right);
+                ? gini_from_counts(right_counts, right_weight)
+                : entropy_from_counts(right_counts, right_weight);
 
-            double weighted = (static_cast<double>(n_left) / n) * left_imp +
-                               (static_cast<double>(n_right) / n) * right_imp;
+            double weighted = (left_weight / total_weight) * left_imp +
+                               (right_weight / total_weight) * right_imp;
             double improvement = parent_impurity - weighted;
 
             if (improvement > best_improvement) {
                 best_improvement = improvement;
-                best_threshold = (pairs[i].first + pairs[i + 1].first) / 2.0;
+                best_threshold = (pts[i].x + pts[i + 1].x) / 2.0;
                 any_valid = true;
             }
         }
     } else if (criterion == Criterion::MSE) {
-        double total_sum = 0.0, total_sum_sq = 0.0;
+        double total_sum = 0.0, total_sum_sq = 0.0, total_weight = 0.0;
         for (std::size_t i = 0; i < n; ++i) {
-            total_sum += pairs[i].second;
-            total_sum_sq += pairs[i].second * pairs[i].second;
+            total_sum += pts[i].w * pts[i].y;
+            total_sum_sq += pts[i].w * pts[i].y * pts[i].y;
+            total_weight += pts[i].w;
         }
-        const double parent_impurity = mse_from_sums(total_sum, total_sum_sq, n);
+        const double parent_impurity = mse_from_sums(total_sum, total_sum_sq, total_weight);
 
-        double left_sum = 0.0, left_sum_sq = 0.0;
+        double left_sum = 0.0, left_sum_sq = 0.0, left_weight = 0.0;
         for (std::size_t i = 0; i + 1 < n; ++i) {
-            left_sum += pairs[i].second;
-            left_sum_sq += pairs[i].second * pairs[i].second;
+            left_sum += pts[i].w * pts[i].y;
+            left_sum_sq += pts[i].w * pts[i].y * pts[i].y;
+            left_weight += pts[i].w;
 
-            if (pairs[i].first == pairs[i + 1].first) continue;
+            if (pts[i].x == pts[i + 1].x) continue;
 
             std::size_t n_left = i + 1;
             std::size_t n_right = n - n_left;
@@ -220,46 +270,52 @@ inline ThresholdResult find_best_threshold(
 
             double right_sum = total_sum - left_sum;
             double right_sum_sq = total_sum_sq - left_sum_sq;
+            double right_weight = total_weight - left_weight;
 
-            double left_imp = mse_from_sums(left_sum, left_sum_sq, n_left);
-            double right_imp = mse_from_sums(right_sum, right_sum_sq, n_right);
+            double left_imp = mse_from_sums(left_sum, left_sum_sq, left_weight);
+            double right_imp = mse_from_sums(right_sum, right_sum_sq, right_weight);
 
-            double weighted = (static_cast<double>(n_left) / n) * left_imp +
-                               (static_cast<double>(n_right) / n) * right_imp;
+            double weighted = (left_weight / total_weight) * left_imp +
+                               (right_weight / total_weight) * right_imp;
             double improvement = parent_impurity - weighted;
 
             if (improvement > best_improvement) {
                 best_improvement = improvement;
-                best_threshold = (pairs[i].first + pairs[i + 1].first) / 2.0;
+                best_threshold = (pts[i].x + pts[i + 1].x) / 2.0;
                 any_valid = true;
             }
         }
-    } else { // MAE: no cheap incremental update for the median; slice + recompute.
-        std::vector<double> all_y(n);
-        for (std::size_t i = 0; i < n; ++i) all_y[i] = pairs[i].second;
-        const double parent_impurity = mae_from_values(all_y);
+    } else { // MAE: no cheap incremental update for the weighted median; slice + recompute.
+        std::vector<std::pair<double, double>> all_vw(n);
+        for (std::size_t i = 0; i < n; ++i) all_vw[i] = {pts[i].y, pts[i].w};
+        const double parent_impurity = mae_from_weighted_values(all_vw);
 
         for (std::size_t i = 0; i + 1 < n; ++i) {
-            if (pairs[i].first == pairs[i + 1].first) continue;
+            if (pts[i].x == pts[i + 1].x) continue;
 
             std::size_t n_left = i + 1;
             std::size_t n_right = n - n_left;
             if (static_cast<int>(n_left) < min_samples_leaf ||
                 static_cast<int>(n_right) < min_samples_leaf) continue;
 
-            std::vector<double> left_vals(all_y.begin(), all_y.begin() + n_left);
-            std::vector<double> right_vals(all_y.begin() + n_left, all_y.end());
+            std::vector<std::pair<double, double>> left_vw(all_vw.begin(), all_vw.begin() + n_left);
+            std::vector<std::pair<double, double>> right_vw(all_vw.begin() + n_left, all_vw.end());
 
-            double left_imp = mae_from_values(std::move(left_vals));
-            double right_imp = mae_from_values(std::move(right_vals));
+            double left_weight = 0.0, right_weight = 0.0;
+            for (const auto& vw : left_vw) left_weight += vw.second;
+            for (const auto& vw : right_vw) right_weight += vw.second;
+            double total_weight = left_weight + right_weight;
 
-            double weighted = (static_cast<double>(n_left) / n) * left_imp +
-                               (static_cast<double>(n_right) / n) * right_imp;
+            double left_imp = mae_from_weighted_values(std::move(left_vw));
+            double right_imp = mae_from_weighted_values(std::move(right_vw));
+
+            double weighted = (left_weight / total_weight) * left_imp +
+                               (right_weight / total_weight) * right_imp;
             double improvement = parent_impurity - weighted;
 
             if (improvement > best_improvement) {
                 best_improvement = improvement;
-                best_threshold = (pairs[i].first + pairs[i + 1].first) / 2.0;
+                best_threshold = (pts[i].x + pts[i + 1].x) / 2.0;
                 any_valid = true;
             }
         }

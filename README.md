@@ -31,6 +31,8 @@ This constraint provides:
 - ✅ Classification (binary & multi-class) and regression
 - ✅ Multiple splitting criteria: Gini, entropy, MSE, MAE
 - ✅ Probability predictions (`predict_proba`)
+- ✅ Random Forest and Gradient Boosting ensembles (`rdt.ensemble`), with real
+  cross-tree parallelism and a parameter surface matching scikit-learn/XGBoost/LightGBM
 - ✅ Interactive D3.js tree visualization, plain-text tree printing, and JSON export
 - ✅ Native C++ core — validated for exact output parity (predictions, per-depth
   feature choice, probabilities) against the project's original Cython
@@ -81,6 +83,42 @@ tree_dict = export_tree_dict(model, y, feature_names=["x"])
 See `examples/basic_usage.py` and `examples/d3_visualization_demo.py` for
 fuller, runnable examples.
 
+### Ensembles
+
+```python
+from rdt.ensemble import RandomForestRDT, GradientBoostingRDT
+
+rf = RandomForestRDT(n_estimators=100, max_depth=4, oob_score=True, n_jobs=-1)
+rf.fit(X_train, y_train)
+rf.predict(X_test)
+rf.feature_importances_
+rf.oob_score_
+
+gb = GradientBoostingRDT(n_estimators=100, learning_rate=0.1, max_depth=3,
+                          validation_fraction=0.15, n_iter_no_change=10)  # early stopping
+gb.fit(X_train, y_train)
+gb.predict(X_test)
+```
+
+Parameter names follow scikit-learn where a concept maps directly to a
+scikit-learn parameter; where XGBoost/LightGBM use a different name for the
+same concept (`colsample_bytree`, `gamma`, `min_child_weight`,
+`early_stopping_rounds`, ...) that name is accepted as an alias — setting
+both names to conflicting values raises. See `rdt/ensemble.py`'s module
+docstring for the full mapping, including the two places where RDT's
+structural constraint (every node at a depth splits on the same feature)
+means a parameter can't work exactly like it does elsewhere:
+
+- **`max_features`/`colsample_bytree`** can't be resampled *per node* the
+  way scikit-learn/XGBoost do it — each tree gets one random column subset
+  chosen once, before that tree is fit.
+- **`reg_alpha`/`reg_lambda`** (`GradientBoostingRDT` only) are a real
+  effect (post-hoc leaf-value soft-thresholding/shrinkage) but not XGBoost's
+  exact Newton/hessian-derived formula — this engine boosts first-order
+  (Friedman-style), not second-order.
+
+See `examples/ensemble_usage.py` for a fuller, runnable example.
+
 ## API reference
 
 ### `rdt.RDT(task="classification", criterion=None, max_depth=5, min_samples_split=2, min_samples_leaf=1)`
@@ -109,6 +147,30 @@ fuller, runnable examples.
 - `root` — the fitted tree's root `Node` (`.is_leaf`, `.split_feature`,
   `.split_threshold`, `.value`, `.class_counts`, `.left`, `.right`, `.indices`)
   for direct programmatic inspection.
+
+### `rdt.ensemble.RandomForestRDT`
+
+Bagging ensemble: `n_estimators`, `task`, `criterion`, `max_depth`,
+`min_samples_split`, `min_samples_leaf` (alias `min_child_weight`),
+`min_impurity_decrease` (alias `gamma`), `max_features` (alias
+`colsample_bytree`), `bootstrap`, `max_samples`, `oob_score`, `class_weight`
+(`'balanced'` or dict), `random_state`, `n_jobs`. After fitting:
+`estimators_` (list of `RDT`, individually introspectable),
+`feature_importances_`, `oob_score_` (if requested).
+
+### `rdt.ensemble.GradientBoostingRDT`
+
+First-order boosting: `n_estimators`, `task`, `loss` (classification:
+`'log_loss'`, `'exponential'`; regression: `'squared_error'`,
+`'absolute_error'`, `'huber'`, `'quantile'`), `learning_rate`, `max_depth`,
+`min_samples_split`, `min_samples_leaf` (alias `min_child_weight`),
+`min_impurity_decrease` (alias `gamma`), `subsample`, `max_features` (alias
+`colsample_bytree`), `validation_fraction`, `n_iter_no_change` (alias
+`early_stopping_rounds`), `tol`, `reg_alpha`, `reg_lambda`,
+`scale_pos_weight` (binary only), `huber_delta`, `quantile_alpha`,
+`random_state`, `n_jobs`. After fitting: `feature_importances_`,
+`train_score_` (loss per round), `n_estimators_` (rounds actually fitted —
+less than `n_estimators` if early stopping triggered).
 
 ### `rdt.visualize`
 
@@ -151,10 +213,12 @@ restricted-decision-trees/
 ├── src/bindings.cpp                    # nanobind bindings
 ├── python/rdt/
 │   ├── __init__.py                     # RDT (sklearn-style wrapper)
+│   ├── ensemble.py                     # RandomForestRDT / GradientBoostingRDT
 │   └── visualize.py                    # print_tree / D3 viz / JSON export
 ├── tests/                              # pytest unit tests
 └── examples/
     ├── basic_usage.py
+    ├── ensemble_usage.py
     └── d3_visualization_demo.py
 ```
 

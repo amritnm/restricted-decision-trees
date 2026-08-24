@@ -37,6 +37,11 @@ struct TreeParams {
     int max_depth = 5;
     int min_samples_split = 2;
     int min_samples_leaf = 1;
+    // A depth's winning feature is only committed if its total improvement
+    // meets this threshold; otherwise every node at that depth becomes a
+    // leaf. sklearn calls this min_impurity_decrease; XGBoost/LightGBM call
+    // the equivalent gamma/min_split_loss.
+    double min_impurity_decrease = 0.0;
 };
 
 } // namespace rdt

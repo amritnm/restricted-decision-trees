@@ -19,8 +19,11 @@ jobs:
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.21
         env:
-          CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-* cp313-*"
-          CIBW_SKIP: "*-musllinux* *_i686 pp*"
+          # cp39 dropped: EOL upstream, and it's also the specific version
+          # that failed to cross-build for macOS arm64 in CI (see commit
+          # history). *_i686/win32 skipped: no reason to support 32-bit.
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
+          CIBW_SKIP: "*-musllinux* *_i686 *-win32 pp*"
           CIBW_BUILD_VERBOSITY: 1
 
       - uses: actions/upload-artifact@v4

@@ -51,10 +51,25 @@ inline double entropy_from_counts(const std::vector<double>& weighted_counts, do
     return h;
 }
 
+// Pass sums of values *centred* near their mean (see find_best_threshold's
+// MSE branch): E[y^2] - E[y]^2 on raw values cancels catastrophically once
+// |mean| >> spread (targets around 1e8 with unit spread lose every digit).
 inline double mse_from_sums(double weighted_sum, double weighted_sum_sq, double total_weight) {
     if (total_weight <= 0.0) return 0.0;
     double mean = weighted_sum / total_weight;
-    return weighted_sum_sq / total_weight - mean * mean;
+    return std::max(0.0, weighted_sum_sq / total_weight - mean * mean);
+}
+
+// Threshold for a split between consecutive distinct sorted values a < b,
+// applied as `x <= threshold` -> left. Normally the midpoint (computed as
+// a/2 + b/2 so it cannot overflow), but -- scikit-learn's rule -- when that
+// is not strictly inside [a, b) (rounds up to b for adjacent doubles, or is
+// non-finite) use a itself. Either way exactly the values <= a go left, so
+// the partition committed by split_indices()/predict() is the one scored.
+inline double split_threshold(double a, double b) {
+    double t = a / 2.0 + b / 2.0;
+    if (!(t >= a && t < b)) t = a;
+    return t;
 }
 
 // `value_weight` need not be pre-sorted; sorted internally by value.
@@ -118,13 +133,19 @@ inline double entropy(const VectorView& y, const std::vector<std::uint32_t>& ind
 
 inline double mse(const VectorView& y, const std::vector<std::uint32_t>& indices,
                    const VectorView* weights = nullptr) {
-    double sum = 0.0, sum_sq = 0.0, total_weight = 0.0;
+    double raw_sum = 0.0, total_weight = 0.0;
     for (auto idx : indices) {
-        double v = y[idx];
         double w = weights ? (*weights)[idx] : 1.0;
-        sum += w * v;
-        sum_sq += w * v * v;
+        raw_sum += w * y[idx];
         total_weight += w;
+    }
+    const double center = total_weight > 0.0 ? raw_sum / total_weight : 0.0;
+    double sum = 0.0, sum_sq = 0.0;
+    for (auto idx : indices) {
+        double d = y[idx] - center;
+        double w = weights ? (*weights)[idx] : 1.0;
+        sum += w * d;
+        sum_sq += w * d * d;
     }
     return mse_from_sums(sum, sum_sq, total_weight);
 }
@@ -242,16 +263,26 @@ inline ThresholdResult find_best_threshold(
 
             if (improvement > best_improvement) {
                 best_improvement = improvement;
-                best_threshold = (pts[i].x + pts[i + 1].x) / 2.0;
+                best_threshold = split_threshold(pts[i].x, pts[i + 1].x);
                 any_valid = true;
             }
         }
     } else if (criterion == Criterion::MSE) {
-        double total_sum = 0.0, total_sum_sq = 0.0, total_weight = 0.0;
+        // Running sums are kept on targets centred at the node's weighted
+        // mean (two passes): variance is shift-invariant, and centring
+        // removes the large-offset cancellation in mse_from_sums.
+        double raw_sum = 0.0, total_weight = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            raw_sum += pts[i].w * pts[i].y;
+            total_weight += pts[i].w;
+        }
+        const double center = total_weight > 0.0 ? raw_sum / total_weight : 0.0;
+        for (auto& p : pts) p.y -= center;
+
+        double total_sum = 0.0, total_sum_sq = 0.0;
         for (std::size_t i = 0; i < n; ++i) {
             total_sum += pts[i].w * pts[i].y;
             total_sum_sq += pts[i].w * pts[i].y * pts[i].y;
-            total_weight += pts[i].w;
         }
         const double parent_impurity = mse_from_sums(total_sum, total_sum_sq, total_weight);
 
@@ -281,7 +312,7 @@ inline ThresholdResult find_best_threshold(
 
             if (improvement > best_improvement) {
                 best_improvement = improvement;
-                best_threshold = (pts[i].x + pts[i + 1].x) / 2.0;
+                best_threshold = split_threshold(pts[i].x, pts[i + 1].x);
                 any_valid = true;
             }
         }
@@ -315,7 +346,7 @@ inline ThresholdResult find_best_threshold(
 
             if (improvement > best_improvement) {
                 best_improvement = improvement;
-                best_threshold = (pts[i].x + pts[i + 1].x) / 2.0;
+                best_threshold = split_threshold(pts[i].x, pts[i + 1].x);
                 any_valid = true;
             }
         }

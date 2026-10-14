@@ -71,6 +71,45 @@ struct PresortedView {
     std::size_t n_entries = 0;
 };
 
+// Sorts `rows` by each column cols[j] of X (value ascending, NaN last, row
+// id ascending) and writes the encoded entries to out[j][0..rows.size()).
+// For wide X, columns are gathered a block at a time so a row-major X is read
+// a cache line at a time rather than one strided double at a time. The
+// transient buffer is 16 bytes per (row, column of a block); the block is at
+// most X.n_cols() / 4 columns (so the buffer never exceeds the 4 bytes per
+// (row, column) of the result) and at most 8.
+template <class Matrix>
+void presort_columns(const Matrix& X, const std::vector<std::uint32_t>& rows,
+                     const std::vector<std::size_t>& cols, const std::vector<std::uint32_t*>& out) {
+    struct KeyRow {
+        std::uint64_t key;
+        std::uint32_t row;
+    };
+    constexpr std::uint64_t kNaNKey = ~std::uint64_t{0};
+    const std::size_t block = std::min<std::size_t>(8, std::max<std::size_t>(1, X.n_cols() / 4));
+    const std::size_t n = rows.size();
+    std::vector<std::vector<KeyRow>> buf(std::min(block, cols.size()));
+    for (auto& b : buf) b.resize(n);
+    for (std::size_t c0 = 0; c0 < cols.size(); c0 += block) {
+        const std::size_t nb = std::min(block, cols.size() - c0);
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint32_t r = rows[i];
+            for (std::size_t j = 0; j < nb; ++j) buf[j][i] = {presort_key(X(r, cols[c0 + j])), r};
+        }
+        for (std::size_t j = 0; j < nb; ++j) {
+            auto& v = buf[j];
+            std::sort(v.begin(), v.end(), [](const KeyRow& a, const KeyRow& b) {
+                return a.key < b.key || (a.key == b.key && a.row < b.row);
+            });
+            std::uint32_t* o = out[c0 + j];
+            for (std::size_t k = 0; k < n; ++k) {
+                const bool new_value = k == 0 || v[k].key != v[k - 1].key || v[k].key == kNaNKey;
+                o[k] = v[k].row | (new_value ? kPresortNewValue : 0u);
+            }
+        }
+    }
+}
+
 // Owning presorted orders: for every column of X, the given rows sorted by
 // (value ascending, NaN last, row id ascending), encoded as above.
 // 4 bytes per (row, column).
@@ -136,39 +175,53 @@ private:
 
     template <class Matrix>
     void build(const Matrix& X, const std::vector<std::uint32_t>& rows) {
-        struct KeyRow {
-            std::uint64_t key;
-            std::uint32_t row;
-        };
-        constexpr std::uint64_t kNaNKey = ~std::uint64_t{0};
-        // Gather a few columns per pass over the rows so a row-major X is
-        // read a cache line at a time rather than one strided double at a
-        // time.
-        constexpr std::size_t kBlock = 8;
-
         n_entries_ = rows.size();
         n_cols_ = X.n_cols();
         data_.assign(n_entries_ * n_cols_, 0u);
-        std::vector<std::vector<KeyRow>> buf(std::min(kBlock, n_cols_), std::vector<KeyRow>(n_entries_));
-        for (std::size_t c0 = 0; c0 < n_cols_; c0 += kBlock) {
-            const std::size_t nb = std::min(kBlock, n_cols_ - c0);
-            for (std::size_t i = 0; i < n_entries_; ++i) {
-                const std::uint32_t r = rows[i];
-                for (std::size_t j = 0; j < nb; ++j) buf[j][i] = {presort_key(X(r, c0 + j)), r};
-            }
-            for (std::size_t j = 0; j < nb; ++j) {
-                auto& v = buf[j];
-                std::sort(v.begin(), v.end(), [](const KeyRow& a, const KeyRow& b) {
-                    return a.key < b.key || (a.key == b.key && a.row < b.row);
-                });
-                std::uint32_t* out = data_.data() + (c0 + j) * n_entries_;
-                for (std::size_t k = 0; k < n_entries_; ++k) {
-                    const bool new_value = k == 0 || v[k].key != v[k - 1].key || v[k].key == kNaNKey;
-                    out[k] = v[k].row | (new_value ? kPresortNewValue : 0u);
-                }
-            }
+        std::vector<std::size_t> cols(n_cols_);
+        std::vector<std::uint32_t*> out(n_cols_);
+        for (std::size_t c = 0; c < n_cols_; ++c) {
+            cols[c] = c;
+            out[c] = data_.data() + c * n_entries_;
         }
+        presort_columns(X, rows, cols, out);
     }
+};
+
+// Presorted orders of a fixed set of rows, computed per column on first
+// use. Gradient boosting with column subsampling then sorts (and keeps) only
+// the columns its rounds actually draw. ensure() is not thread-safe; views
+// of ensured columns may be read concurrently.
+class LazySortedColumns {
+public:
+    LazySortedColumns(const MatrixView& X, std::vector<std::uint32_t> rows)
+        : X_(X), rows_(std::move(rows)), cols_(X.n_cols()) {}
+
+    void ensure(const std::vector<std::uint32_t>& cols) {
+        std::vector<std::size_t> todo;
+        std::vector<std::uint32_t*> out;
+        for (auto c : cols) {
+            if (!cols_[c].empty() || rows_.empty()) continue;
+            cols_[c].resize(rows_.size());
+            todo.push_back(c);
+            out.push_back(cols_[c].data());
+        }
+        if (!todo.empty()) presort_columns(X_, rows_, todo, out);
+    }
+
+    // Columns `cols` (all ensured) in that order.
+    PresortedView view(const std::vector<std::uint32_t>& cols) const {
+        PresortedView v;
+        v.n_entries = rows_.size();
+        v.columns.reserve(cols.size());
+        for (auto c : cols) v.columns.push_back(cols_[c].data());
+        return v;
+    }
+
+private:
+    MatrixView X_;
+    std::vector<std::uint32_t> rows_;
+    std::vector<std::vector<std::uint32_t>> cols_;
 };
 
 // What the presorted search needs per row, indexed by row id.
@@ -234,11 +287,13 @@ public:
 
 private:
     struct Item {
-        double y;
+        union {
+            double y;          // regression (MSE)
+            std::int64_t cls;  // classification: index into the classes
+        };
         double w;
         std::uint32_t row;
         std::uint32_t run; // index of the row's run of equal values in the sorted column
-        std::int32_t cls;
     };
 
     Criterion criterion_;
@@ -257,6 +312,7 @@ private:
     }
 
     void gather(const std::uint32_t* sorted, std::size_t n_entries, const ScanRow* rows) {
+        const bool mse = criterion_ == Criterion::MSE;
         for (std::size_t k = 0; k < cursor_.size(); ++k) cursor_[k] = node_begin_[k];
         std::uint32_t run = 0;
         for (std::size_t i = 0; i < n_entries; ++i) {
@@ -265,7 +321,15 @@ private:
             const std::uint32_t row = e & kPresortRowMask;
             const ScanRow& r = rows[row];
             if (r.node < 0) continue;
-            items_[cursor_[static_cast<std::size_t>(r.node)]++] = Item{r.y, r.w, row, run, r.cls};
+            Item& item = items_[cursor_[static_cast<std::size_t>(r.node)]++];
+            if (mse) {
+                item.y = r.y;
+            } else {
+                item.cls = r.cls;
+            }
+            item.w = r.w;
+            item.row = row;
+            item.run = run;
         }
     }
 

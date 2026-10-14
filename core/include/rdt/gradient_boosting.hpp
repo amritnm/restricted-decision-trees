@@ -119,13 +119,14 @@ public:
         const std::size_t n_est = static_cast<std::size_t>(params_.n_estimators);
         ThreadPool pool(resolve_n_jobs(params_.n_jobs));
 
-        // Every round's trees are fitted on a subset of train_rows, so sort
-        // each column's training rows once here (4 bytes per (training row,
-        // column) for the duration of fit()); each round derives its trees'
-        // presorted columns from these in O(n) per column (presort.hpp).
+        // Every round's trees are fitted on a subset of train_rows, so each
+        // column's training rows are sorted once per fit -- lazily, the first
+        // time a round draws the column -- and kept (4 bytes per (training
+        // row, sorted column) for the duration of fit()); each round derives
+        // its trees' presorted columns from these in O(n) per column
+        // (presort.hpp).
         const bool presort = params_.tree_params.presort && n <= kPresortMaxRows;
-        SortedColumns sorted_columns;
-        if (presort) sorted_columns = SortedColumns(X, train_rows);
+        LazySortedColumns sorted_columns(X, presort ? train_rows : std::vector<std::uint32_t>());
 
         // Negative gradient per output, indexed by sample (only train_rows
         // are written/read); reused across rounds. Replaces v0.2.0's per-round
@@ -142,19 +143,19 @@ public:
                 tp.retain_indices = false; // see TreeParams::retain_indices
                 round_trees.emplace_back(tp);
             }
+            std::vector<std::vector<std::uint32_t>> round_fit_rows(n_outputs);
             std::vector<std::vector<std::uint32_t>> round_col_subsets(n_outputs);
             std::vector<std::vector<double>> round_raw_preds(n_outputs);
 
-            pool.parallel_for(n_outputs, [&](std::size_t k) {
+            // Row / column subsets. Each (round, output) has its own seeded
+            // Rng, so drawing them here, sequentially and before the
+            // residuals, gives the same subsets as drawing them inside the
+            // parallel per-output work; it lets the columns the round needs be
+            // presorted up front, outside the threads.
+            for (std::size_t k = 0; k < n_outputs; ++k) {
                 Rng rng(derive_seed(params_.random_state, round * 1000 + k + 1));
 
-                std::vector<double>& residual_k = residual[k];
-                for (std::size_t r = 0; r < train_rows.size(); ++r) {
-                    std::uint32_t i = train_rows[r];
-                    residual_k[i] = negative_gradient(i, k, y_enc, F, n_outputs);
-                }
-
-                std::vector<std::uint32_t> fit_rows;
+                std::vector<std::uint32_t>& fit_rows = round_fit_rows[k];
                 if (params_.subsample < 1.0) {
                     std::uint32_t m = static_cast<std::uint32_t>(
                         std::max(1.0, params_.subsample * static_cast<double>(train_rows.size())));
@@ -165,15 +166,26 @@ public:
                     fit_rows = train_rows;
                 }
 
-                std::uint32_t k_features = resolve_max_features(params_.max_features, static_cast<std::uint32_t>(n_features_));
-                std::vector<std::uint32_t> col_subset;
+                std::uint32_t k_features =
+                    resolve_max_features(params_.max_features, static_cast<std::uint32_t>(n_features_));
+                std::vector<std::uint32_t>& col_subset = round_col_subsets[k];
                 if (k_features < n_features_) {
                     col_subset = rng.sample_without_replacement(static_cast<std::uint32_t>(n_features_), k_features);
                 } else {
                     col_subset.resize(n_features_);
                     for (std::uint32_t f = 0; f < n_features_; ++f) col_subset[f] = f;
                 }
-                round_col_subsets[k] = col_subset;
+                if (presort) sorted_columns.ensure(col_subset);
+            }
+
+            pool.parallel_for(n_outputs, [&](std::size_t k) {
+                std::vector<double>& residual_k = residual[k];
+                for (std::size_t r = 0; r < train_rows.size(); ++r) {
+                    std::uint32_t i = train_rows[r];
+                    residual_k[i] = negative_gradient(i, k, y_enc, F, n_outputs);
+                }
+                const std::vector<std::uint32_t>& fit_rows = round_fit_rows[k];
+                const std::vector<std::uint32_t>& col_subset = round_col_subsets[k];
 
                 // The tree sees X[fit_rows, col_subset] as a view (no copy of
                 // X); only its residuals / weights are gathered.
@@ -196,7 +208,7 @@ public:
                 SortedColumns round_sorted;
                 PresortedView presorted;
                 if (presort) {
-                    presorted = sorted_columns.view(&col_subset);
+                    presorted = sorted_columns.view(col_subset);
                     const bool all_rows = m == n; // fit_rows == 0..n-1: ids already match
                     if (!all_rows) {
                         std::vector<std::int32_t> new_id(n, -1);
@@ -209,7 +221,9 @@ public:
                                    presort ? &presorted : nullptr);
 
                 std::vector<double> raw_pred(n);
-                for (std::size_t i = 0; i < n; ++i) raw_pred[i] = round_trees[k].find_leaf(X, i, col_subset.data())->value;
+                for (std::size_t i = 0; i < n; ++i) {
+                    raw_pred[i] = round_trees[k].find_leaf(X, i, col_subset.data())->value;
+                }
                 shrink_leaf_values(raw_pred);
                 round_raw_preds[k] = std::move(raw_pred);
             });

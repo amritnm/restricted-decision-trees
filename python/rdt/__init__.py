@@ -37,6 +37,14 @@ class RDT:
         improvement meets this threshold; otherwise every node at that depth
         becomes a leaf. Matches sklearn's parameter of the same name (and is
         XGBoost/LightGBM's gamma/min_split_loss).
+    presort : bool, default=True
+        Split search implementation. True (default) sorts each feature once
+        per fit and scores every node of a depth in one pass. False sorts
+        every (node, feature) pair's samples at every depth, as v0.2.0 did,
+        and reproduces v0.2.0's results bit for bit. Both choose the same
+        splits except between candidates whose improvements are equal to
+        within floating-point rounding (e.g. a column and an affine or
+        mirrored copy of it); see docs/ALGORITHM_DETAILS.md.
     """
 
     def __init__(
@@ -47,6 +55,7 @@ class RDT:
         min_samples_split: int = 2,
         min_samples_leaf: int = 1,
         min_impurity_decrease: float = 0.0,
+        presort: bool = True,
     ):
         self.task = task.lower()
         if self.task not in ("classification", "regression"):
@@ -66,6 +75,7 @@ class RDT:
         self.min_samples_split = min_samples_split
         self.min_samples_leaf = min_samples_leaf
         self.min_impurity_decrease = min_impurity_decrease
+        self.presort = presort
 
         self.root = None
         self.n_features_ = None
@@ -111,6 +121,7 @@ class RDT:
         model = _rdt_native.RDTModel(
             self.task, self.criterion, self.max_depth,
             self.min_samples_split, self.min_samples_leaf, self.min_impurity_decrease,
+            presort=self.presort,
         )
         model.fit(X, y, sample_weight)
         self._model = model

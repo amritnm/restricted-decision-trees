@@ -7,12 +7,14 @@ against the native C++-backed `RDT` class: it recomputes per-node statistics
 labels, exactly as the original did, rather than assuming those stats are
 cached on the node.
 
-Only a standalone `RDT` keeps `node.indices` after fitting; the sub-trees of
-`RandomForestRDT.estimators_` do not (each would otherwise hold
-~4 * n_samples * (max_depth + 1) bytes, and their indices referred to the
-tree's bootstrap sample rather than to the training rows anyway).
-`print_tree` works for every tree (it uses `node.n_samples`);
-`export_tree_dict` / `visualize_d3_observable` need the indices.
+`node.indices` is kept by a standalone `RDT` and by the sub-trees of
+`RandomForestRDT(bootstrap=False)`, whose rows are the training rows. Sub-trees
+fitted on a bootstrap sample (`RandomForestRDT(bootstrap=True)`) drop them
+after fitting -- they would be positions in the bootstrap sample, not rows of
+the training data, and cost ~4 * n_samples * (max_depth + 1) bytes per tree
+-- and accessing `node.indices` there raises AttributeError. `print_tree`
+works for every tree (it uses `node.n_samples`); `export_tree_dict` /
+`visualize_d3_observable` need the indices.
 """
 
 from __future__ import annotations
@@ -109,12 +111,14 @@ def export_tree_dict(
     """Export a fitted RDT's tree structure as a nested dict with per-node statistics."""
     if model.root is None:
         raise ValueError("Tree has not been fitted yet. Call fit() first.")
-    if _n_samples(model.root) > 0 and len(model.root.indices) == 0:
+    try:
+        model.root.indices
+    except AttributeError as e:
         raise ValueError(
-            "This tree does not retain its per-node training indices (ensemble sub-estimators "
-            "drop them after fitting to save memory), so per-node statistics cannot be computed; "
-            "fit a standalone rdt.RDT to use export_tree_dict / visualize_d3_observable."
-        )
+            "This tree does not retain its per-node training indices (sub-trees fitted on a "
+            "bootstrap sample drop them), so per-node statistics cannot be computed; use a "
+            "standalone rdt.RDT or RandomForestRDT(bootstrap=False)."
+        ) from e
 
     y = np.asarray(y)
     if feature_names is None:

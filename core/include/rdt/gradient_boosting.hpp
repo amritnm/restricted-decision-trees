@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -87,6 +88,9 @@ public:
             std::sort(labels.begin(), labels.end());
             labels.erase(std::unique(labels.begin(), labels.end()), labels.end());
             classes_ = std::move(labels);
+            if (classes_.size() < 2) {
+                throw std::invalid_argument("gradient boosting classification needs at least 2 classes in y");
+            }
         }
         const std::size_t n_outputs = (is_classification && classes_.size() > 2) ? classes_.size() : 1;
         n_outputs_ = n_outputs;
@@ -266,6 +270,7 @@ public:
     const std::vector<double>& feature_importances() const { return feature_importances_; }
     const std::vector<double>& train_score() const { return train_score_; }
     std::size_t n_estimators_fitted() const { return rounds_fitted_; }
+    std::size_t n_features() const { return n_features_; }
 
 private:
     GBParams params_;

@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 
 from . import RDT, _rdt_native
+from ._validation import check_X, check_X_y, check_sample_weight
 
 __all__ = ["RandomForestRDT", "GradientBoostingRDT"]
 
@@ -197,8 +198,7 @@ class RandomForestRDT:
         self._model = None
 
     def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None) -> "RandomForestRDT":
-        X = np.asarray(X, dtype=np.float64, order="C")
-        y = np.asarray(y, dtype=np.float64, order="C")
+        X, y, sample_weight = check_X_y(X, y, sample_weight)
         self.n_features_ = X.shape[1]
 
         if self.task == "classification":
@@ -206,7 +206,7 @@ class RandomForestRDT:
             self.n_classes_ = len(self.classes_)
             sample_weight = _class_weight_to_sample_weight(y, self.classes_, self.class_weight, sample_weight)
         if sample_weight is not None:
-            sample_weight = np.asarray(sample_weight, dtype=np.float64, order="C")
+            sample_weight = check_sample_weight(sample_weight, len(y), "sample_weight combined with class_weight")
 
         self._model = _rdt_native.RandomForestModel(
             self.task, self.criterion, self.max_depth, self.min_samples_split, self.min_samples_leaf,
@@ -234,7 +234,7 @@ class RandomForestRDT:
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self._model is None:
             raise ValueError("Forest not fitted yet. Call fit() first.")
-        X = np.asarray(X, dtype=np.float64, order="C")
+        X = check_X(X, self.n_features_)
         return np.array(self._model.predict(X))
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -242,7 +242,7 @@ class RandomForestRDT:
             raise ValueError("predict_proba only available for classification")
         if self._model is None:
             raise ValueError("Forest not fitted yet. Call fit() first.")
-        X = np.asarray(X, dtype=np.float64, order="C")
+        X = check_X(X, self.n_features_)
         return np.array(self._model.predict_proba(X))
 
 
@@ -381,23 +381,29 @@ class GradientBoostingRDT:
         self._model = None
 
     def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None) -> "GradientBoostingRDT":
-        X = np.asarray(X, dtype=np.float64, order="C")
-        y = np.asarray(y, dtype=np.float64, order="C")
+        X, y, sample_weight = check_X_y(X, y, sample_weight)
         self.n_features_ = X.shape[1]
 
         if self.task == "classification":
             self.classes_ = np.unique(y)
             self.n_classes_ = len(self.classes_)
+            if self.n_classes_ < 2:
+                raise ValueError(
+                    f"GradientBoostingRDT classification needs at least 2 classes in y; "
+                    f"got {self.n_classes_} ({self.classes_.tolist()})."
+                )
             if self.loss == "exponential" and self.n_classes_ != 2:
                 raise ValueError("loss='exponential' only supports binary classification")
             if self.scale_pos_weight is not None:
+                if not (np.isfinite(self.scale_pos_weight) and self.scale_pos_weight > 0):
+                    raise ValueError(f"scale_pos_weight must be a finite number > 0, got {self.scale_pos_weight!r}")
                 if self.n_classes_ != 2:
                     raise ValueError("scale_pos_weight only supports binary classification")
                 base = np.ones(len(y), dtype=np.float64) if sample_weight is None else np.array(sample_weight, dtype=np.float64)
                 base[y == self.classes_[1]] *= self.scale_pos_weight
                 sample_weight = base
         if sample_weight is not None:
-            sample_weight = np.asarray(sample_weight, dtype=np.float64, order="C")
+            sample_weight = check_sample_weight(sample_weight, len(y), "sample_weight combined with scale_pos_weight")
 
         self._model = _rdt_native.GradientBoostingModel(
             self.task, self.loss, self.max_depth, self.min_samples_split, self.min_samples_leaf,
@@ -417,7 +423,7 @@ class GradientBoostingRDT:
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self._model is None:
             raise ValueError("Model not fitted yet. Call fit() first.")
-        X = np.asarray(X, dtype=np.float64, order="C")
+        X = check_X(X, self.n_features_)
         return np.array(self._model.predict(X))
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -425,5 +431,5 @@ class GradientBoostingRDT:
             raise ValueError("predict_proba only available for classification")
         if self._model is None:
             raise ValueError("Model not fitted yet. Call fit() first.")
-        X = np.asarray(X, dtype=np.float64, order="C")
+        X = check_X(X, self.n_features_)
         return np.array(self._model.predict_proba(X))

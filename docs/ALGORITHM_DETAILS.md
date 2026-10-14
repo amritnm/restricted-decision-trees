@@ -195,6 +195,9 @@ each node independently).
 - **No categorical feature encoding** in this implementation — all inputs
   are treated as continuous; encode categoricals (e.g. one-hot or ordinal)
   before calling `fit`.
+- **No missing-value support**: NaN or infinity in `X` raises `ValueError`
+  at both `fit` and `predict`; impute (or encode missingness as an extra
+  column) beforehand.
 
 ## References and related work
 

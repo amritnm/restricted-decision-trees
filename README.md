@@ -135,9 +135,17 @@ See `examples/ensemble_usage.py` for a fuller, runnable example.
 
 **Methods**
 
-- `fit(X, y)` — build the tree from training data.
+- `fit(X, y, sample_weight=None)` — build the tree from training data.
 - `predict(X)` — predict target values.
 - `predict_proba(X)` — predict class probabilities (classification only).
+
+All estimators validate their inputs the way scikit-learn does and raise
+`ValueError` for: `X` that is not 2D or is empty; NaN or infinity in `X`,
+`y` or `sample_weight` (missing values are not supported — impute them
+first); `y`/`sample_weight` whose length differs from `X`'s rows; negative
+or all-zero weights (also after `class_weight` / `scale_pos_weight` are
+applied; `scale_pos_weight` must be finite and > 0); and, at predict time, an
+`X` with a different number of features than during `fit`.
 
 **Attributes (after fitting)**
 
@@ -168,7 +176,8 @@ First-order boosting: `n_estimators`, `task`, `loss` (classification:
 `colsample_bytree`), `validation_fraction`, `n_iter_no_change` (alias
 `early_stopping_rounds`), `tol`, `reg_alpha`, `reg_lambda`,
 `scale_pos_weight` (binary only), `huber_delta`, `quantile_alpha`,
-`random_state`, `n_jobs`. After fitting: `feature_importances_`,
+`random_state`, `n_jobs`. Classification needs at least two classes in
+`y`. After fitting: `feature_importances_`,
 `train_score_` (loss per round), `n_estimators_` (rounds actually fitted —
 less than `n_estimators` if early stopping triggered).
 

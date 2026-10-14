@@ -29,6 +29,18 @@ VectorView to_vector_view(const InputVector& y) {
     return VectorView(y.data(), y.shape(0));
 }
 
+// The core indexes y/sample_weight by row and X by the column numbers seen at
+// fit time without bounds checks, so mismatched shapes must never reach it.
+// (The Python wrappers validate first; these guard direct use of the module.)
+void check_fit_shapes(const InputMatrix& X, const InputVector& y, const std::optional<InputVector>& w) {
+    if (y.shape(0) != X.shape(0)) throw std::invalid_argument("X and y have different numbers of rows");
+    if (w && w->shape(0) != X.shape(0)) throw std::invalid_argument("X and sample_weight have different numbers of rows");
+}
+
+void check_predict_shape(const InputMatrix& X, std::size_t n_features) {
+    if (X.shape(1) != n_features) throw std::invalid_argument("X has a different number of features than during fit");
+}
+
 GBLoss loss_from_string(const std::string& loss) {
     if (loss == "log_loss") return GBLoss::LogLoss;
     if (loss == "exponential") return GBLoss::Exponential;
@@ -70,6 +82,7 @@ NB_MODULE(_rdt_native, m) {
              "min_impurity_decrease"_a = 0.0)
         .def("fit",
              [](RDTModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
+                 check_fit_shapes(X, y, sample_weight);
                  if (sample_weight) {
                      VectorView wv = to_vector_view(*sample_weight);
                      self.fit(to_matrix_view(X), to_vector_view(y), &wv);
@@ -79,10 +92,16 @@ NB_MODULE(_rdt_native, m) {
              },
              "X"_a, "y"_a, "sample_weight"_a = nb::none())
         .def("predict",
-             [](const RDTModel& self, InputMatrix X) { return self.predict(to_matrix_view(X)); },
+             [](const RDTModel& self, InputMatrix X) {
+                 check_predict_shape(X, self.n_features());
+                 return self.predict(to_matrix_view(X));
+             },
              "X"_a)
         .def("predict_proba",
-             [](const RDTModel& self, InputMatrix X) { return self.predict_proba(to_matrix_view(X)); },
+             [](const RDTModel& self, InputMatrix X) {
+                 check_predict_shape(X, self.n_features());
+                 return self.predict_proba(to_matrix_view(X));
+             },
              "X"_a)
         .def_prop_ro("classes_", [](const RDTModel& self) { return self.classes(); })
         .def_prop_ro("n_classes_", [](const RDTModel& self) { return self.n_classes(); })
@@ -141,6 +160,7 @@ NB_MODULE(_rdt_native, m) {
              "max_samples"_a, "oob_score"_a, "random_state"_a, "n_jobs"_a)
         .def("fit",
              [](RandomForestModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
+                 check_fit_shapes(X, y, sample_weight);
                  if (sample_weight) {
                      VectorView wv = to_vector_view(*sample_weight);
                      self.fit(to_matrix_view(X), to_vector_view(y), &wv);
@@ -150,9 +170,15 @@ NB_MODULE(_rdt_native, m) {
              },
              "X"_a, "y"_a, "sample_weight"_a = nb::none())
         .def("predict",
-             [](const RandomForestModel& self, InputMatrix X) { return self.predict(to_matrix_view(X)); }, "X"_a)
+             [](const RandomForestModel& self, InputMatrix X) {
+                 check_predict_shape(X, self.n_features());
+                 return self.predict(to_matrix_view(X));
+             }, "X"_a)
         .def("predict_proba",
-             [](const RandomForestModel& self, InputMatrix X) { return self.predict_proba(to_matrix_view(X)); }, "X"_a)
+             [](const RandomForestModel& self, InputMatrix X) {
+                 check_predict_shape(X, self.n_features());
+                 return self.predict_proba(to_matrix_view(X));
+             }, "X"_a)
         .def_prop_ro("classes_", [](const RandomForestModel& self) { return self.classes(); })
         .def_prop_ro("n_classes_", [](const RandomForestModel& self) { return self.n_classes(); })
         .def_prop_ro("feature_importances_", [](const RandomForestModel& self) { return self.feature_importances(); })
@@ -204,6 +230,7 @@ NB_MODULE(_rdt_native, m) {
              "reg_alpha"_a, "reg_lambda"_a, "huber_delta"_a, "quantile_alpha"_a, "random_state"_a, "n_jobs"_a)
         .def("fit",
              [](GradientBoostingModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
+                 check_fit_shapes(X, y, sample_weight);
                  if (sample_weight) {
                      VectorView wv = to_vector_view(*sample_weight);
                      self.fit(to_matrix_view(X), to_vector_view(y), &wv);
@@ -213,9 +240,15 @@ NB_MODULE(_rdt_native, m) {
              },
              "X"_a, "y"_a, "sample_weight"_a = nb::none())
         .def("predict",
-             [](const GradientBoostingModel& self, InputMatrix X) { return self.predict(to_matrix_view(X)); }, "X"_a)
+             [](const GradientBoostingModel& self, InputMatrix X) {
+                 check_predict_shape(X, self.n_features());
+                 return self.predict(to_matrix_view(X));
+             }, "X"_a)
         .def("predict_proba",
-             [](const GradientBoostingModel& self, InputMatrix X) { return self.predict_proba(to_matrix_view(X)); }, "X"_a)
+             [](const GradientBoostingModel& self, InputMatrix X) {
+                 check_predict_shape(X, self.n_features());
+                 return self.predict_proba(to_matrix_view(X));
+             }, "X"_a)
         .def_prop_ro("classes_", [](const GradientBoostingModel& self) { return self.classes(); })
         .def_prop_ro("n_classes_", [](const GradientBoostingModel& self) { return self.n_classes(); })
         .def_prop_ro("feature_importances_", [](const GradientBoostingModel& self) { return self.feature_importances(); })

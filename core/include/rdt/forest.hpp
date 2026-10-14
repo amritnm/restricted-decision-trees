@@ -211,6 +211,7 @@ public:
     const std::vector<double>& feature_importances() const { return feature_importances_; }
     double oob_score() const { return oob_score_; }
     bool has_oob_score() const { return params_.oob_score; }
+    std::size_t n_features() const { return n_features_; }
 
 private:
     ForestParams params_;

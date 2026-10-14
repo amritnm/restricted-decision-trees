@@ -33,10 +33,15 @@ class RDT:
     min_samples_leaf : int, default=1
         Minimum samples required in a leaf node.
     min_impurity_decrease : float, default=0.0
-        A depth's winning feature is only committed if its total impurity
-        improvement meets this threshold; otherwise every node at that depth
-        becomes a leaf. Matches sklearn's parameter of the same name (and is
-        XGBoost/LightGBM's gamma/min_split_loss).
+        A depth's winning feature is only committed if its total weighted
+        impurity decrease -- the sum over the depth's nodes of
+        ``N_t / N * (impurity - N_t_L / N_t * left_impurity - N_t_R / N_t * right_impurity)``,
+        with ``N`` the total (weighted) number of training samples -- meets
+        this threshold (up to machine epsilon, as in scikit-learn); otherwise
+        every node at that depth becomes a leaf. Same quantity and
+        comparison as sklearn's parameter of the same name, which sklearn
+        applies per node rather than per depth (XGBoost/LightGBM's closest
+        equivalent is gamma/min_split_loss).
     """
 
     def __init__(

@@ -30,7 +30,8 @@ This is the key distinction from:
 
 For each depth, every candidate feature is scored across *all* currently
 active nodes at that depth — summing each node's best achievable impurity
-improvement for that feature — before any split is committed:
+improvement for that feature, weighted by the node's share of the training
+samples (sample weight) — before any split is committed:
 
 ```
 function BuildRestrictedTree(X, y, max_depth):
@@ -54,15 +55,22 @@ function BuildRestrictedTree(X, y, max_depth):
             for node in nodes_to_split:
                 threshold, improvement = find_best_threshold(node, feature)
                 if threshold is not None:
-                    total_improvement += improvement
+                    total_improvement += (node.weight / root.weight) * improvement
                     thresholds[node] = threshold
 
             if total_improvement > best_total_improvement:
                 best_total_improvement = total_improvement
                 best_feature, best_thresholds = feature, thresholds
 
+        if best_feature is None or best_total_improvement + EPSILON < min_impurity_decrease:
+            make every node in nodes_to_split a leaf
+            break
+
         next_level = []
         for node in nodes_to_split:
+            if node not in best_thresholds:
+                make node a leaf        # best_feature cannot split it (see below)
+                continue
             threshold = best_thresholds[node]
             node.left, node.right = split(node, best_feature, threshold)
             next_level += [node.left, node.right]
@@ -71,6 +79,37 @@ function BuildRestrictedTree(X, y, max_depth):
 
     return root
 ```
+
+`node.weight` is the node's number of training samples (or their total
+`sample_weight`), so `(node.weight / root.weight) * improvement` is exactly
+scikit-learn's *weighted impurity decrease* of a split,
+`N_t / N * (impurity - N_t_L / N_t * left_impurity - N_t_R / N_t * right_impurity)`.
+Without that weighting a node's within-node improvement would count the same
+whether the node holds 10 samples or 10,000, and a feature that perfectly
+separates a tiny node could win the whole depth over one that substantially
+improves the large nodes. The winning total is stored per depth as
+`depth_improvements_` (the basis of the ensembles' `feature_importances_`), and
+`min_impurity_decrease` is compared against it: a depth is committed unless
+its total weighted impurity decrease plus `EPSILON` (machine epsilon) is below
+the threshold. For a single node (the root, or `max_depth=1`) this is exactly
+scikit-learn's quantity and rule;
+the difference is that scikit-learn applies it node by node while an RDT
+applies it to the whole depth, since the depth shares one feature.
+
+### Nodes the depth's feature cannot split
+
+The winning feature may have no valid threshold in some node — it is constant
+there, or every threshold would violate `min_samples_leaf`. Such a node
+becomes a leaf at that depth, even if a feature chosen for a later depth
+could have split it. This is deliberate: deferring the node and splitting it
+later with depth `d+1`'s feature would place a depth-`d+1` feature at depth
+`d` (breaking "all nodes at depth `d` use the same feature"), or would need a
+pass-through node with a single child, which neither the tree structure nor
+the per-depth feature map (`depth_features_`) can represent; it would also
+break the "two-pass" equivalence argument below, which relies on every node
+at a depth being split by that depth's feature. Weighting each node's
+improvement by its size makes it unlikely that the depth's feature is one
+that cannot split the large nodes, which is what makes freezing costly.
 
 ### Finding the best threshold for a (node, feature) pair
 
@@ -176,8 +215,13 @@ Tree growth stops at a node when:
 1. **Max depth reached**: `depth >= max_depth`.
 2. **Insufficient samples**: `n_samples < min_samples_split`.
 3. **Pure node**: all samples share the same target value.
-4. **No valid split**: no candidate feature/threshold satisfies
-   `min_samples_leaf` on both sides.
+4. **No valid split on the depth's feature**: the feature selected for this
+   depth has no threshold satisfying `min_samples_leaf` on both sides of this
+   node (e.g. it is constant within the node). The node becomes a leaf even
+   if another feature could split it — see "Nodes the depth's feature cannot
+   split" above.
+5. **Insufficient improvement**: the depth's total weighted impurity decrease
+   is below `min_impurity_decrease` (every node at that depth becomes a leaf).
 
 ## Complexity
 

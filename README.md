@@ -121,7 +121,7 @@ See `examples/ensemble_usage.py` for a fuller, runnable example.
 
 ## API reference
 
-### `rdt.RDT(task="classification", criterion=None, max_depth=5, min_samples_split=2, min_samples_leaf=1)`
+### `rdt.RDT(task="classification", criterion=None, max_depth=5, min_samples_split=2, min_samples_leaf=1, min_impurity_decrease=0.0)`
 
 **Parameters**
 
@@ -132,6 +132,10 @@ See `examples/ensemble_usage.py` for a fuller, runnable example.
 - `max_depth` — maximum tree depth.
 - `min_samples_split` — minimum samples required to split a node.
 - `min_samples_leaf` — minimum samples required in a leaf node.
+- `min_impurity_decrease` — a depth is only split if its total weighted
+  impurity decrease (sum over the depth's nodes of
+  `node_samples / total_samples * node_improvement`, scikit-learn's
+  definition and comparison, up to machine epsilon) is at least this value.
 
 **Methods**
 
@@ -142,6 +146,8 @@ See `examples/ensemble_usage.py` for a fuller, runnable example.
 **Attributes (after fitting)**
 
 - `depth_features_` — `dict[int, int]`, the feature index chosen at each depth.
+- `depth_improvements_` — `dict[int, float]`, the total weighted impurity
+  decrease achieved at each depth.
 - `n_features_` — number of features seen during `fit`.
 - `classes_`, `n_classes_` — unique class labels and their count (classification only).
 - `root` — the fitted tree's root `Node` (`.is_leaf`, `.split_feature`,
@@ -187,20 +193,29 @@ less than `n_estimators` if early stopping triggered).
 
 For each depth, every candidate feature is scored across **all** currently
 active nodes at that depth (summing each node's best achievable impurity
-improvement for that feature); the feature with the highest total wins and is
-locked in for the whole depth, and the per-node thresholds already found
-while scoring it are reused directly as the final split points:
+improvement for that feature, weighted by the node's share of the training
+samples); the feature with the highest total wins and is locked in for the
+whole depth, and the per-node thresholds already found while scoring it are
+reused directly as the final split points:
 
 ```
 For each depth level:
   1. For every candidate feature:
        for every active node at this depth:
          find that node's best threshold for this feature
-       total_improvement = sum of improvements across all nodes
+       total_improvement = sum over nodes of
+                           (node samples / total samples) * node improvement
   2. Choose the feature with the highest total_improvement; lock it in.
   3. Split every node at this depth using the threshold already found
-     for the winning feature.
+     for the winning feature (a node that feature cannot split becomes a leaf).
 ```
+
+The weighted per-node term is scikit-learn's weighted impurity decrease, so a
+`max_depth=1` RDT is the same stump as `DecisionTreeClassifier`/`Regressor`,
+and `depth_improvements_`/`feature_importances_` are scikit-learn-style
+impurity-based (MDI) importances. See `docs/ALGORITHM_DETAILS.md` for details,
+including why a node the depth's feature cannot split is not deferred to a
+later depth.
 
 ## Package structure
 

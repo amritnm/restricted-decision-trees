@@ -109,8 +109,12 @@ class RandomForestRDT:
     min_child_weight : int, optional
         XGBoost-style alias of ``min_samples_leaf`` (see module docstring).
     min_impurity_decrease : float, default=0.0
+        A tree splits a depth only if the depth's total weighted impurity
+        decrease -- the sum over its nodes of ``N_t / N * (node improvement)``,
+        scikit-learn's scale (see ``rdt.RDT``) -- reaches this value.
     gamma : float, optional
-        XGBoost-style alias of ``min_impurity_decrease``.
+        XGBoost-style alias of ``min_impurity_decrease`` (same scale, not
+        XGBoost's gain scale).
     max_features : {'sqrt', 'log2', None} or int or float, default='sqrt'
         Chosen once per tree, not per node (see module docstring).
     colsample_bytree : {'sqrt', 'log2', None} or int or float, optional
@@ -266,8 +270,13 @@ class GradientBoostingRDT:
     min_child_weight : int, optional
         XGBoost-style alias of ``min_samples_leaf``.
     min_impurity_decrease : float, default=0.0
+        Each round's tree splits a depth only if the depth's total weighted
+        decrease in squared error of the gradient -- the sum over its nodes of
+        ``N_t / N * (node improvement)``, scikit-learn's scale (see
+        ``rdt.RDT``) -- reaches this value.
     gamma : float, optional
-        XGBoost-style alias of ``min_impurity_decrease``.
+        XGBoost-style alias of ``min_impurity_decrease`` (same scale, not
+        XGBoost's gain scale).
     subsample : float, default=1.0
         Row fraction per round (without replacement) -- stochastic GB.
     max_features : {'sqrt', 'log2', None} or int or float, default=None (all)

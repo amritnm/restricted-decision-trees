@@ -161,11 +161,16 @@ public:
             }
             VectorView sub_Y(sub_y.data(), sub_y.size());
 
+            // Every tree is aligned to the forest's classes_, not just the
+            // labels its bootstrap sample happens to contain, so predict_proba
+            // and the OOB vote can add tree rows column-by-column.
+            const std::vector<double>* tree_classes =
+                params_.tree_params.task == Task::Classification ? &classes_ : nullptr;
             if (sample_weight) {
                 VectorView sub_W(sub_w.data(), sub_w.size());
-                trees_[t].fit(sub.view, sub_Y, &sub_W);
+                trees_[t].fit(sub.view, sub_Y, &sub_W, tree_classes);
             } else {
-                trees_[t].fit(sub.view, sub_Y);
+                trees_[t].fit(sub.view, sub_Y, nullptr, tree_classes);
             }
         });
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <future>
 #include <mutex>
@@ -53,6 +54,9 @@ public:
     // block until all finish. Simpler than submit()-ing N futures by hand
     // for the common "parallel for" case that Random Forest/multiclass
     // boosting rounds need.
+    //
+    // Waits for every job even if one throws (the jobs reference the
+    // caller's locals), then rethrows the first exception.
     template <typename F>
     void parallel_for(std::size_t count, F&& f) {
         if (count == 0) return;
@@ -61,7 +65,15 @@ public:
         for (std::size_t i = 0; i < count; ++i) {
             futures.push_back(submit([&f, i] { f(i); }));
         }
-        for (auto& fut : futures) fut.get();
+        std::exception_ptr first_error;
+        for (auto& fut : futures) {
+            try {
+                fut.get();
+            } catch (...) {
+                if (!first_error) first_error = std::current_exception();
+            }
+        }
+        if (first_error) std::rethrow_exception(first_error);
     }
 
 private:

@@ -54,9 +54,10 @@ struct TreeParams {
     // search. Exposed mainly so tests can compare the two.
     bool presort = true;
     // Keep each Node's `indices` (the training rows that reached it) after
-    // fit. rdt.visualize's export_tree_dict needs them for a standalone tree;
-    // the ensembles turn this off, since they would otherwise retain
-    // ~4 * n_samples * (max_depth + 1) bytes per fitted tree.
+    // fit. rdt.visualize's export_tree_dict needs them. Gradient boosting and
+    // bootstrapped forests turn this off -- they would otherwise retain
+    // ~4 * n_samples * (max_depth + 1) bytes per fitted tree, and a bootstrap
+    // tree's indices are positions in its bootstrap sample, not training rows.
     bool retain_indices = true;
 };
 

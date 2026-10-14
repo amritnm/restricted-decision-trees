@@ -294,7 +294,9 @@ private:
     }
 
     void release_indices(Node& node) const {
-        if (!params_.retain_indices) std::vector<std::uint32_t>().swap(node.indices);
+        if (params_.retain_indices) return;
+        std::vector<std::uint32_t>().swap(node.indices);
+        node.has_indices = false;
     }
 
     void finish_leaf(Node& node, const VectorView& y, const VectorView* sample_weight) const {
@@ -309,6 +311,18 @@ private:
         auto root = std::make_unique<Node>();
         root->n_samples = root_indices.size();
         root->indices = std::move(root_indices);
+
+        // Labels that cannot be located in classes_ (NaN) have no class
+        // index for the presorted search; use the per-node search instead.
+        if (presorted && params_.task == Task::Classification) {
+            for (auto idx : root->indices) {
+                auto it = std::lower_bound(classes_.begin(), classes_.end(), y[idx]);
+                if (it == classes_.end() || !(*it == y[idx])) {
+                    presorted = nullptr;
+                    break;
+                }
+            }
+        }
 
         // Presorted search state: per-row target/weight/class and the index
         // of the node being split that the row currently belongs to.

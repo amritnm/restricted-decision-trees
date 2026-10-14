@@ -53,32 +53,6 @@ inline std::uint32_t resolve_max_features(const MaxFeaturesSpec& spec, std::uint
     return std::max<std::uint32_t>(1, std::min(k, n_features));
 }
 
-// Materializes an owning contiguous buffer for X[row_indices, col_indices]
-// (row_indices == nullptr means "all rows"). No longer used by the ensembles,
-// which fit on an IndexedMatrixView and predict through each tree's column
-// subset (RDTModel::find_leaf's col_map) instead of copying X; kept as a
-// public helper.
-struct SubMatrix {
-    std::vector<double> buffer;
-    MatrixView view;
-};
-
-inline SubMatrix extract_submatrix(const MatrixView& X, const std::vector<std::uint32_t>* row_indices,
-                                    const std::vector<std::uint32_t>& col_indices) {
-    std::size_t n_rows = row_indices ? row_indices->size() : X.n_rows();
-    std::size_t n_cols = col_indices.size();
-    SubMatrix out;
-    out.buffer.resize(n_rows * n_cols);
-    for (std::size_t r = 0; r < n_rows; ++r) {
-        std::uint32_t orig_row = row_indices ? (*row_indices)[r] : static_cast<std::uint32_t>(r);
-        for (std::size_t c = 0; c < n_cols; ++c) {
-            out.buffer[r * n_cols + c] = X(orig_row, col_indices[c]);
-        }
-    }
-    out.view = MatrixView(out.buffer.data(), n_rows, n_cols, /*row_major=*/true);
-    return out;
-}
-
 // Rows per block when an ensemble predicts: every tree is applied to a block
 // of rows before moving to the next block, so a block's rows of X stay in
 // cache across trees. Per-row accumulation order over trees is unchanged.
@@ -124,7 +98,10 @@ public:
 
         const std::size_t n_est = static_cast<std::size_t>(params_.n_estimators);
         TreeParams tree_params = params_.tree_params;
-        tree_params.retain_indices = false; // see TreeParams::retain_indices
+        // Without bootstrap a tree's rows are the training rows themselves, so
+        // its node indices stay meaningful (rdt.visualize); with bootstrap they
+        // would be positions in the sample. See TreeParams::retain_indices.
+        tree_params.retain_indices = !params_.bootstrap;
         trees_.clear();
         trees_.reserve(n_est);
         for (std::size_t i = 0; i < n_est; ++i) trees_.emplace_back(tree_params);
@@ -310,7 +287,8 @@ private:
             const std::uint32_t* cols = feature_subsets_[t].data();
             if (classification) {
                 for (std::size_t i = 0; i < oob.size(); ++i) {
-                    add_tree_proba(trees_[t], trees_[t].find_leaf(X, oob[i], cols), tree_proba, vote_sums[oob[i]].data());
+                    const Node* leaf = trees_[t].find_leaf(X, oob[i], cols);
+                    add_tree_proba(trees_[t], leaf, tree_proba, vote_sums[oob[i]].data());
                     vote_counts[oob[i]]++;
                 }
             } else {

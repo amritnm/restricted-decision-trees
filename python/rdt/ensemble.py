@@ -11,15 +11,18 @@ version:
   scikit-learn's usual way -- a fresh random subset *per node*. Instead each
   tree gets ONE random column subset chosen before its own fit(), matching
   this project's earlier Python ``ensemble/random_forest_rdt.py``.
-- ``min_samples_leaf`` / ``min_child_weight``: aliases. There's no hessian
-  in this first-order boosting engine, so ``min_child_weight`` (normally
-  hessian-based in XGBoost) is treated as a plain sample-count constraint.
+- ``min_samples_leaf`` / ``min_child_weight``: aliases. Trees are grown on
+  the gradient alone (hessians only enter the per-leaf Newton step), so
+  ``min_child_weight`` (normally hessian-based in XGBoost) is treated as a
+  plain sample-count constraint.
 - ``min_impurity_decrease`` / ``gamma``: real, aliases of the same pruning
   threshold.
 - ``reg_alpha`` / ``reg_lambda`` (GradientBoostingRDT only): a real effect
   (post-hoc leaf-value soft-thresholding / ridge-style shrinkage) but not
-  XGBoost's exact Newton/hessian-derived leaf formula -- this engine is
-  first-order (Friedman-style), not second-order.
+  XGBoost's exact regularised leaf formula -- this engine is Friedman's
+  gradient boosting as in scikit-learn (squared-error trees on the gradient,
+  then one Newton step per leaf for log_loss/exponential), not XGBoost's
+  hessian-weighted tree growth.
 - ``n_iter_no_change`` / ``early_stopping_rounds``: aliases.
 """
 
@@ -248,8 +251,17 @@ class RandomForestRDT:
 
 class GradientBoostingRDT:
     """Gradient Boosting of Restricted Decision Trees, backed by a native
-    C++ core. First-order (Friedman-style) boosting -- see module docstring
-    for how reg_alpha/reg_lambda differ from XGBoost's exact mechanics.
+    C++ core. Friedman's gradient boosting, as in scikit-learn's
+    GradientBoostingClassifier/Regressor: each round fits an RDT to the
+    negative gradient, then replaces each leaf value by the loss's one-step
+    Newton estimate sum(w*g)/sum(w*h) (log_loss, exponential; squared_error's
+    leaf mean is already exact; absolute_error/huber/quantile keep the leaf
+    mean of the gradient). The initial score is the weighted constant
+    minimiser of the loss (prior log-odds, log class priors, mean, median,
+    quantile). ``sample_weight``/``scale_pos_weight`` weight the trees, the
+    init, the leaf values, ``train_score_`` and the early-stopping
+    validation loss. See the module docstring for how reg_alpha/reg_lambda
+    differ from XGBoost's exact mechanics.
 
     Parameters
     ----------
@@ -300,7 +312,8 @@ class GradientBoostingRDT:
     ---------------------------
     feature_importances_ : ndarray of shape (n_features,)
     train_score_ : ndarray
-        Training loss at each round actually fitted.
+        Training loss (sample-weighted if weights were given) at each round
+        actually fitted.
     n_estimators_ : int
         Rounds actually fitted -- less than ``n_estimators`` if early
         stopping triggered.

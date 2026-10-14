@@ -4,7 +4,9 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "rdt/forest.hpp" // MaxFeaturesSpec, resolve_max_features, extract_submatrix, SubMatrix
@@ -14,25 +16,39 @@
 #include "rdt/thread_pool.hpp"
 #include "rdt/tree.hpp"
 
-// Gradient Boosting of RDTs -- first-order (Friedman-style): each round fits
-// a regression tree (MSE criterion) to the negative gradient of the chosen
-// loss, then shrinks it by learning_rate. Not XGBoost's second-order
-// (Newton/hessian-aware) mechanics -- see reg_alpha/reg_lambda below.
+// Gradient Boosting of RDTs -- Friedman's gradient boosting, as implemented
+// by scikit-learn's GradientBoostingClassifier/Regressor: each round fits a
+// regression tree (MSE criterion, sample-weighted) to the negative gradient
+// of the chosen loss, then (step 5 of Friedman's Algorithm 1, sklearn's
+// _update_terminal_regions) re-estimates every leaf's value for the loss
+// itself over the in-bag rows reaching it, then shrinks by learning_rate:
 //
-// Every round's tree(s) always fit MSE against the current negative
-// gradient; for absolute_error/huber/quantile this means the *gradient
-// formula* is loss-correct but the fitted leaf value is the tree's ordinary
-// mean-of-residuals-in-leaf (not the loss-specific terminal-region-corrected
-// constant sklearn's exact Friedman algorithm computes, e.g. the leaf
-// median for LAD). A documented simplification, same spirit as
-// reg_alpha/reg_lambda below.
+// - squared_error: the leaf mean of the residuals is already the exact
+//   minimiser, kept as is;
+// - log_loss: one Newton step, sum(w*(y-p)) / sum(w*p*(1-p)); multiclass
+//   (softmax, one tree per class per round) additionally scales the
+//   numerator by (K-1)/K, as in Friedman's paper and sklearn;
+// - exponential: one Newton step, sum(w*g) / sum(w*|g|) with
+//   g = y~*exp(-y~*F), y~ in {-1,+1}; F estimates half the log-odds, so
+//   probabilities are sigmoid(2F);
+// - absolute_error/huber/quantile: the leaf mean of the (sign/clipped)
+//   gradient -- a documented simplification of sklearn's leaf median /
+//   quantile line search, same spirit as reg_alpha/reg_lambda below.
 //
-// reg_alpha/reg_lambda are applied as a post-hoc shrink of each fitted
-// tree's *predictions* (equivalent to shrinking its leaf values, since
-// predict() just returns the landed-on leaf's value) -- soft-threshold for
-// alpha, ridge-style denominator shrink for lambda. A real effect, but not
-// XGBoost's exact Newton-derived leaf formula (which needs hessians this
-// first-order engine doesn't compute).
+// The initial score is the loss's (weighted) constant minimiser: weighted
+// log-odds of the positive class (half of it for exponential), weighted
+// log class priors centred to sum to zero for multiclass, weighted
+// mean/median/quantile for regression. sample_weight enters the tree fits,
+// the init, the leaf values and the loss reported in train_score_ / used for
+// early stopping.
+//
+// Splits are still chosen first-order (MSE on the gradient), not with
+// XGBoost's hessian-weighted gain. reg_alpha/reg_lambda are applied as a
+// post-hoc shrink of each fitted tree's *predictions* (equivalent to
+// shrinking its leaf values, since predict() just returns the landed-on
+// leaf's value) -- soft-threshold for alpha, ridge-style denominator shrink
+// for lambda. A real effect, but not XGBoost's exact regularised leaf
+// formula.
 namespace rdt {
 
 enum class GBLoss {
@@ -105,13 +121,27 @@ public:
             for (std::uint32_t i = 0; i < n; ++i) train_rows[i] = i;
         }
 
+        // Both sides of the early-stopping split must carry weight: with no
+        // weight on the training rows there is nothing to fit (the init would
+        // be a clipped prior of no data), and with none on the holdout the
+        // validation loss is 0/0 and early stopping fires after
+        // n_iter_no_change + 1 rounds regardless of the fit. scikit-learn
+        // raises in both cases too.
+        if (sample_weight && total_weight(*sample_weight, train_rows) <= 0.0) {
+            throw std::invalid_argument(
+                "the training rows (after the validation_fraction split) have zero total sample_weight");
+        }
+        if (sample_weight && early_stopping && total_weight(*sample_weight, val_rows) <= 0.0) {
+            throw std::invalid_argument(
+                "the early-stopping validation rows (validation_fraction) have zero total sample_weight; "
+                "increase validation_fraction or give more rows a positive weight");
+        }
+
         // F[k][i]: current raw score for output k, sample i (over ALL rows).
         std::vector<std::vector<double>> F(n_outputs, std::vector<double>(n, 0.0));
-        init_scores_.assign(n_outputs, 0.0);
+        init_scores_ = compute_init_scores(y_enc, train_rows, sample_weight);
         for (std::size_t k = 0; k < n_outputs; ++k) {
-            double init = compute_init_score(y_enc[k], train_rows);
-            init_scores_[k] = init;
-            for (std::size_t i = 0; i < n; ++i) F[k][i] = init;
+            for (std::size_t i = 0; i < n; ++i) F[k][i] = init_scores_[k];
         }
 
         double best_val_score = std::numeric_limits<double>::infinity();
@@ -181,6 +211,10 @@ public:
                 } else {
                     round_trees[k].fit(fit_sub.view, residual_view);
                 }
+                if (has_newton_leaf_step()) {
+                    update_leaf_values(round_trees[k], fit_sub.view, fit_rows, fit_residual,
+                                       sample_weight ? &fit_weight : nullptr, y_enc[k], n_outputs);
+                }
 
                 SubMatrix all_sub = extract_submatrix(X, nullptr, col_subset);
                 std::vector<double> raw_pred = round_trees[k].predict(all_sub.view);
@@ -195,11 +229,11 @@ public:
             }
             rounds_fitted_ = round + 1;
 
-            double train_loss = compute_loss(y_enc, F, train_rows, n_outputs);
+            double train_loss = compute_loss(y_enc, F, train_rows, n_outputs, sample_weight);
             train_score_.push_back(train_loss);
 
             if (early_stopping) {
-                double val_loss = compute_loss(y_enc, F, val_rows, n_outputs);
+                double val_loss = compute_loss(y_enc, F, val_rows, n_outputs, sample_weight);
                 if (val_loss < best_val_score - params_.tol) {
                     best_val_score = val_loss;
                     rounds_without_improve = 0;
@@ -220,7 +254,7 @@ public:
         std::vector<double> out(X.n_rows());
         if (n_outputs_ == 1) { // binary
             for (std::size_t i = 0; i < X.n_rows(); ++i) {
-                double p = sigmoid_like(F[0][i]);
+                double p = positive_proba(F[0][i]);
                 out[i] = p >= 0.5 ? classes_[1] : classes_[0];
             }
         } else {
@@ -241,7 +275,7 @@ public:
         std::vector<std::vector<double>> out(X.n_rows(), std::vector<double>(classes_.size(), 0.0));
         if (n_outputs_ == 1) {
             for (std::size_t i = 0; i < X.n_rows(); ++i) {
-                double p1 = sigmoid_like(F[0][i]);
+                double p1 = positive_proba(F[0][i]);
                 out[i][0] = 1.0 - p1;
                 out[i][1] = p1;
             }
@@ -310,38 +344,135 @@ private:
         for (std::uint32_t i = 0; i < n; ++i) if (!is_val[i]) train_rows.push_back(i);
     }
 
-    double compute_init_score(const std::vector<double>& enc, const std::vector<std::uint32_t>& train_rows) const {
-        double mean = 0.0;
-        for (auto i : train_rows) mean += enc[i];
-        mean /= static_cast<double>(train_rows.size());
+    static double weighted_mean(const std::vector<double>& enc, const std::vector<std::uint32_t>& rows,
+                                const VectorView* sample_weight) {
+        double sum = 0.0, total_weight = 0.0;
+        for (auto i : rows) {
+            double w = sample_weight ? (*sample_weight)[i] : 1.0;
+            sum += w * enc[i];
+            total_weight += w;
+        }
+        return total_weight > 0.0 ? sum / total_weight : 0.0;
+    }
 
+    // The element of enc[rows] at 0-based sorted position `rank`, where
+    // weights act as replication counts rescaled to sum to rows.size():
+    // the first value whose cumulative (rescaled) weight exceeds `rank`.
+    // Unweighted it is exactly sorted[floor(rank)].
+    static double order_statistic(const std::vector<double>& enc, const std::vector<std::uint32_t>& rows,
+                                  const VectorView* sample_weight, double rank) {
+        if (!sample_weight) {
+            std::vector<double> vals;
+            vals.reserve(rows.size());
+            for (auto i : rows) vals.push_back(enc[i]);
+            std::sort(vals.begin(), vals.end());
+            return vals[std::min(static_cast<std::size_t>(rank), vals.size() - 1)];
+        }
+        std::vector<std::pair<double, double>> vw;
+        vw.reserve(rows.size());
+        double total_weight = 0.0;
+        for (auto i : rows) {
+            vw.emplace_back(enc[i], (*sample_weight)[i]);
+            total_weight += (*sample_weight)[i];
+        }
+        std::sort(vw.begin(), vw.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        const double n = static_cast<double>(rows.size());
+        double cum = 0.0;
+        for (const auto& v : vw) {
+            cum += v.second;
+            if (cum * n > rank * total_weight) return v.first;
+        }
+        return vw.back().first;
+    }
+
+    // Priors are clipped to [eps, 1 - eps] before the logit/log, with
+    // scikit-learn's eps (float64 machine epsilon).
+    static constexpr double kProbaEps = std::numeric_limits<double>::epsilon();
+
+    static double total_weight(const VectorView& w, const std::vector<std::uint32_t>& rows) {
+        double total = 0.0;
+        for (auto i : rows) total += w[i];
+        return total;
+    }
+
+    // Constant initial raw score per output: the (weighted) minimiser of the
+    // loss over the training rows, as scikit-learn's default init does.
+    std::vector<double> compute_init_scores(const std::vector<std::vector<double>>& y_enc,
+                                             const std::vector<std::uint32_t>& rows,
+                                             const VectorView* sample_weight) const {
+        std::vector<double> init(n_outputs_, 0.0);
+        if (params_.loss == GBLoss::LogLoss && n_outputs_ > 1) {
+            // Multiclass: log of each class's weighted prior, centred to sum
+            // to zero (softmax is shift-invariant; sklearn's symmetric link).
+            double mean_log = 0.0;
+            for (std::size_t k = 0; k < n_outputs_; ++k) {
+                double p = std::min(std::max(weighted_mean(y_enc[k], rows, sample_weight), kProbaEps), 1.0 - kProbaEps);
+                init[k] = std::log(p);
+                mean_log += init[k] / static_cast<double>(n_outputs_);
+            }
+            for (double& v : init) v -= mean_log;
+            return init;
+        }
+        const std::vector<double>& enc = y_enc[0];
+        const double n = static_cast<double>(rows.size());
         switch (params_.loss) {
             case GBLoss::LogLoss: {
-                if (n_outputs_ > 1) return 0.0; // multiclass: start every class's raw score at 0
-                double p = std::min(std::max(mean, 1e-7), 1.0 - 1e-7);
-                return std::log(p / (1.0 - p));
+                double p = std::min(std::max(weighted_mean(enc, rows, sample_weight), kProbaEps), 1.0 - kProbaEps);
+                init[0] = std::log(p / (1.0 - p));
+                break;
             }
             case GBLoss::Exponential: {
-                double p = std::min(std::max((mean + 1.0) / 2.0, 1e-7), 1.0 - 1e-7); // enc in {-1,+1}
-                return 0.5 * std::log(p / (1.0 - p));
+                double mean = weighted_mean(enc, rows, sample_weight); // enc in {-1,+1}
+                double p = std::min(std::max((mean + 1.0) / 2.0, kProbaEps), 1.0 - kProbaEps);
+                init[0] = 0.5 * std::log(p / (1.0 - p));
+                break;
             }
-            case GBLoss::AbsoluteError: {
-                std::vector<double> vals;
-                vals.reserve(train_rows.size());
-                for (auto i : train_rows) vals.push_back(enc[i]);
-                std::sort(vals.begin(), vals.end());
-                return vals[vals.size() / 2];
-            }
-            case GBLoss::Quantile: {
-                std::vector<double> vals;
-                vals.reserve(train_rows.size());
-                for (auto i : train_rows) vals.push_back(enc[i]);
-                std::sort(vals.begin(), vals.end());
-                std::size_t idx = static_cast<std::size_t>(params_.quantile_alpha * (vals.size() - 1));
-                return vals[idx];
-            }
+            case GBLoss::AbsoluteError:
+                init[0] = order_statistic(enc, rows, sample_weight, n / 2.0);
+                break;
+            case GBLoss::Quantile:
+                init[0] = order_statistic(enc, rows, sample_weight, params_.quantile_alpha * (n - 1.0));
+                break;
             default: // SquaredError, Huber
-                return mean;
+                init[0] = weighted_mean(enc, rows, sample_weight);
+        }
+        return init;
+    }
+
+    bool has_newton_leaf_step() const {
+        return params_.loss == GBLoss::LogLoss || params_.loss == GBLoss::Exponential;
+    }
+
+    // Friedman's terminal-region update (scikit-learn's
+    // _update_terminal_regions): replace each leaf's mean-of-gradient value
+    // by one Newton step of the loss, sum(w*g) / sum(w*h), over the in-bag
+    // rows reaching that leaf. g is the negative gradient the tree was fit
+    // to; the hessian follows from it: p*(1-p) with p = y - g for log_loss,
+    // |g| = exp(-y~*F) for exponential. Multiclass scales the numerator by
+    // (K-1)/K. A leaf whose hessian sum is ~0 (all p in {0,1}) gets 0.
+    void update_leaf_values(RDTModel& tree, const MatrixView& fit_X, const std::vector<std::uint32_t>& fit_rows,
+                            const std::vector<double>& fit_residual, const std::vector<double>* fit_weight,
+                            const std::vector<double>& enc, std::size_t n_outputs) const {
+        std::unordered_map<Node*, std::pair<double, double>> sums; // leaf -> (sum w*g, sum w*h)
+        for (std::size_t r = 0; r < fit_rows.size(); ++r) {
+            const double g = fit_residual[r];
+            double h;
+            if (params_.loss == GBLoss::Exponential) {
+                h = std::abs(g);
+            } else {
+                const double p = enc[fit_rows[r]] - g;
+                h = p * (1.0 - p);
+            }
+            const double w = fit_weight ? (*fit_weight)[r] : 1.0;
+            auto& acc = sums[tree.leaf_for(fit_X, r)];
+            acc.first += w * g;
+            acc.second += w * h;
+        }
+        const double scale = (params_.loss == GBLoss::LogLoss && n_outputs > 1)
+            ? static_cast<double>(n_outputs - 1) / static_cast<double>(n_outputs) : 1.0;
+        for (auto& kv : sums) {
+            const double den = kv.second.second;
+            kv.first->value = std::abs(den) < 1e-150 ? 0.0 : scale * kv.second.first / den;
         }
     }
 
@@ -390,11 +521,23 @@ private:
 
     static double sigmoid_like(double f) { return 1.0 / (1.0 + std::exp(-f)); }
 
+    // P(positive class) from a binary raw score. The exponential loss's raw
+    // score estimates half the log-odds (its init is 0.5*logit(p)), so its
+    // link is sigmoid(2F), as in scikit-learn.
+    double positive_proba(double f) const {
+        return sigmoid_like(params_.loss == GBLoss::Exponential ? 2.0 * f : f);
+    }
+
+    // Mean loss over `rows`, sample-weighted when weights are given -- the
+    // same objective the trees and leaf values optimise, for train_score_
+    // and the early-stopping validation loss.
     double compute_loss(const std::vector<std::vector<double>>& y_enc, const std::vector<std::vector<double>>& F,
-                         const std::vector<std::uint32_t>& rows, std::size_t n_outputs) const {
+                         const std::vector<std::uint32_t>& rows, std::size_t n_outputs,
+                         const VectorView* sample_weight) const {
         if (rows.empty()) return 0.0;
-        double total = 0.0;
+        double weighted_total = 0.0, total_weight = 0.0;
         for (auto i : rows) {
+            double total = 0.0;
             switch (params_.loss) {
                 case GBLoss::LogLoss:
                     if (n_outputs == 1) {
@@ -432,8 +575,11 @@ private:
                     break;
                 }
             }
+            const double w = sample_weight ? (*sample_weight)[i] : 1.0;
+            weighted_total += w * total;
+            total_weight += w;
         }
-        return total / static_cast<double>(rows.size());
+        return total_weight > 0.0 ? weighted_total / total_weight : 0.0;
     }
 
     std::vector<std::vector<double>> accumulate_scores(const MatrixView& X) const {

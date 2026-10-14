@@ -83,6 +83,17 @@ public:
     const TreeParams& params() const { return params_; }
     std::size_t n_features() const { return n_features_; }
 
+    // Leaf reached by row `row` of X under predict()'s routing. Non-const so
+    // gradient boosting can overwrite leaf values after the fit (its per-leaf
+    // line search); the tree structure itself must not be modified.
+    Node* leaf_for(const MatrixView& X, std::size_t row) {
+        Node* node = root_.get();
+        while (!node->is_leaf()) {
+            node = (X(row, node->split_feature) <= node->split_threshold) ? node->left.get() : node->right.get();
+        }
+        return node;
+    }
+
 private:
     TreeParams params_;
     std::unique_ptr<Node> root_;

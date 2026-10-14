@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -69,6 +70,18 @@ public:
             std::sort(labels.begin(), labels.end());
             labels.erase(std::unique(labels.begin(), labels.end()), labels.end());
             classes_ = std::move(labels);
+        }
+
+        if (presorted) {
+            bool ok = presorted->n_entries == X.n_rows() && presorted->columns.size() == X.n_cols();
+            // Every column holds the same rows; checking the first one's ids is O(n).
+            if (ok && !presorted->columns.empty()) {
+                const std::uint32_t* col = presorted->columns[0];
+                for (std::size_t i = 0; ok && i < presorted->n_entries; ++i) {
+                    ok = (col[i] & kPresortRowMask) < X.n_rows();
+                }
+            }
+            if (!ok) throw std::invalid_argument("presorted columns must cover exactly X's rows and columns");
         }
 
         std::vector<std::uint32_t> root_indices(X.n_rows());

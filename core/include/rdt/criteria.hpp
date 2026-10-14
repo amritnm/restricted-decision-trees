@@ -193,13 +193,22 @@ inline ThresholdResult find_best_threshold(
     const std::size_t n = indices.size();
     if (static_cast<int>(n) < min_samples_split) return result;
 
-    struct SamplePoint { double x, y, w; };
+    // Tied feature values are ordered by row index. std::sort leaves the
+    // order inside a run of ties unspecified (it differs between standard
+    // libraries and input sizes), and that order fixes the summation order of
+    // the running sums -- which, once they are inexact (centred MSE targets,
+    // real-valued weights), decides the last bits of an improvement and so
+    // the winner between equal candidates. Sorting by (value, row) makes the
+    // search deterministic across platforms.
+    struct SamplePoint { double x, y, w; std::uint32_t idx; };
     std::vector<SamplePoint> pts;
     pts.reserve(n);
     for (auto idx : indices) {
-        pts.push_back({X(idx, feature_idx), y[idx], weights ? (*weights)[idx] : 1.0});
+        pts.push_back({X(idx, feature_idx), y[idx], weights ? (*weights)[idx] : 1.0, idx});
     }
-    std::sort(pts.begin(), pts.end(), [](const auto& a, const auto& b) { return a.x < b.x; });
+    std::sort(pts.begin(), pts.end(), [](const auto& a, const auto& b) {
+        return a.x < b.x || (a.x == b.x && a.idx < b.idx);
+    });
 
     if (pts.front().x == pts.back().x) return result; // < 2 unique values
 

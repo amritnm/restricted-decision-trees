@@ -232,8 +232,9 @@ def test_native_tree_matches_bruteforce_reference(criterion):
 
 # --------------------------------------------------------------------------- presort vs per-node sort
 def _walk(node, out):
+    indices = tuple(node.indices) if hasattr(node, "indices") else None  # not retained by bootstrap trees
     out.append((node.is_leaf, node.split_feature, node.split_threshold.hex(), node.value.hex(),
-                tuple(c.hex() for c in node.class_counts), node.n_samples, tuple(node.indices)))
+                tuple(c.hex() for c in node.class_counts), node.n_samples, indices))
     if not node.is_leaf:
         _walk(node.left, out)
         _walk(node.right, out)
@@ -309,38 +310,38 @@ def test_presort_bitwise_equal_to_per_node_sort_exact_sums_with_ties():
                          _native_tree(False, "regression", "mse", X, y, w, **kw), X)
 
 
-def _native_ensemble(cls, presort, X, y, w, **kw):
-    """Fit an ensemble wrapper with its native model's presort switch forced."""
-    native = {"RF": _rdt_native.RandomForestModel, "GB": _rdt_native.GradientBoostingModel}[cls]
-    orig = getattr(_rdt_native, native.__name__)
-    try:
-        setattr(_rdt_native, native.__name__, lambda *a: orig(*a, presort=presort))
-        est = (RandomForestRDT if cls == "RF" else GradientBoostingRDT)(**kw)
-        return est.fit(X, y, w)
-    finally:
-        setattr(_rdt_native, native.__name__, orig)
+def _ensemble(cls, presort, X, y, w, **kw):
+    est = (RandomForestRDT if cls == "RF" else GradientBoostingRDT)(presort=presort, **kw)
+    return est.fit(X, y, w)
 
 
+@pytest.mark.parametrize("bootstrap", [False, True])
 @pytest.mark.parametrize("task", ["classification", "regression"])
-def test_ensembles_presort_bitwise_equal_to_per_node_sort_without_ties(task):
+def test_ensembles_presort_bitwise_equal_to_per_node_sort_without_ties(task, bootstrap):
+    # Distinct X: the only tied values a tree can see are bootstrap copies of the same row,
+    # whose (x, y, w) are identical, so their order cannot change any sum.
     rng = np.random.default_rng(13)
     for i in range(6):
         n, p = int(rng.integers(200, 1500)), int(rng.integers(2, 12))
         X = rng.normal(size=(n, p))
-        y = (X[:, 0] + rng.normal(size=n) > 0).astype(float) if task == "classification" else X[:, 0] + rng.normal(size=n)
+        noise = rng.normal(size=n)
+        y = (X[:, 0] + noise > 0).astype(float) if task == "classification" else X[:, 0] + noise
         if task == "classification" and i % 2:
             y += (X[:, 1] > 1.0)  # three classes
         w = rng.uniform(0.2, 2.0, size=n) if i % 3 == 0 else None
         Xte = rng.normal(size=(300, p))
 
-        rf_kw = dict(task=task, n_estimators=4, max_depth=5, max_features=0.6, bootstrap=False,
-                     random_state=i, n_jobs=2)
-        a, b = _native_ensemble("RF", True, X, y, w, **rf_kw), _native_ensemble("RF", False, X, y, w, **rf_kw)
+        rf_kw = dict(task=task, n_estimators=4, max_depth=5, max_features=0.6, bootstrap=bootstrap,
+                     oob_score=bootstrap, random_state=i, n_jobs=2)
+        a, b = _ensemble("RF", True, X, y, w, **rf_kw), _ensemble("RF", False, X, y, w, **rf_kw)
         for t, (ta, tb) in enumerate(zip(a.estimators_, b.estimators_)):
             assert_same_tree(ta, tb, np.ascontiguousarray(X[:, a._model.feature_subsets_[t]]))
         np.testing.assert_array_equal(a.predict(Xte), b.predict(Xte))
         np.testing.assert_array_equal(a.feature_importances_, b.feature_importances_)
+        assert a.oob_score_ == b.oob_score_
 
+        if bootstrap:
+            continue
         if task == "classification" and len(np.unique(y)) > 2 and i % 2:
             loss = "log_loss"
         else:
@@ -349,9 +350,93 @@ def test_ensembles_presort_bitwise_equal_to_per_node_sort_without_ties(task):
                      random_state=i, n_iter_no_change=3 if i % 2 else None)
         if loss:
             gb_kw["loss"] = loss
-        a, b = _native_ensemble("GB", True, X, y, w, **gb_kw), _native_ensemble("GB", False, X, y, w, **gb_kw)
+        a, b = _ensemble("GB", True, X, y, w, **gb_kw), _ensemble("GB", False, X, y, w, **gb_kw)
         np.testing.assert_array_equal(a.predict(Xte), b.predict(Xte))
         np.testing.assert_array_equal(a.train_score_, b.train_score_)
         np.testing.assert_array_equal(a.feature_importances_, b.feature_importances_)
         if task == "classification":
             np.testing.assert_array_equal(a.predict_proba(Xte), b.predict_proba(Xte))
+
+
+def test_ensembles_presort_bitwise_equal_on_tied_data_small_nodes():
+    # Heavily tied data (incl. -0.0 / 0.0), boosting with row subsampling, column
+    # subsampling and early stopping -- i.e. each round's presorted columns derived from the
+    # per-fit ones with rows dropped -- and bootstrapped forests. With at most 16 rows per
+    # tree both searches see tied values in the same order, so they must agree bit for bit.
+    rng = np.random.default_rng(14)
+    for i in range(150):
+        n, p = int(rng.integers(4, 17)), int(rng.integers(1, 5))
+        X = rng.choice(np.array([-1.0, -0.0, 0.0, 0.5, 2.0]), size=(n, p))
+        reg = i % 2 == 0
+        y = rng.normal(size=n) if reg else rng.integers(0, 2 + i % 3, size=n).astype(float)
+        if not reg and len(np.unique(y)) < 2:
+            y[0] = 1.0 - y[0] if y[0] < 1 else 0.0
+        w = rng.uniform(0.2, 2.0, size=n) if i % 3 == 0 else None
+        task = "regression" if reg else "classification"
+        gb_kw = dict(task=task, n_estimators=6, max_depth=4, learning_rate=0.5,
+                     subsample=float(rng.choice([0.5, 0.8, 1.0])), colsample_bytree=float(rng.choice([0.5, 1.0])),
+                     n_iter_no_change=2 if i % 4 < 2 else None, validation_fraction=0.25, random_state=i)
+        a, b = _ensemble("GB", True, X, y, w, **gb_kw), _ensemble("GB", False, X, y, w, **gb_kw)
+        np.testing.assert_array_equal(a.predict(X), b.predict(X))
+        np.testing.assert_array_equal(a.train_score_, b.train_score_)
+        np.testing.assert_array_equal(a.feature_importances_, b.feature_importances_)
+        rf_kw = dict(task=task, n_estimators=3, max_depth=4, max_features=None, bootstrap=True, random_state=i)
+        a, b = _ensemble("RF", True, X, y, w, **rf_kw), _ensemble("RF", False, X, y, w, **rf_kw)
+        for t, (ta, tb) in enumerate(zip(a.estimators_, b.estimators_)):
+            assert_same_tree(ta, tb, np.ascontiguousarray(X[:, a._model.feature_subsets_[t]]))
+
+
+# --------------------------------------------------------------------------- presort encoding
+def _reference_presort(X, rows):
+    """NumPy reference of the presort encoding (presort.hpp): per column, `rows` sorted by
+    value (NaN last, -0.0 == 0.0), ties by row id; high bit = value differs from previous."""
+    out = []
+    for c in range(X.shape[1]):
+        v = X[rows, c]
+        nan = np.isnan(v)
+        key = np.where(nan | (v == 0), 0.0, v)
+        order = np.lexsort((rows, key, nan))
+        r, k, nn = rows[order], key[order], nan[order]
+        new = np.ones(len(r), dtype=bool)
+        new[1:] = ~((k[1:] == k[:-1]) & ~nn[1:] & ~nn[:-1])
+        out.append(r.astype(np.uint32) | (new.astype(np.uint32) << np.uint32(31)))
+    return np.array(out, dtype=np.uint32).reshape(X.shape[1], len(rows))
+
+
+def _tied_matrix(rng, n, p):
+    vals = np.array([np.nan, -0.0, 0.0, 1.0, 2.0, 3.0, -10.0 + 1 / 32, 7.25])
+    return vals[rng.integers(0, len(vals), size=(n, p))]
+
+
+def _subset(rng, pop, frac):
+    s = np.flatnonzero(rng.uniform(size=pop) < frac).astype(np.uint32)
+    return s if len(s) else np.array([rng.integers(0, pop)], dtype=np.uint32)
+
+
+def test_presort_encoding_matches_reference():
+    rng = np.random.default_rng(20)
+    for _ in range(200):
+        n, p = int(rng.integers(1, 200)), int(rng.integers(1, 5))
+        X = _tied_matrix(rng, n, p)
+        rows = _subset(rng, n, 0.7)
+        np.testing.assert_array_equal(_rdt_native._presort(X, rows), _reference_presort(X, rows))
+
+
+def test_derived_round_presort_equals_fresh_presort():
+    # What gradient boosting does each round: take the per-fit presorted columns (over the
+    # training rows), keep the round's columns, drop the rows outside the round's subsample and
+    # renumber the rest -- must equal presorting the round's submatrix from scratch.
+    rng = np.random.default_rng(2024)
+    for _ in range(400):
+        n, p = int(rng.integers(1, 301)), int(rng.integers(1, 7))
+        X = _tied_matrix(rng, n, p)
+        train = _subset(rng, n, 0.8) if rng.uniform() < 0.5 else np.arange(n, dtype=np.uint32)
+        full = _rdt_native._presort(X, train)
+        fit_rows = train[_subset(rng, len(train), 0.5)]
+        cols = _subset(rng, p, 0.6)
+        new_id = np.full(n, -1, dtype=np.int32)
+        new_id[fit_rows] = np.arange(len(fit_rows), dtype=np.int32)
+        derived = _rdt_native._presort_restrict(np.ascontiguousarray(full[cols]), new_id, len(fit_rows))
+        fresh = _rdt_native._presort(np.ascontiguousarray(X[np.ix_(fit_rows, cols)]),
+                                     np.arange(len(fit_rows), dtype=np.uint32))
+        np.testing.assert_array_equal(derived, fresh)

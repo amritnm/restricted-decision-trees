@@ -208,13 +208,16 @@ class RandomForestRDT:
         if sample_weight is not None:
             sample_weight = np.asarray(sample_weight, dtype=np.float64, order="C")
 
-        self._model = _rdt_native.RandomForestModel(
+        # The native fit runs with the GIL released; only publish the model
+        # once it is fully fitted.
+        model = _rdt_native.RandomForestModel(
             self.task, self.criterion, self.max_depth, self.min_samples_split, self.min_samples_leaf,
             self.min_impurity_decrease, self.n_estimators, _resolve_max_features(self.max_features),
             self.bootstrap, self.max_samples, self.oob_score,
             _resolve_random_state(self.random_state), _resolve_n_jobs(self.n_jobs),
         )
-        self._model.fit(X, y, sample_weight)
+        model.fit(X, y, sample_weight)
+        self._model = model
 
         self.feature_importances_ = np.array(self._model.feature_importances_)
         if self.oob_score:
@@ -399,7 +402,9 @@ class GradientBoostingRDT:
         if sample_weight is not None:
             sample_weight = np.asarray(sample_weight, dtype=np.float64, order="C")
 
-        self._model = _rdt_native.GradientBoostingModel(
+        # The native fit runs with the GIL released; only publish the model
+        # once it is fully fitted.
+        model = _rdt_native.GradientBoostingModel(
             self.task, self.loss, self.max_depth, self.min_samples_split, self.min_samples_leaf,
             self.min_impurity_decrease, self.n_estimators, self.learning_rate, self.subsample,
             _resolve_max_features(self.max_features), self.validation_fraction,
@@ -407,7 +412,8 @@ class GradientBoostingRDT:
             self.reg_alpha, self.reg_lambda, self.huber_delta, self.quantile_alpha,
             _resolve_random_state(self.random_state), _resolve_n_jobs(self.n_jobs),
         )
-        self._model.fit(X, y, sample_weight)
+        model.fit(X, y, sample_weight)
+        self._model = model
 
         self.feature_importances_ = np.array(self._model.feature_importances_)
         self.train_score_ = np.array(self._model.train_score_)

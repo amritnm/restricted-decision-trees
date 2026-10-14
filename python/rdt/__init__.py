@@ -106,11 +106,14 @@ class RDT:
 
         self.n_features_ = X.shape[1]
 
-        self._model = _rdt_native.RDTModel(
+        # The native fit runs with the GIL released; only publish the model
+        # once it is fully fitted.
+        model = _rdt_native.RDTModel(
             self.task, self.criterion, self.max_depth,
             self.min_samples_split, self.min_samples_leaf, self.min_impurity_decrease,
         )
-        self._model.fit(X, y, sample_weight)
+        model.fit(X, y, sample_weight)
+        self._model = model
 
         if self.task == "classification":
             self.classes_ = np.array(self._model.classes_)

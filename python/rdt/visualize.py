@@ -6,6 +6,13 @@ against the native C++-backed `RDT` class: it recomputes per-node statistics
 (impurity, target average, leaf purity) from `node.indices` and the training
 labels, exactly as the original did, rather than assuming those stats are
 cached on the node.
+
+Only a standalone `RDT` keeps `node.indices` after fitting; the sub-trees of
+`RandomForestRDT.estimators_` do not (each would otherwise hold
+~4 * n_samples * (max_depth + 1) bytes, and their indices referred to the
+tree's bootstrap sample rather than to the training rows anyway).
+`print_tree` works for every tree (it uses `node.n_samples`);
+`export_tree_dict` / `visualize_d3_observable` need the indices.
 """
 
 from __future__ import annotations
@@ -89,6 +96,10 @@ def _node_to_dict(model, node, y, depth, feature_names, class_names) -> Dict[str
     return node_dict
 
 
+def _n_samples(node) -> int:
+    return node.n_samples if hasattr(node, "n_samples") else len(node.indices)
+
+
 def export_tree_dict(
     model,
     y: np.ndarray,
@@ -98,6 +109,12 @@ def export_tree_dict(
     """Export a fitted RDT's tree structure as a nested dict with per-node statistics."""
     if model.root is None:
         raise ValueError("Tree has not been fitted yet. Call fit() first.")
+    if _n_samples(model.root) > 0 and len(model.root.indices) == 0:
+        raise ValueError(
+            "This tree does not retain its per-node training indices (ensemble sub-estimators "
+            "drop them after fitting to save memory), so per-node statistics cannot be computed; "
+            "fit a standalone rdt.RDT to use export_tree_dict / visualize_d3_observable."
+        )
 
     y = np.asarray(y)
     if feature_names is None:
@@ -116,10 +133,10 @@ def print_tree(model, feature_names: Optional[List[str]] = None) -> None:
     def _print(node, depth):
         indent = "  " * depth
         if node.is_leaf:
-            print(f"{indent}leaf: value={node.value:g}, samples={len(node.indices)}")
+            print(f"{indent}leaf: value={node.value:g}, samples={_n_samples(node)}")
         else:
             fname = feature_names[node.split_feature]
-            print(f"{indent}[{fname} <= {node.split_threshold:.4f}] samples={len(node.indices)}")
+            print(f"{indent}[{fname} <= {node.split_threshold:.4f}] samples={_n_samples(node)}")
             _print(node.left, depth + 1)
             _print(node.right, depth + 1)
 

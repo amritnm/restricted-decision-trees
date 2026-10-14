@@ -29,6 +29,59 @@ VectorView to_vector_view(const InputVector& y) {
     return VectorView(y.data(), y.shape(0));
 }
 
+// fit()/predict() run with the GIL released: the views above are plain
+// pointers into the input arrays, which the bound function's arguments keep
+// alive for the duration of the call, and the core never touches a Python
+// object. Results are copied into NumPy arrays only after the GIL is
+// re-acquired.
+using OutputArray = nb::ndarray<nb::numpy, double>;
+
+OutputArray to_numpy(std::vector<double>&& values, std::size_t n_rows, std::size_t n_cols, bool two_d) {
+    auto* heap = new std::vector<double>(std::move(values));
+    nb::capsule owner(heap, [](void* p) noexcept { delete static_cast<std::vector<double>*>(p); });
+    if (!two_d) return OutputArray(heap->data(), {n_rows}, owner);
+    // v0.2.0 returned a list of per-row lists; for zero rows np.array() of
+    // that is shape (0,), so keep that shape.
+    if (n_rows == 0) return OutputArray(heap->data(), {std::size_t{0}}, owner);
+    return OutputArray(heap->data(), {n_rows, n_cols}, owner);
+}
+
+template <class Model>
+void fit_released(Model& self, const InputMatrix& X, const InputVector& y,
+                  const std::optional<InputVector>& sample_weight) {
+    const MatrixView xv = to_matrix_view(X);
+    const VectorView yv = to_vector_view(y);
+    std::optional<VectorView> wv;
+    if (sample_weight) wv = to_vector_view(*sample_weight);
+    nb::gil_scoped_release release;
+    self.fit(xv, yv, wv ? &*wv : nullptr);
+}
+
+template <class Model>
+OutputArray predict_released(const Model& self, const InputMatrix& X) {
+    const MatrixView xv = to_matrix_view(X);
+    std::vector<double> out;
+    {
+        nb::gil_scoped_release release;
+        out = self.predict(xv);
+    }
+    const std::size_t n = out.size();
+    return to_numpy(std::move(out), n, 1, /*two_d=*/false);
+}
+
+template <class Model>
+OutputArray predict_proba_released(const Model& self, const InputMatrix& X) {
+    const MatrixView xv = to_matrix_view(X);
+    const std::size_t n = xv.n_rows();
+    const std::size_t k = self.n_classes();
+    std::vector<double> out(n * k);
+    {
+        nb::gil_scoped_release release;
+        self.predict_proba_into(xv, out.data());
+    }
+    return to_numpy(std::move(out), n, k, /*two_d=*/true);
+}
+
 GBLoss loss_from_string(const std::string& loss) {
     if (loss == "log_loss") return GBLoss::LogLoss;
     if (loss == "exponential") return GBLoss::Exponential;
@@ -45,6 +98,7 @@ NB_MODULE(_rdt_native, m) {
     nb::class_<Node>(m, "Node")
         .def_prop_ro("is_leaf", &Node::is_leaf)
         .def_prop_ro("indices", [](const Node& n) { return n.indices; })
+        .def_prop_ro("n_samples", [](const Node& n) { return n.n_samples; })
         .def_ro("split_feature", &Node::split_feature)
         .def_ro("split_threshold", &Node::split_threshold)
         .def_ro("value", &Node::value)
@@ -56,7 +110,8 @@ NB_MODULE(_rdt_native, m) {
 
     nb::class_<RDTModel>(m, "RDTModel")
         .def(nb::new_([](std::string task, std::string criterion, int max_depth,
-                          int min_samples_split, int min_samples_leaf, double min_impurity_decrease) {
+                          int min_samples_split, int min_samples_leaf, double min_impurity_decrease,
+                          bool presort) {
                  TreeParams p;
                  p.task = (task == "classification") ? Task::Classification : Task::Regression;
                  p.criterion = criterion_from_string(criterion);
@@ -64,25 +119,18 @@ NB_MODULE(_rdt_native, m) {
                  p.min_samples_split = min_samples_split;
                  p.min_samples_leaf = min_samples_leaf;
                  p.min_impurity_decrease = min_impurity_decrease;
+                 p.presort = presort;
                  return new RDTModel(p);
              }),
              "task"_a, "criterion"_a, "max_depth"_a, "min_samples_split"_a, "min_samples_leaf"_a,
-             "min_impurity_decrease"_a = 0.0)
+             "min_impurity_decrease"_a = 0.0, "presort"_a = true)
         .def("fit",
              [](RDTModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
-                 if (sample_weight) {
-                     VectorView wv = to_vector_view(*sample_weight);
-                     self.fit(to_matrix_view(X), to_vector_view(y), &wv);
-                 } else {
-                     self.fit(to_matrix_view(X), to_vector_view(y));
-                 }
+                 fit_released(self, X, y, sample_weight);
              },
              "X"_a, "y"_a, "sample_weight"_a = nb::none())
-        .def("predict",
-             [](const RDTModel& self, InputMatrix X) { return self.predict(to_matrix_view(X)); },
-             "X"_a)
-        .def("predict_proba",
-             [](const RDTModel& self, InputMatrix X) { return self.predict_proba(to_matrix_view(X)); },
+        .def("predict", [](const RDTModel& self, InputMatrix X) { return predict_released(self, X); }, "X"_a)
+        .def("predict_proba", [](const RDTModel& self, InputMatrix X) { return predict_proba_released(self, X); },
              "X"_a)
         .def_prop_ro("classes_", [](const RDTModel& self) { return self.classes(); })
         .def_prop_ro("n_classes_", [](const RDTModel& self) { return self.n_classes(); })
@@ -119,7 +167,8 @@ NB_MODULE(_rdt_native, m) {
         .def(nb::new_([](std::string task, std::string criterion, int max_depth,
                           int min_samples_split, int min_samples_leaf, double min_impurity_decrease,
                           int n_estimators, MaxFeaturesSpec max_features, bool bootstrap,
-                          double max_samples, bool oob_score, std::uint64_t random_state, int n_jobs) {
+                          double max_samples, bool oob_score, std::uint64_t random_state, int n_jobs,
+                          bool presort) {
                  ForestParams p;
                  p.tree_params.task = (task == "classification") ? Task::Classification : Task::Regression;
                  p.tree_params.criterion = criterion_from_string(criterion);
@@ -134,25 +183,21 @@ NB_MODULE(_rdt_native, m) {
                  p.oob_score = oob_score;
                  p.random_state = random_state;
                  p.n_jobs = n_jobs;
+                 p.tree_params.presort = presort;
                  return new RandomForestModel(p);
              }),
              "task"_a, "criterion"_a, "max_depth"_a, "min_samples_split"_a, "min_samples_leaf"_a,
              "min_impurity_decrease"_a, "n_estimators"_a, "max_features"_a, "bootstrap"_a,
-             "max_samples"_a, "oob_score"_a, "random_state"_a, "n_jobs"_a)
+             "max_samples"_a, "oob_score"_a, "random_state"_a, "n_jobs"_a, "presort"_a = true)
         .def("fit",
              [](RandomForestModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
-                 if (sample_weight) {
-                     VectorView wv = to_vector_view(*sample_weight);
-                     self.fit(to_matrix_view(X), to_vector_view(y), &wv);
-                 } else {
-                     self.fit(to_matrix_view(X), to_vector_view(y));
-                 }
+                 fit_released(self, X, y, sample_weight);
              },
              "X"_a, "y"_a, "sample_weight"_a = nb::none())
-        .def("predict",
-             [](const RandomForestModel& self, InputMatrix X) { return self.predict(to_matrix_view(X)); }, "X"_a)
+        .def("predict", [](const RandomForestModel& self, InputMatrix X) { return predict_released(self, X); },
+             "X"_a)
         .def("predict_proba",
-             [](const RandomForestModel& self, InputMatrix X) { return self.predict_proba(to_matrix_view(X)); }, "X"_a)
+             [](const RandomForestModel& self, InputMatrix X) { return predict_proba_released(self, X); }, "X"_a)
         .def_prop_ro("classes_", [](const RandomForestModel& self) { return self.classes(); })
         .def_prop_ro("n_classes_", [](const RandomForestModel& self) { return self.n_classes(); })
         .def_prop_ro("feature_importances_", [](const RandomForestModel& self) { return self.feature_importances(); })
@@ -175,7 +220,7 @@ NB_MODULE(_rdt_native, m) {
                           int n_estimators, double learning_rate, double subsample,
                           MaxFeaturesSpec max_features, double validation_fraction, int n_iter_no_change,
                           double tol, double reg_alpha, double reg_lambda, double huber_delta,
-                          double quantile_alpha, std::uint64_t random_state, int n_jobs) {
+                          double quantile_alpha, std::uint64_t random_state, int n_jobs, bool presort) {
                  GBParams p;
                  p.tree_params.task = (task == "classification") ? Task::Classification : Task::Regression;
                  p.tree_params.max_depth = max_depth;
@@ -196,26 +241,24 @@ NB_MODULE(_rdt_native, m) {
                  p.quantile_alpha = quantile_alpha;
                  p.random_state = random_state;
                  p.n_jobs = n_jobs;
+                 p.tree_params.presort = presort;
                  return new GradientBoostingModel(p);
              }),
              "task"_a, "loss"_a, "max_depth"_a, "min_samples_split"_a, "min_samples_leaf"_a,
              "min_impurity_decrease"_a, "n_estimators"_a, "learning_rate"_a, "subsample"_a,
              "max_features"_a, "validation_fraction"_a, "n_iter_no_change"_a, "tol"_a,
-             "reg_alpha"_a, "reg_lambda"_a, "huber_delta"_a, "quantile_alpha"_a, "random_state"_a, "n_jobs"_a)
+             "reg_alpha"_a, "reg_lambda"_a, "huber_delta"_a, "quantile_alpha"_a, "random_state"_a, "n_jobs"_a,
+             "presort"_a = true)
         .def("fit",
              [](GradientBoostingModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
-                 if (sample_weight) {
-                     VectorView wv = to_vector_view(*sample_weight);
-                     self.fit(to_matrix_view(X), to_vector_view(y), &wv);
-                 } else {
-                     self.fit(to_matrix_view(X), to_vector_view(y));
-                 }
+                 fit_released(self, X, y, sample_weight);
              },
              "X"_a, "y"_a, "sample_weight"_a = nb::none())
         .def("predict",
-             [](const GradientBoostingModel& self, InputMatrix X) { return self.predict(to_matrix_view(X)); }, "X"_a)
+             [](const GradientBoostingModel& self, InputMatrix X) { return predict_released(self, X); }, "X"_a)
         .def("predict_proba",
-             [](const GradientBoostingModel& self, InputMatrix X) { return self.predict_proba(to_matrix_view(X)); }, "X"_a)
+             [](const GradientBoostingModel& self, InputMatrix X) { return predict_proba_released(self, X); },
+             "X"_a)
         .def_prop_ro("classes_", [](const GradientBoostingModel& self) { return self.classes(); })
         .def_prop_ro("n_classes_", [](const GradientBoostingModel& self) { return self.n_classes(); })
         .def_prop_ro("feature_importances_", [](const GradientBoostingModel& self) { return self.feature_importances(); })

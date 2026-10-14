@@ -209,9 +209,10 @@ less than `n_estimators` if early stopping triggered).
   own sample and column subset — plus about 48 bytes per row of search state,
   and sorting needs a transient buffer of 16 bytes per row for each of up to
   8 columns sorted together (at most `n_features / 4`). This is less than
-  v0.2.0's per-tree copies of `X` for the ensembles, but more than v0.2.0 for
-  a single tree on tall, narrow data (e.g. 2,000,000 x 4: about +195 MB vs
-  +101 MB); `presort=False` avoids it.
+  v0.2.0's per-tree copies of `X` for the ensembles on wide data, but more than
+  v0.2.0 for a single tree on tall, narrow data (e.g. 2,000,000 x 4: about
+  +190 MB vs +100–130 MB) and for boosting with few rounds and a small
+  `colsample_bytree`; `presort=False` avoids it.
 - **No copies of `X`:** the ensembles fit and predict through each tree's
   rows / column subset in place.
 - **GIL:** `fit`, `predict` and `predict_proba` release the GIL while the

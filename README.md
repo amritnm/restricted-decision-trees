@@ -145,8 +145,11 @@ See `examples/ensemble_usage.py` for a fuller, runnable example.
 - `n_features_` — number of features seen during `fit`.
 - `classes_`, `n_classes_` — unique class labels and their count (classification only).
 - `root` — the fitted tree's root `Node` (`.is_leaf`, `.split_feature`,
-  `.split_threshold`, `.value`, `.class_counts`, `.left`, `.right`, `.indices`)
-  for direct programmatic inspection.
+  `.split_threshold`, `.value`, `.class_counts`, `.left`, `.right`,
+  `.n_samples`, `.indices`) for direct programmatic inspection. `.indices`
+  (the training rows that reached the node) is kept only for a standalone
+  `RDT`; sub-trees of the ensembles drop it after fitting to save memory
+  (`.n_samples` is always available).
 
 ### `rdt.ensemble.RandomForestRDT`
 
@@ -182,6 +185,22 @@ less than `n_estimators` if early stopping triggered).
 - `visualize_d3_observable(model, y, feature_names=None, class_names=None, filename="rdt_tree_d3.html", width=1200, height=800) -> str` —
   render an interactive, collapsible D3.js tree to an HTML file (and return
   the HTML string).
+
+## Performance notes
+
+- **Split search:** each feature is sorted once per fit and every depth scores
+  all of its nodes in one pass over the presorted rows, instead of sorting
+  every node's samples for every feature at every depth (see
+  [docs/ALGORITHM_DETAILS.md](docs/ALGORITHM_DETAILS.md#complexity)). The
+  presorted orders use 4 bytes per (row, feature) while fitting.
+- **No copies of `X`:** the ensembles fit and predict through each tree's
+  rows / column subset in place.
+- **GIL:** `fit`, `predict` and `predict_proba` release the GIL while the
+  native code runs, so other Python threads (including other fits) keep
+  running.
+- `n_jobs` parallelizes across trees: Random Forest trees, and a multiclass
+  boosting round's per-class trees. Binary / regression boosting fits one
+  tree per round, so it does not use extra threads.
 
 ## How it works
 

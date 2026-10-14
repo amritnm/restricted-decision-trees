@@ -91,10 +91,25 @@ function find_best_threshold(node, feature):
     return best_threshold, best_improvement
 ```
 
-The native core sorts each `(node, feature)` pair's values once and sweeps
-the split point with incrementally-updated running class counts / sums,
-rather than rescanning all samples for every candidate threshold — an
-`O(1)`-amortized-per-candidate scan instead of `O(n)` per candidate.
+The native core sweeps the split point with incrementally-updated running
+class counts / sums, rather than rescanning all samples for every candidate
+threshold — an `O(1)`-amortized-per-candidate scan instead of `O(n)` per
+candidate.
+
+It also exploits the RDT structure: every node at a depth is scored on the
+same candidate feature, so each feature's rows are **sorted once per fit**
+(not once per node, feature and depth), and at each depth one pass over a
+feature's presorted rows routes every row to its node and sweeps all of the
+depth's nodes together (`core/include/rdt/presort.hpp`). Gradient Boosting
+sorts once per `fit()` and derives each round's (subsampled) order from it in
+linear time. This chooses the same features and thresholds as the per-node
+sort — same candidate boundaries, midpoints, sample-count constraints,
+summation order of the running statistics and tie-breaking — except that the
+order of samples *within a run of tied feature values* is fixed (row order)
+where `std::sort` left it unspecified; that can change the last bits of an
+improvement when the running sums are inexact, and so can only matter when
+two candidates' improvements are equal to within rounding error. MAE keeps
+the per-node path.
 
 ### On "two-pass"
 
@@ -181,11 +196,22 @@ Tree growth stops at a node when:
 
 ## Complexity
 
-`O(d * m * n)` for `d` depths, `m` candidate features, `n` samples —
-asymptotically the same order as a standard greedy tree's `O(d * m * n)`,
-just with a higher constant factor from scoring every feature against every
-node at a depth before committing to a split (versus a standard tree scoring
-each node independently).
+For `d` depths, `m` candidate features and `n` samples:
+
+- **Gini / entropy / MSE:** a one-off `O(m * n log n)` presort, then
+  `O(m * n)` per depth — `O(m * n log n + d * m * n)` per tree. (Sorting every
+  node's samples for every feature at every depth, as earlier versions did,
+  costs `O(d * m * n log n)`.) Gradient Boosting pays the presort once per
+  `fit()`; each round then costs `O(m * n)` to restrict it to the round's
+  subsample plus `O(d * m * n_subsample)` for the search.
+- **MAE:** the median is recomputed per candidate threshold, `O(n log n)`
+  each, i.e. up to `O(d * m * n^2 log n)` per tree.
+
+Memory during `fit`: the presorted orders take 4 bytes per (row, feature)
+(Gradient Boosting keeps the per-fit ones, plus the current round's, for the
+duration of `fit`). No copy of `X` is made by the ensembles at fit or predict
+time — each tree reads its bootstrap rows / column subset through an index
+mapping.
 
 ## Limitations
 

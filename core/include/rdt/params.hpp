@@ -42,6 +42,22 @@ struct TreeParams {
     // leaf. sklearn calls this min_impurity_decrease; XGBoost/LightGBM call
     // the equivalent gamma/min_split_loss.
     double min_impurity_decrease = 0.0;
+
+    // Implementation choices that do not change which splits are chosen.
+    //
+    // presort: score every node of a depth in one pass over each feature's
+    // presorted rows (presort.hpp) instead of sorting each (node, feature)
+    // pair's samples at every depth. Both searches pick the same features and
+    // thresholds; the only possible difference is floating-point summation
+    // order *within a run of tied feature values* (whose internal order the
+    // per-node std::sort leaves unspecified). MAE always uses the per-node
+    // search. Exposed mainly so tests can compare the two.
+    bool presort = true;
+    // Keep each Node's `indices` (the training rows that reached it) after
+    // fit. rdt.visualize's export_tree_dict needs them for a standalone tree;
+    // the ensembles turn this off, since they would otherwise retain
+    // ~4 * n_samples * (max_depth + 1) bytes per fitted tree.
+    bool retain_indices = true;
 };
 
 } // namespace rdt

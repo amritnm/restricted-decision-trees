@@ -1,0 +1,374 @@
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#include "rdt/criteria.hpp"
+#include "rdt/matrix.hpp"
+#include "rdt/params.hpp"
+
+// Presorted split search.
+//
+// The RDT constraint means every node at a depth is scored on the same
+// candidate feature, so instead of sorting each (node, feature) pair's
+// samples at every depth (find_best_threshold), each column is sorted once
+// per fit and every depth's candidate feature is scored for *all* of that
+// depth's nodes in a single pass over the column's presorted rows: each row
+// is routed to its node's running aggregates, and a node's candidate
+// boundaries are the points where its own subsequence of values changes.
+// Cost per depth: O(n_features * n) instead of
+// O(n_features * sum_nodes(n_node * log n_node)), plus a one-off
+// O(n_features * n log n) presort (shared by every boosting round).
+//
+// Exactness. For each node this reproduces find_best_threshold's arithmetic
+// operation by operation: the same candidate boundaries (between distinct
+// adjacent values only), the same midpoint, the same min_samples_leaf test,
+// node totals accumulated in the same feature-sorted order, the same running
+// left/right updates, classes numbered in the same first-encountered order,
+// and the same strict '>' tie-breaking, with the expressions written
+// identically so the compiler contracts them (FMA) the same way. The one
+// unavoidable difference is the order of samples *inside a run of tied
+// feature values*: here it is ascending row id (a stable sort); in
+// find_best_threshold it is whatever std::sort leaves, which is unspecified
+// (libc++, libstdc++ and MSVC all happen to be stable for short ranges). The
+// set of samples on each side of every candidate boundary is the same, so
+// the candidate thresholds are the same; only the last bits of an
+// improvement can differ -- through the rounding of running sums that are
+// not exact (non-integer weights, real-valued targets) or, for
+// classification, which class is encountered first among tied smallest
+// values. A different split can therefore only be chosen between candidates
+// whose improvements are equal to within rounding error.
+namespace rdt {
+
+// A presorted column entry: the row id in the low 31 bits; the high bit is
+// set when the row's value differs from the previous entry's (operator==,
+// so -0.0 == 0.0 and NaN never equals anything).
+constexpr std::uint32_t kPresortRowMask = 0x7FFFFFFFu;
+constexpr std::uint32_t kPresortNewValue = 0x80000000u;
+// Row ids must fit in the low 31 bits.
+constexpr std::size_t kPresortMaxRows = static_cast<std::size_t>(kPresortRowMask);
+
+// Order-preserving map from double to uint64 (-0.0 and 0.0 map together;
+// NaN sorts after +inf). Sorting by (key, row) is a strict total order even
+// with NaN in X, unlike operator< on the doubles themselves.
+inline std::uint64_t presort_key(double x) {
+    if (std::isnan(x)) return ~std::uint64_t{0};
+    if (x == 0.0) x = 0.0;
+    std::uint64_t u;
+    std::memcpy(&u, &x, sizeof u);
+    return (u >> 63) ? ~u : (u | 0x8000000000000000ULL);
+}
+
+// Read-only per-feature presorted orders as handed to RDTModel::fit:
+// columns[f] holds the n_entries entries (one per row the tree is fitted on)
+// for the tree's feature f.
+struct PresortedView {
+    std::vector<const std::uint32_t*> columns;
+    std::size_t n_entries = 0;
+};
+
+// Owning presorted orders: for every column of X, the given rows sorted by
+// (value ascending, NaN last, row id ascending), encoded as above.
+// 4 bytes per (row, column).
+class SortedColumns {
+public:
+    SortedColumns() = default;
+
+    template <class Matrix>
+    SortedColumns(const Matrix& X, const std::vector<std::uint32_t>& rows) {
+        build(X, rows);
+    }
+
+    // `src` restricted to the rows with new_id[row] >= 0, renumbered to
+    // new_id[row] (which must preserve the rows' relative order, so ties
+    // stay ordered by row). Used by boosting to derive each round's
+    // presorted columns from the per-fit ones in O(n) per column.
+    SortedColumns(const PresortedView& src, const std::int32_t* new_id, std::size_t n_kept) {
+        n_entries_ = n_kept;
+        n_cols_ = src.columns.size();
+        data_.assign(n_entries_ * n_cols_ + 1, 0u);
+        for (std::size_t c = 0; c < n_cols_; ++c) {
+            const std::uint32_t* in = src.columns[c];
+            std::uint32_t* out = data_.data() + c * n_entries_;
+            std::size_t k = 0;
+            std::uint32_t pending = 0; // a new value started since the last kept entry
+            for (std::size_t i = 0; i < src.n_entries; ++i) {
+                // Branch-free: every entry is written at out[k], and k only
+                // advances past kept ones (data_ has one slot of slack).
+                const std::uint32_t e = in[i];
+                pending |= e & kPresortNewValue;
+                const std::int32_t id = new_id[e & kPresortRowMask];
+                const std::uint32_t keep = id >= 0 ? 1u : 0u;
+                out[k] = static_cast<std::uint32_t>(id) | pending;
+                k += keep;
+                pending &= keep - 1u;
+            }
+        }
+    }
+
+    std::size_t n_entries() const { return n_entries_; }
+    std::size_t n_cols() const { return n_cols_; }
+    const std::uint32_t* column(std::size_t col) const { return data_.data() + col * n_entries_; }
+
+    // Columns for the given subset of this object's columns, in that order
+    // (nullptr = all columns).
+    PresortedView view(const std::vector<std::uint32_t>* cols = nullptr) const {
+        PresortedView v;
+        v.n_entries = n_entries_;
+        if (cols) {
+            v.columns.reserve(cols->size());
+            for (auto c : *cols) v.columns.push_back(column(c));
+        } else {
+            v.columns.reserve(n_cols_);
+            for (std::size_t c = 0; c < n_cols_; ++c) v.columns.push_back(column(c));
+        }
+        return v;
+    }
+
+private:
+    std::vector<std::uint32_t> data_;
+    std::size_t n_entries_ = 0;
+    std::size_t n_cols_ = 0;
+
+    template <class Matrix>
+    void build(const Matrix& X, const std::vector<std::uint32_t>& rows) {
+        struct KeyRow {
+            std::uint64_t key;
+            std::uint32_t row;
+        };
+        constexpr std::uint64_t kNaNKey = ~std::uint64_t{0};
+        // Gather a few columns per pass over the rows so a row-major X is
+        // read a cache line at a time rather than one strided double at a
+        // time.
+        constexpr std::size_t kBlock = 8;
+
+        n_entries_ = rows.size();
+        n_cols_ = X.n_cols();
+        data_.assign(n_entries_ * n_cols_, 0u);
+        std::vector<std::vector<KeyRow>> buf(std::min(kBlock, n_cols_), std::vector<KeyRow>(n_entries_));
+        for (std::size_t c0 = 0; c0 < n_cols_; c0 += kBlock) {
+            const std::size_t nb = std::min(kBlock, n_cols_ - c0);
+            for (std::size_t i = 0; i < n_entries_; ++i) {
+                const std::uint32_t r = rows[i];
+                for (std::size_t j = 0; j < nb; ++j) buf[j][i] = {presort_key(X(r, c0 + j)), r};
+            }
+            for (std::size_t j = 0; j < nb; ++j) {
+                auto& v = buf[j];
+                std::sort(v.begin(), v.end(), [](const KeyRow& a, const KeyRow& b) {
+                    return a.key < b.key || (a.key == b.key && a.row < b.row);
+                });
+                std::uint32_t* out = data_.data() + (c0 + j) * n_entries_;
+                for (std::size_t k = 0; k < n_entries_; ++k) {
+                    const bool new_value = k == 0 || v[k].key != v[k - 1].key || v[k].key == kNaNKey;
+                    out[k] = v[k].row | (new_value ? kPresortNewValue : 0u);
+                }
+            }
+        }
+    }
+};
+
+// What the presorted search needs per row, indexed by row id.
+struct ScanRow {
+    double y = 0.0;
+    double w = 1.0;
+    std::int32_t node = -1; // index into the depth's nodes being split; -1 = skip this row
+    std::int32_t cls = 0;   // index into RDTModel::classes() (classification only)
+};
+
+// Best split of one node on one feature, as found by DepthScanner. The
+// threshold is the midpoint of rows lo_row's and hi_row's values.
+struct NodeSplit {
+    bool found = false;
+    double improvement = 0.0;
+    std::uint32_t lo_row = 0;
+    std::uint32_t hi_row = 0;
+};
+
+// Scores one feature for every node of a depth. One pass over the
+// feature's presorted rows gathers each node's rows into a contiguous
+// segment (in sorted order); each segment is then swept twice -- totals,
+// then candidate boundaries -- with the running aggregates in registers.
+// Gini, Entropy and MSE only (MAE keeps the per-node path).
+class DepthScanner {
+public:
+    DepthScanner(Criterion criterion, int min_samples_leaf, std::size_t n_classes)
+        : criterion_(criterion), min_samples_leaf_(min_samples_leaf), n_classes_(n_classes) {}
+
+    static bool supports(Criterion c) { return c != Criterion::MAE; }
+
+    // node_sizes[k] = number of rows routed to node k (ScanRow::node == k).
+    void begin_depth(const std::vector<std::size_t>& node_sizes) {
+        node_begin_.assign(node_sizes.size() + 1, 0);
+        for (std::size_t k = 0; k < node_sizes.size(); ++k) node_begin_[k + 1] = node_begin_[k] + node_sizes[k];
+        items_.resize(node_begin_.back());
+        cursor_.resize(node_sizes.size());
+        if (criterion_ != Criterion::MSE) {
+            local_.assign(n_classes_, -1);
+            total_.assign(n_classes_, 0.0);
+            left_.assign(n_classes_, 0.0);
+            right_.assign(n_classes_, 0.0);
+        }
+    }
+
+    // `sorted`: the feature's presorted entries (presort.hpp) covering at
+    // least every row with rows[row].node >= 0.
+    void score_feature(const std::uint32_t* sorted, std::size_t n_entries, const ScanRow* rows,
+                       std::vector<NodeSplit>& out) {
+        const std::size_t n_nodes = cursor_.size();
+        out.assign(n_nodes, NodeSplit{});
+        gather(sorted, n_entries, rows);
+        for (std::size_t k = 0; k < n_nodes; ++k) {
+            const Item* b = items_.data() + node_begin_[k];
+            const Item* e = items_.data() + node_begin_[k + 1];
+            if (criterion_ == Criterion::MSE) {
+                score_mse(b, e, out[k]);
+            } else {
+                score_classification(b, e, out[k]);
+            }
+        }
+    }
+
+private:
+    struct Item {
+        double y;
+        double w;
+        std::uint32_t row;
+        std::uint32_t run; // index of the row's run of equal values in the sorted column
+        std::int32_t cls;
+    };
+
+    Criterion criterion_;
+    int min_samples_leaf_;
+    std::size_t n_classes_;
+    std::vector<std::size_t> node_begin_; // node k's items are [node_begin_[k], node_begin_[k + 1])
+    std::vector<std::size_t> cursor_;
+    std::vector<Item> items_;
+    std::vector<std::int32_t> local_;     // class -> first-encounter position within the node
+    std::vector<double> total_, left_, right_; // per first-encounter position
+
+    bool leaf_sizes_ok(std::size_t n_left, std::size_t n_total) const {
+        const std::size_t n_right = n_total - n_left;
+        return !(static_cast<int>(n_left) < min_samples_leaf_ ||
+                 static_cast<int>(n_right) < min_samples_leaf_);
+    }
+
+    void gather(const std::uint32_t* sorted, std::size_t n_entries, const ScanRow* rows) {
+        for (std::size_t k = 0; k < cursor_.size(); ++k) cursor_[k] = node_begin_[k];
+        std::uint32_t run = 0;
+        for (std::size_t i = 0; i < n_entries; ++i) {
+            const std::uint32_t e = sorted[i];
+            run += e >> 31;
+            const std::uint32_t row = e & kPresortRowMask;
+            const ScanRow& r = rows[row];
+            if (r.node < 0) continue;
+            items_[cursor_[static_cast<std::size_t>(r.node)]++] = Item{r.y, r.w, row, run, r.cls};
+        }
+    }
+
+    // One node's items in sorted order. A boundary between the node's
+    // previous row and the current one is evaluated (with the previous rows
+    // on the left) when a new run of values started in between.
+    void score_mse(const Item* begin, const Item* end, NodeSplit& out) const {
+        const std::size_t n = static_cast<std::size_t>(end - begin);
+        double total_sum = 0.0, total_sum_sq = 0.0, total_weight = 0.0;
+        for (const Item* p = begin; p != end; ++p) {
+            total_sum += p->w * p->y;
+            total_sum_sq += p->w * p->y * p->y;
+            total_weight += p->w;
+        }
+        const double parent_impurity = mse_from_sums(total_sum, total_sum_sq, total_weight);
+
+        double best_improvement = -std::numeric_limits<double>::infinity();
+        double left_sum = 0.0, left_sum_sq = 0.0, left_weight = 0.0;
+        std::size_t n_left = 0;
+        for (const Item* p = begin; p != end; ++p) {
+            if (n_left > 0 && p[-1].run != p->run && leaf_sizes_ok(n_left, n)) {
+                double right_sum = total_sum - left_sum;
+                double right_sum_sq = total_sum_sq - left_sum_sq;
+                double right_weight = total_weight - left_weight;
+
+                double left_imp = mse_from_sums(left_sum, left_sum_sq, left_weight);
+                double right_imp = mse_from_sums(right_sum, right_sum_sq, right_weight);
+
+                double weighted = (left_weight / total_weight) * left_imp +
+                                   (right_weight / total_weight) * right_imp;
+                double improvement = parent_impurity - weighted;
+
+                if (improvement > best_improvement) {
+                    best_improvement = improvement;
+                    out.found = true;
+                    out.improvement = improvement;
+                    out.lo_row = p[-1].row;
+                    out.hi_row = p->row;
+                }
+            }
+            left_sum += p->w * p->y;
+            left_sum_sq += p->w * p->y * p->y;
+            left_weight += p->w;
+            ++n_left;
+        }
+    }
+
+    double class_impurity(const double* counts, std::size_t n, double weight) const {
+        return (criterion_ == Criterion::Gini) ? gini_from_counts(counts, n, weight)
+                                               : entropy_from_counts(counts, n, weight);
+    }
+
+    void score_classification(const Item* begin, const Item* end, NodeSplit& out) {
+        const std::size_t n = static_cast<std::size_t>(end - begin);
+        // Class totals in sorted order, classes numbered by first encounter
+        // (find_best_threshold's order, which fixes the summation order
+        // inside the impurity functions).
+        std::size_t n_seen = 0;
+        for (const Item* p = begin; p != end; ++p) {
+            std::int32_t& pos = local_[static_cast<std::size_t>(p->cls)];
+            if (pos < 0) {
+                pos = static_cast<std::int32_t>(n_seen++);
+                total_[static_cast<std::size_t>(pos)] = 0.0;
+            }
+            total_[static_cast<std::size_t>(pos)] += p->w;
+        }
+        double total_weight = 0.0;
+        for (std::size_t c = 0; c < n_seen; ++c) total_weight += total_[c];
+        const double parent_impurity = class_impurity(total_.data(), n_seen, total_weight);
+        for (std::size_t c = 0; c < n_seen; ++c) {
+            left_[c] = 0.0;
+            right_[c] = total_[c];
+        }
+
+        double best_improvement = -std::numeric_limits<double>::infinity();
+        double left_weight = 0.0, right_weight = total_weight;
+        std::size_t n_left = 0;
+        for (const Item* p = begin; p != end; ++p) {
+            if (n_left > 0 && p[-1].run != p->run && leaf_sizes_ok(n_left, n)) {
+                double left_imp = class_impurity(left_.data(), n_seen, left_weight);
+                double right_imp = class_impurity(right_.data(), n_seen, right_weight);
+
+                double weighted = (left_weight / total_weight) * left_imp +
+                                   (right_weight / total_weight) * right_imp;
+                double improvement = parent_impurity - weighted;
+
+                if (improvement > best_improvement) {
+                    best_improvement = improvement;
+                    out.found = true;
+                    out.improvement = improvement;
+                    out.lo_row = p[-1].row;
+                    out.hi_row = p->row;
+                }
+            }
+            const std::size_t pos = static_cast<std::size_t>(local_[static_cast<std::size_t>(p->cls)]);
+            left_[pos] += p->w;
+            right_[pos] -= p->w;
+            left_weight += p->w;
+            right_weight -= p->w;
+            ++n_left;
+        }
+        for (const Item* p = begin; p != end; ++p) local_[static_cast<std::size_t>(p->cls)] = -1;
+    }
+};
+
+} // namespace rdt

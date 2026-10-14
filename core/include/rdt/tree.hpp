@@ -5,7 +5,7 @@
 #include <limits>
 #include <map>
 #include <memory>
-#include <tuple>
+#include <numeric>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -14,6 +14,7 @@
 #include "rdt/matrix.hpp"
 #include "rdt/node.hpp"
 #include "rdt/params.hpp"
+#include "rdt/presort.hpp"
 
 // Port of rdt_optimal_cython/optimal_rdt_cython.py's OptimalRDTCython.
 //
@@ -29,6 +30,10 @@
 // primarily to support the ensemble layer (class_weight, sample_weight,
 // gamma/min_split_loss pruning) built on top of this core; passing neither
 // reproduces the original unweighted, unpruned behavior exactly.
+//
+// The per-depth feature scoring normally runs on presorted columns (see
+// presort.hpp and TreeParams::presort); the per-(node, feature) sort in
+// find_best_threshold remains for MAE and as the reference implementation.
 namespace rdt {
 
 class RDTModel {
@@ -41,6 +46,18 @@ public:
     RDTModel& operator=(RDTModel&&) = default;
 
     void fit(const MatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr) {
+        fit(IndexedMatrixView(X), y, sample_weight, nullptr);
+    }
+
+    // Fit on a row/column-mapped view of a matrix (e.g. a bootstrap sample
+    // restricted to a column subset) without copying it; y / sample_weight
+    // are indexed by the view's rows. `presorted`, if given, holds the view's
+    // rows presorted by each of its columns (presort.hpp), for callers that
+    // fit many trees on related rows (boosting rounds) and sort only once;
+    // otherwise the tree presorts its rows itself when TreeParams::presort is
+    // set.
+    void fit(const IndexedMatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr,
+             const PresortedView* presorted = nullptr) {
         n_features_ = X.n_cols();
         depth_features_.clear();
         depth_improvements_.clear();
@@ -55,22 +72,60 @@ public:
         }
 
         std::vector<std::uint32_t> root_indices(X.n_rows());
-        for (std::size_t i = 0; i < root_indices.size(); ++i) root_indices[i] = static_cast<std::uint32_t>(i);
+        std::iota(root_indices.begin(), root_indices.end(), std::uint32_t{0});
 
-        root_ = build_tree(X, y, sample_weight, std::move(root_indices));
+        const bool presort = params_.presort && DepthScanner::supports(params_.criterion) &&
+                             X.n_rows() <= kPresortMaxRows;
+        SortedColumns own_sorted;
+        PresortedView own_view;
+        if (presort && presorted == nullptr) {
+            own_sorted = SortedColumns(X, root_indices);
+            own_view = own_sorted.view();
+            presorted = &own_view;
+        }
+        root_ = build_tree(X, y, sample_weight, std::move(root_indices), presort ? presorted : nullptr);
     }
 
     std::vector<double> predict(const MatrixView& X) const {
         std::vector<double> out(X.n_rows());
-        for (std::size_t i = 0; i < X.n_rows(); ++i) out[i] = predict_one(X, i, root_.get());
+        for (std::size_t i = 0; i < X.n_rows(); ++i) out[i] = find_leaf(X, i)->value;
         return out;
     }
 
     // n_samples x n_classes, classes ordered per classes().
     std::vector<std::vector<double>> predict_proba(const MatrixView& X) const {
         std::vector<std::vector<double>> out(X.n_rows(), std::vector<double>(classes_.size(), 0.0));
-        for (std::size_t i = 0; i < X.n_rows(); ++i) out[i] = predict_proba_one(X, i, root_.get());
+        for (std::size_t i = 0; i < X.n_rows(); ++i) leaf_proba(find_leaf(X, i), out[i].data());
         return out;
+    }
+
+    // Same as predict_proba, into a row-major n_samples x n_classes buffer.
+    void predict_proba_into(const MatrixView& X, double* out) const {
+        const std::size_t k = classes_.size();
+        for (std::size_t i = 0; i < X.n_rows(); ++i) leaf_proba(find_leaf(X, i), out + i * k);
+    }
+
+    // Leaf reached by row `row` of X. `col_map` (nullptr = identity) maps
+    // this tree's feature indices to X's columns -- how the ensembles predict
+    // through a tree fitted on a column subset without copying X.
+    const Node* find_leaf(const MatrixView& X, std::size_t row, const std::uint32_t* col_map = nullptr) const {
+        const Node* node = root_.get();
+        while (!node->is_leaf()) {
+            const std::size_t col = col_map ? static_cast<std::size_t>(col_map[node->split_feature])
+                                            : static_cast<std::size_t>(node->split_feature);
+            node = (X(row, col) <= node->split_threshold) ? node->left.get() : node->right.get();
+        }
+        return node;
+    }
+
+    // A leaf's class probabilities (classes() order) into out[0..n_classes()).
+    void leaf_proba(const Node* leaf, double* out) const {
+        double total = 0.0;
+        for (double c : leaf->class_counts) total += c;
+        for (std::size_t i = 0; i < classes_.size(); ++i) out[i] = 0.0;
+        if (total > 0.0) {
+            for (std::size_t i = 0; i < classes_.size(); ++i) out[i] = leaf->class_counts[i] / total;
+        }
     }
 
     const std::vector<double>& classes() const { return classes_; }
@@ -151,46 +206,126 @@ private:
         }
     }
 
-    // Returns (best_feature or -1, best_total_improvement, per-node thresholds keyed by Node*).
-    std::tuple<int, double, std::unordered_map<Node*, double>> find_optimal_feature_for_depth(
-        const MatrixView& X, const VectorView& y, const VectorView* sample_weight,
+    // Winning feature of a depth: per-node thresholds, aligned with the
+    // `nodes` passed in (found[k] == 0: node k has no valid split on it).
+    struct DepthChoice {
+        int feature = -1;
+        double total_improvement = -std::numeric_limits<double>::infinity();
+        std::vector<char> found;
+        std::vector<double> threshold;
+    };
+
+    // Reference search: sort each (node, feature) pair (find_best_threshold).
+    DepthChoice find_optimal_feature_for_depth(
+        const IndexedMatrixView& X, const VectorView& y, const VectorView* sample_weight,
         const std::vector<Node*>& nodes) const {
 
-        int best_feature = -1;
-        double best_total_improvement = -std::numeric_limits<double>::infinity();
-        std::unordered_map<Node*, double> best_node_thresholds;
+        DepthChoice best;
+        std::vector<char> found(nodes.size());
+        std::vector<double> thresholds(nodes.size());
 
         for (int feature_idx = 0; feature_idx < static_cast<int>(n_features_); ++feature_idx) {
             double total_improvement = 0.0;
-            std::unordered_map<Node*, double> node_thresholds;
             bool valid_split_found = false;
 
-            for (Node* node : nodes) {
+            for (std::size_t k = 0; k < nodes.size(); ++k) {
                 ThresholdResult r = find_best_threshold(
-                    X, y, node->indices, feature_idx, params_.criterion,
+                    X, y, nodes[k]->indices, feature_idx, params_.criterion,
                     params_.min_samples_split, params_.min_samples_leaf, sample_weight);
+                found[k] = r.found;
+                thresholds[k] = r.threshold;
                 if (r.found) {
                     total_improvement += r.improvement;
-                    node_thresholds[node] = r.threshold;
                     valid_split_found = true;
                 }
             }
 
-            if (valid_split_found && total_improvement > best_total_improvement) {
-                best_total_improvement = total_improvement;
-                best_feature = feature_idx;
-                best_node_thresholds = std::move(node_thresholds);
+            if (valid_split_found && total_improvement > best.total_improvement) {
+                best.total_improvement = total_improvement;
+                best.feature = feature_idx;
+                best.found = found;
+                best.threshold = thresholds;
             }
         }
-
-        return {best_feature, best_total_improvement, std::move(best_node_thresholds)};
+        return best;
     }
 
-    std::unique_ptr<Node> build_tree(const MatrixView& X, const VectorView& y,
+    // Presorted search: the same choice, scoring each feature for all nodes
+    // in one pass over its presorted rows. Requires scan_rows[i].node == k
+    // for every row i of nodes[k] and -1 for every other row.
+    DepthChoice find_optimal_feature_presorted(
+        const IndexedMatrixView& X, const std::vector<Node*>& nodes, const PresortedView& presorted,
+        const std::vector<ScanRow>& scan_rows, DepthScanner& scanner) const {
+
+        std::vector<std::size_t> node_sizes(nodes.size());
+        for (std::size_t k = 0; k < nodes.size(); ++k) node_sizes[k] = nodes[k]->indices.size();
+        scanner.begin_depth(node_sizes);
+
+        DepthChoice best;
+        std::vector<NodeSplit> splits, best_splits;
+        for (int feature_idx = 0; feature_idx < static_cast<int>(n_features_); ++feature_idx) {
+            scanner.score_feature(presorted.columns[static_cast<std::size_t>(feature_idx)], presorted.n_entries,
+                                  scan_rows.data(), splits);
+            double total_improvement = 0.0;
+            bool valid_split_found = false;
+            for (const NodeSplit& sp : splits) {
+                if (sp.found) {
+                    total_improvement += sp.improvement;
+                    valid_split_found = true;
+                }
+            }
+            if (valid_split_found && total_improvement > best.total_improvement) {
+                best.total_improvement = total_improvement;
+                best.feature = feature_idx;
+                best_splits = splits;
+            }
+        }
+        if (best.feature >= 0) {
+            best.found.assign(nodes.size(), 0);
+            best.threshold.assign(nodes.size(), 0.0);
+            const std::size_t f = static_cast<std::size_t>(best.feature);
+            for (std::size_t k = 0; k < nodes.size(); ++k) {
+                if (!best_splits[k].found) continue;
+                best.found[k] = 1;
+                best.threshold[k] = (X(best_splits[k].lo_row, f) + X(best_splits[k].hi_row, f)) / 2.0;
+            }
+        }
+        return best;
+    }
+
+    void release_indices(Node& node) const {
+        if (!params_.retain_indices) std::vector<std::uint32_t>().swap(node.indices);
+    }
+
+    void finish_leaf(Node& node, const VectorView& y, const VectorView* sample_weight) const {
+        make_leaf(node, y, sample_weight);
+        release_indices(node);
+    }
+
+    std::unique_ptr<Node> build_tree(const IndexedMatrixView& X, const VectorView& y,
                                       const VectorView* sample_weight,
-                                      std::vector<std::uint32_t> root_indices) {
+                                      std::vector<std::uint32_t> root_indices,
+                                      const PresortedView* presorted) {
         auto root = std::make_unique<Node>();
+        root->n_samples = root_indices.size();
         root->indices = std::move(root_indices);
+
+        // Presorted search state: per-row target/weight/class and the index
+        // of the node being split that the row currently belongs to.
+        std::vector<ScanRow> scan_rows;
+        DepthScanner scanner(params_.criterion, params_.min_samples_leaf, classes_.size());
+        if (presorted) {
+            scan_rows.resize(X.n_rows());
+            for (auto idx : root->indices) {
+                ScanRow& r = scan_rows[idx];
+                r.y = y[idx];
+                r.w = sample_weight ? (*sample_weight)[idx] : 1.0;
+                if (params_.task == Task::Classification) {
+                    r.cls = static_cast<std::int32_t>(
+                        std::lower_bound(classes_.begin(), classes_.end(), y[idx]) - classes_.begin());
+                }
+            }
+        }
 
         std::vector<Node*> current_level = {root.get()};
 
@@ -202,37 +337,48 @@ private:
                 if (should_split(*node, depth) && !all_same_label(y, node->indices)) {
                     nodes_to_split.push_back(node);
                 } else {
-                    make_leaf(*node, y, sample_weight);
+                    finish_leaf(*node, y, sample_weight);
                 }
             }
 
             if (nodes_to_split.empty()) break;
 
-            auto [best_feature, best_total_improvement, node_thresholds] =
-                find_optimal_feature_for_depth(X, y, sample_weight, nodes_to_split);
+            DepthChoice choice;
+            if (presorted) {
+                for (std::size_t k = 0; k < nodes_to_split.size(); ++k) {
+                    for (auto idx : nodes_to_split[k]->indices) scan_rows[idx].node = static_cast<std::int32_t>(k);
+                }
+                choice = find_optimal_feature_presorted(X, nodes_to_split, *presorted, scan_rows, scanner);
+                for (Node* node : nodes_to_split) {
+                    for (auto idx : node->indices) scan_rows[idx].node = -1;
+                }
+            } else {
+                choice = find_optimal_feature_for_depth(X, y, sample_weight, nodes_to_split);
+            }
+            const int best_feature = choice.feature;
 
-            if (best_feature < 0 || best_total_improvement < params_.min_impurity_decrease) {
-                for (Node* node : nodes_to_split) make_leaf(*node, y, sample_weight);
+            if (best_feature < 0 || choice.total_improvement < params_.min_impurity_decrease) {
+                for (Node* node : nodes_to_split) finish_leaf(*node, y, sample_weight);
                 break;
             }
 
             depth_features_[depth] = best_feature;
-            depth_improvements_[depth] = best_total_improvement;
+            depth_improvements_[depth] = choice.total_improvement;
 
             std::vector<Node*> next_level;
-            for (Node* node : nodes_to_split) {
-                auto it = node_thresholds.find(node);
-                if (it == node_thresholds.end()) {
-                    make_leaf(*node, y, sample_weight);
+            for (std::size_t k = 0; k < nodes_to_split.size(); ++k) {
+                Node* node = nodes_to_split[k];
+                if (!choice.found[k]) {
+                    finish_leaf(*node, y, sample_weight);
                     continue;
                 }
-                double threshold = it->second;
+                double threshold = choice.threshold[k];
 
                 std::vector<std::uint32_t> left_indices, right_indices;
                 split_indices(X, node->indices, best_feature, threshold, left_indices, right_indices);
 
                 if (left_indices.empty() || right_indices.empty()) {
-                    make_leaf(*node, y, sample_weight);
+                    finish_leaf(*node, y, sample_weight);
                     continue;
                 }
 
@@ -241,9 +387,12 @@ private:
                 node->split_threshold = threshold;
 
                 node->left = std::make_unique<Node>();
+                node->left->n_samples = left_indices.size();
                 node->left->indices = std::move(left_indices);
                 node->right = std::make_unique<Node>();
+                node->right->n_samples = right_indices.size();
                 node->right->indices = std::move(right_indices);
+                release_indices(*node);
 
                 next_level.push_back(node->left.get());
                 next_level.push_back(node->right.get());
@@ -253,30 +402,10 @@ private:
         }
 
         for (Node* node : current_level) {
-            if (!node->has_value) make_leaf(*node, y, sample_weight);
+            if (!node->has_value) finish_leaf(*node, y, sample_weight);
         }
 
         return root;
-    }
-
-    double predict_one(const MatrixView& X, std::size_t row, const Node* node) const {
-        while (!node->is_leaf()) {
-            node = (X(row, node->split_feature) <= node->split_threshold) ? node->left.get() : node->right.get();
-        }
-        return node->value;
-    }
-
-    std::vector<double> predict_proba_one(const MatrixView& X, std::size_t row, const Node* node) const {
-        while (!node->is_leaf()) {
-            node = (X(row, node->split_feature) <= node->split_threshold) ? node->left.get() : node->right.get();
-        }
-        std::vector<double> probs(classes_.size(), 0.0);
-        double total = 0.0;
-        for (double c : node->class_counts) total += c;
-        if (total > 0.0) {
-            for (std::size_t i = 0; i < probs.size(); ++i) probs[i] = node->class_counts[i] / total;
-        }
-        return probs;
     }
 };
 

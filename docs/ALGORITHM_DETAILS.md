@@ -101,15 +101,20 @@ same candidate feature, so each feature's rows are **sorted once per fit**
 (not once per node, feature and depth), and at each depth one pass over a
 feature's presorted rows routes every row to its node and sweeps all of the
 depth's nodes together (`core/include/rdt/presort.hpp`). Gradient Boosting
-sorts once per `fit()` and derives each round's (subsampled) order from it in
-linear time. This chooses the same features and thresholds as the per-node
-sort — same candidate boundaries, midpoints, sample-count constraints,
-summation order of the running statistics and tie-breaking — except that the
-order of samples *within a run of tied feature values* is fixed (row order)
-where `std::sort` left it unspecified; that can change the last bits of an
-improvement when the running sums are inexact, and so can only matter when
-two candidates' improvements are equal to within rounding error. MAE keeps
-the per-node path.
+sorts each column once per `fit()` (the first time a round draws it) and
+derives each round's (subsampled) order from it in linear time. This chooses
+the same features and thresholds as the per-node sort — same candidate
+boundaries, midpoints, sample-count constraints, summation order of the
+running statistics and tie-breaking — except that the order of samples
+*within a run of tied feature values* is fixed (row order) where `std::sort`
+left it unspecified. That can change the last bits of an improvement when the
+running sums are inexact (so `depth_improvements_` / `feature_importances_`
+may differ in the last bits on tie-heavy data), and so can only change a
+split when two candidates' improvements are equal to within rounding error —
+in practice a column and an affine or mirrored copy of it, which induce the
+same partition. Which of two such candidates the per-node sort picks depends
+on the standard library's `std::sort`, so it can already differ between
+platforms. MAE keeps the per-node path; `presort=False` selects it everywhere.
 
 ### On "two-pass"
 
@@ -207,11 +212,23 @@ For `d` depths, `m` candidate features and `n` samples:
 - **MAE:** the median is recomputed per candidate threshold, `O(n log n)`
   each, i.e. up to `O(d * m * n^2 log n)` per tree.
 
-Memory during `fit`: the presorted orders take 4 bytes per (row, feature)
-(Gradient Boosting keeps the per-fit ones, plus the current round's, for the
-duration of `fit`). No copy of `X` is made by the ensembles at fit or predict
-time — each tree reads its bootstrap rows / column subset through an index
-mapping.
+Memory during `fit` (in addition to `X`, `y` and the fitted trees):
+
+- presorted orders: 4 bytes per (row, sorted column). A single tree and each
+  Random Forest tree sort their own rows and columns; Gradient Boosting sorts
+  a column over the training rows the first time a round draws it, keeps it
+  until `fit` returns, and derives each round's order (4 bytes per (fit row,
+  round column), freed after the round);
+- search state: about 48 bytes per row (target, weight and node per row, and
+  each depth's rows gathered per node), plus the nodes' row indices (4 bytes
+  per row per level), as before;
+- sorting: a transient 16 bytes per row per column sorted together, at most 8
+  columns and at most `n_features / 4`.
+
+No copy of `X` is made by the ensembles at fit or predict time — each tree
+reads its bootstrap rows / column subset through an index mapping (v0.2.0
+copied `X[rows, columns]` for every tree and, in boosting, also `X[:, columns]`
+every round).
 
 ## Limitations
 

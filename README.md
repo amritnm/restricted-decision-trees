@@ -132,6 +132,8 @@ See `examples/ensemble_usage.py` for a fuller, runnable example.
 - `max_depth` — maximum tree depth.
 - `min_samples_split` — minimum samples required to split a node.
 - `min_samples_leaf` — minimum samples required in a leaf node.
+- `presort` — `True` (default): presorted split search; `False`: the original
+  per-node sort (see [Performance notes](#performance-notes)).
 
 **Methods**
 
@@ -147,9 +149,10 @@ See `examples/ensemble_usage.py` for a fuller, runnable example.
 - `root` — the fitted tree's root `Node` (`.is_leaf`, `.split_feature`,
   `.split_threshold`, `.value`, `.class_counts`, `.left`, `.right`,
   `.n_samples`, `.indices`) for direct programmatic inspection. `.indices`
-  (the training rows that reached the node) is kept only for a standalone
-  `RDT`; sub-trees of the ensembles drop it after fitting to save memory
-  (`.n_samples` is always available).
+  (the training rows that reached the node) is kept by a standalone `RDT` and
+  by `RandomForestRDT(bootstrap=False)` sub-trees; sub-trees fitted on a
+  bootstrap sample drop it after fitting (accessing it raises
+  `AttributeError`); `.n_samples` is always available.
 
 ### `rdt.ensemble.RandomForestRDT`
 
@@ -157,7 +160,7 @@ Bagging ensemble: `n_estimators`, `task`, `criterion`, `max_depth`,
 `min_samples_split`, `min_samples_leaf` (alias `min_child_weight`),
 `min_impurity_decrease` (alias `gamma`), `max_features` (alias
 `colsample_bytree`), `bootstrap`, `max_samples`, `oob_score`, `class_weight`
-(`'balanced'` or dict), `random_state`, `n_jobs`. After fitting:
+(`'balanced'` or dict), `random_state`, `n_jobs`, `presort`. After fitting:
 `estimators_` (list of `RDT`, individually introspectable),
 `feature_importances_`, `oob_score_` (if requested).
 
@@ -171,7 +174,7 @@ First-order boosting: `n_estimators`, `task`, `loss` (classification:
 `colsample_bytree`), `validation_fraction`, `n_iter_no_change` (alias
 `early_stopping_rounds`), `tol`, `reg_alpha`, `reg_lambda`,
 `scale_pos_weight` (binary only), `huber_delta`, `quantile_alpha`,
-`random_state`, `n_jobs`. After fitting: `feature_importances_`,
+`random_state`, `n_jobs`, `presort`. After fitting: `feature_importances_`,
 `train_score_` (loss per round), `n_estimators_` (rounds actually fitted —
 less than `n_estimators` if early stopping triggered).
 
@@ -191,13 +194,34 @@ less than `n_estimators` if early stopping triggered).
 - **Split search:** each feature is sorted once per fit and every depth scores
   all of its nodes in one pass over the presorted rows, instead of sorting
   every node's samples for every feature at every depth (see
-  [docs/ALGORITHM_DETAILS.md](docs/ALGORITHM_DETAILS.md#complexity)). The
-  presorted orders use 4 bytes per (row, feature) while fitting.
+  [docs/ALGORITHM_DETAILS.md](docs/ALGORITHM_DETAILS.md#complexity)).
+- **Results:** the same as the per-node sort (and v0.2.0) except at exact or
+  near ties — two candidate splits whose improvements are equal to within
+  floating-point rounding, typically a column and an affine or mirrored copy
+  of it (e.g. `x` and `1 - x`) — which may be broken the other way; on
+  tie-heavy data `depth_improvements_` / `feature_importances_` can also
+  differ in the last bits. `presort=False` (on `RDT`, `RandomForestRDT`,
+  `GradientBoostingRDT`) uses the per-node sort and reproduces v0.2.0 bit for
+  bit.
+- **Memory while fitting:** the presorted orders take 4 bytes per (row,
+  sorted column) — Gradient Boosting sorts a column the first time a round
+  draws it and keeps it until `fit` returns; Random Forest sorts each tree's
+  own sample and column subset — plus about 48 bytes per row of search state,
+  and sorting needs a transient buffer of 16 bytes per row for each of up to
+  8 columns sorted together (at most `n_features / 4`). This is less than
+  v0.2.0's per-tree copies of `X` for the ensembles, but more than v0.2.0 for
+  a single tree on tall, narrow data (e.g. 2,000,000 x 4: about +195 MB vs
+  +101 MB); `presort=False` avoids it.
 - **No copies of `X`:** the ensembles fit and predict through each tree's
   rows / column subset in place.
 - **GIL:** `fit`, `predict` and `predict_proba` release the GIL while the
   native code runs, so other Python threads (including other fits) keep
-  running.
+  running. One native model object (`rdt._rdt_native.*Model`) may serve
+  several `predict` calls at once, but calling `fit` on it while it is in use
+  by another thread (or using it while it is being fitted) raises
+  `RuntimeError`; the `rdt` estimators fit a fresh native object and publish
+  it only once fitted, so this does not affect them. The native
+  `predict` / `predict_proba` now return NumPy arrays (they returned lists).
 - `n_jobs` parallelizes across trees: Random Forest trees, and a multiclass
   boosting round's per-class trees. Binary / regression boosting fits one
   tree per round, so it does not use extra threads.

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "rdt/matrix.hpp"
@@ -78,6 +80,10 @@ inline SubMatrix extract_submatrix(const MatrixView& X, const std::vector<std::u
     return out;
 }
 
+// A bootstrap sample containing only zero-weight rows is redrawn at most
+// this many times in total before RandomForestModel::fit gives up.
+constexpr int kMaxBootstrapDraws = 100;
+
 struct ForestParams {
     TreeParams tree_params;
     int n_estimators = 100;
@@ -122,6 +128,10 @@ public:
         for (std::size_t i = 0; i < n_est; ++i) trees_.emplace_back(params_.tree_params);
         feature_subsets_.assign(n_est, {});
         std::vector<std::vector<std::uint32_t>> oob_row_indices(n_est);
+        // Trees whose bootstrap never drew a positively weighted row; reported
+        // after the pool has finished (an exception thrown inside a pool task
+        // would leave the other tasks running against this frame).
+        std::vector<char> no_weighted_rows(n_est, 0);
 
         ThreadPool pool(resolve_n_jobs(params_.n_jobs));
         pool.parallel_for(n_est, [&](std::size_t t) {
@@ -130,6 +140,21 @@ public:
             std::vector<std::uint32_t> row_indices;
             if (params_.bootstrap) {
                 row_indices = rng.sample_with_replacement(static_cast<std::uint32_t>(n_samples_), bootstrap_size);
+                // A sample made only of zero-weight rows carries no information
+                // (the tree would be a single leaf with zero class counts, i.e.
+                // a predict_proba row of zeros, or value 0): redraw it from the
+                // same per-tree generator, so the result stays deterministic.
+                if (sample_weight) {
+                    int draws = 1;
+                    while (!has_positive_weight(*sample_weight, row_indices) && draws < kMaxBootstrapDraws) {
+                        row_indices = rng.sample_with_replacement(static_cast<std::uint32_t>(n_samples_), bootstrap_size);
+                        ++draws;
+                    }
+                    if (!has_positive_weight(*sample_weight, row_indices)) {
+                        no_weighted_rows[t] = 1;
+                        return;
+                    }
+                }
                 if (params_.oob_score) {
                     std::vector<bool> in_bag(n_samples_, false);
                     for (auto idx : row_indices) in_bag[idx] = true;
@@ -168,6 +193,15 @@ public:
                 trees_[t].fit(sub.view, sub_Y);
             }
         });
+
+        for (std::size_t t = 0; t < n_est; ++t) {
+            if (no_weighted_rows[t]) {
+                throw std::invalid_argument(
+                    "every bootstrap sample drawn for a tree (" + std::to_string(kMaxBootstrapDraws) +
+                    " attempts) contained only rows with zero sample_weight; increase max_samples or give "
+                    "more rows a positive weight");
+            }
+        }
 
         compute_feature_importances();
         if (params_.oob_score) compute_oob_score(X, y, oob_row_indices);
@@ -221,6 +255,13 @@ private:
     double oob_score_ = 0.0;
     std::size_t n_features_ = 0;
     std::size_t n_samples_ = 0;
+
+    static bool has_positive_weight(const VectorView& w, const std::vector<std::uint32_t>& rows) {
+        for (auto r : rows) {
+            if (w[r] > 0.0) return true;
+        }
+        return false;
+    }
 
     static std::size_t argmax(const std::vector<double>& v) {
         std::size_t best = 0;

@@ -54,8 +54,18 @@ public:
             classes_ = std::move(labels);
         }
 
-        std::vector<std::uint32_t> root_indices(X.n_rows());
-        for (std::size_t i = 0; i < root_indices.size(); ++i) root_indices[i] = static_cast<std::uint32_t>(i);
+        // Zero-weight samples carry no information. Like scikit-learn's
+        // splitter, leave them out of the tree entirely (equivalent to
+        // deleting those rows): otherwise a split could isolate them into a
+        // leaf with zero total weight, i.e. all-zero class counts and a
+        // predict_proba row summing to 0, and they would shift thresholds and
+        // count towards min_samples_split/min_samples_leaf.
+        std::vector<std::uint32_t> root_indices;
+        root_indices.reserve(X.n_rows());
+        for (std::size_t i = 0; i < X.n_rows(); ++i) {
+            if (sample_weight && (*sample_weight)[i] == 0.0) continue;
+            root_indices.push_back(static_cast<std::uint32_t>(i));
+        }
 
         root_ = build_tree(X, y, sample_weight, std::move(root_indices));
     }

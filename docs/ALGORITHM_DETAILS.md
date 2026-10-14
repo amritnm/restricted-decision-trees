@@ -157,6 +157,14 @@ by whichever class was encountered first while scanning the leaf's samples).
 implementation always uses the mean as the leaf value, independent of which
 regression criterion was used to choose splits.
 
+With `sample_weight`, counts and means are weighted. Samples whose weight is
+zero take no part in growing the tree, exactly as if those rows were removed
+(as in scikit-learn), so no node — in particular no leaf — has zero total
+weight. A Random Forest bootstrap sample that happens to contain only
+zero-weight rows is redrawn (up to 100 times, deterministically for a given
+`random_state`); if none of the draws contains a positively weighted row,
+`fit` raises `ValueError`.
+
 ## Prediction
 
 ```

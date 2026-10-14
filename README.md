@@ -154,7 +154,9 @@ Bagging ensemble: `n_estimators`, `task`, `criterion`, `max_depth`,
 `min_samples_split`, `min_samples_leaf` (alias `min_child_weight`),
 `min_impurity_decrease` (alias `gamma`), `max_features` (alias
 `colsample_bytree`), `bootstrap`, `max_samples`, `oob_score`, `class_weight`
-(`'balanced'` or dict), `random_state`, `n_jobs`. After fitting:
+(`'balanced'` or dict), `random_state`, `n_jobs`. `max_samples` follows
+scikit-learn: an int is the number of rows drawn per tree, a float is a
+fraction of `n_samples`, `None` means `n_samples`. After fitting:
 `estimators_` (list of `RDT`, individually introspectable),
 `feature_importances_`, `oob_score_` (if requested).
 

@@ -119,7 +119,8 @@ NB_MODULE(_rdt_native, m) {
         .def(nb::new_([](std::string task, std::string criterion, int max_depth,
                           int min_samples_split, int min_samples_leaf, double min_impurity_decrease,
                           int n_estimators, MaxFeaturesSpec max_features, bool bootstrap,
-                          double max_samples, bool oob_score, std::uint64_t random_state, int n_jobs) {
+                          double max_samples, bool oob_score, std::uint64_t random_state, int n_jobs,
+                          std::uint32_t max_samples_count) {
                  ForestParams p;
                  p.tree_params.task = (task == "classification") ? Task::Classification : Task::Regression;
                  p.tree_params.criterion = criterion_from_string(criterion);
@@ -131,6 +132,7 @@ NB_MODULE(_rdt_native, m) {
                  p.max_features = max_features;
                  p.bootstrap = bootstrap;
                  p.max_samples = max_samples;
+                 p.max_samples_count = max_samples_count;
                  p.oob_score = oob_score;
                  p.random_state = random_state;
                  p.n_jobs = n_jobs;
@@ -138,7 +140,7 @@ NB_MODULE(_rdt_native, m) {
              }),
              "task"_a, "criterion"_a, "max_depth"_a, "min_samples_split"_a, "min_samples_leaf"_a,
              "min_impurity_decrease"_a, "n_estimators"_a, "max_features"_a, "bootstrap"_a,
-             "max_samples"_a, "oob_score"_a, "random_state"_a, "n_jobs"_a)
+             "max_samples"_a, "oob_score"_a, "random_state"_a, "n_jobs"_a, "max_samples_count"_a = 0)
         .def("fit",
              [](RandomForestModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
                  if (sample_weight) {

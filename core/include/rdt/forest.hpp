@@ -84,6 +84,9 @@ struct ForestParams {
     MaxFeaturesSpec max_features = MaxFeaturesSpec::Sqrt();
     bool bootstrap = true;
     double max_samples = 1.0; // fraction of n_samples per bootstrap draw (only used if bootstrap)
+    // Absolute bootstrap draw size; when > 0 it overrides max_samples
+    // (scikit-learn's integer max_samples).
+    std::uint32_t max_samples_count = 0;
     bool oob_score = false;
     std::uint64_t random_state = 0;
     int n_jobs = 1; // sklearn convention: caller passes 1 for "None", -1 for "all cores"
@@ -112,9 +115,11 @@ public:
         }
 
         const std::uint32_t k = resolve_max_features(params_.max_features, static_cast<std::uint32_t>(n_features_));
-        const std::uint32_t bootstrap_size = params_.bootstrap
-            ? static_cast<std::uint32_t>(std::max(1.0, params_.max_samples * static_cast<double>(n_samples_)))
-            : static_cast<std::uint32_t>(n_samples_);
+        const std::uint32_t bootstrap_size = !params_.bootstrap
+            ? static_cast<std::uint32_t>(n_samples_)
+            : params_.max_samples_count > 0
+                ? params_.max_samples_count
+                : static_cast<std::uint32_t>(std::max(1.0, params_.max_samples * static_cast<double>(n_samples_)));
 
         const std::size_t n_est = static_cast<std::size_t>(params_.n_estimators);
         trees_.clear();

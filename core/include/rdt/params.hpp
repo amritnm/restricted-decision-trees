@@ -37,10 +37,14 @@ struct TreeParams {
     int max_depth = 5;
     int min_samples_split = 2;
     int min_samples_leaf = 1;
-    // A depth's winning feature is only committed if its total improvement
-    // meets this threshold; otherwise every node at that depth becomes a
-    // leaf. sklearn calls this min_impurity_decrease; XGBoost/LightGBM call
-    // the equivalent gamma/min_split_loss.
+    // A depth's winning feature is only committed if its total weighted
+    // impurity decrease -- sum over the depth's nodes of
+    // N_t/N * (node improvement), N = total training weight -- plus machine
+    // epsilon reaches this threshold; otherwise every node at that depth
+    // becomes a leaf. Same quantity and comparison as sklearn's
+    // min_impurity_decrease (which gates each node separately rather than
+    // each depth); XGBoost/LightGBM's closest equivalent is
+    // gamma/min_split_loss, on a different (unnormalised gain) scale.
     double min_impurity_decrease = 0.0;
 };
 

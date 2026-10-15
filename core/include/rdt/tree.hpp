@@ -20,8 +20,10 @@
 //
 // Per-depth greedy search: for each depth, every candidate feature is
 // scored across all currently-active nodes at that depth (summing each
-// node's best achievable impurity improvement for the feature); the feature
-// with the highest total wins and is locked in for the whole depth, and the
+// node's best achievable impurity improvement for the feature, weighted by
+// the node's share of the training weight -- scikit-learn's weighted impurity
+// decrease N_t/N * (impurity - N_tL/N_t * left - N_tR/N_t * right)); the
+// feature with the highest total wins and is locked in for the whole depth, and the
 // per-node thresholds already found while scoring it are reused directly as
 // the final split points (see the plan's "two-pass" note: this is
 // result-equivalent to the paper's Algorithm 1, not an approximation of it).
@@ -106,8 +108,10 @@ public:
     const std::vector<double>& classes() const { return classes_; }
     std::size_t n_classes() const { return classes_.size(); }
     const std::map<int, int>& depth_features() const { return depth_features_; }
-    // Total impurity improvement achieved by the winning feature at each
-    // depth -- the basis for feature_importances_ in the ensemble layer.
+    // Weighted impurity decrease achieved by the winning feature at each
+    // depth, sum over the depth's split nodes of N_t/N * (node improvement)
+    // (N = total training weight) -- scikit-learn's per-split importance
+    // definition, and the basis for feature_importances_ in the ensembles.
     const std::map<int, double>& depth_improvements() const { return depth_improvements_; }
     const Node* root() const { return root_.get(); }
     const TreeParams& params() const { return params_; }
@@ -182,25 +186,35 @@ private:
     }
 
     // Returns (best_feature or -1, best_total_improvement, per-node thresholds keyed by Node*).
+    // A node's improvement is weighted by its share of the total training
+    // weight (`root_weight`), so a feature that helps a tiny node a lot can't
+    // outscore one that helps a large node -- the per-node improvement is a
+    // within-node quantity and is not comparable across nodes otherwise.
     std::tuple<int, double, std::unordered_map<Node*, double>> find_optimal_feature_for_depth(
         const MatrixView& X, const VectorView& y, const VectorView* sample_weight,
-        const std::vector<Node*>& nodes) const {
+        const std::vector<Node*>& nodes, double root_weight) const {
 
         int best_feature = -1;
         double best_total_improvement = -std::numeric_limits<double>::infinity();
         std::unordered_map<Node*, double> best_node_thresholds;
+
+        std::vector<double> node_share(nodes.size(), 0.0);
+        for (std::size_t j = 0; j < nodes.size(); ++j) {
+            node_share[j] = root_weight > 0.0 ? total_weight(*nodes[j], sample_weight) / root_weight : 0.0;
+        }
 
         for (int feature_idx = 0; feature_idx < static_cast<int>(n_features_); ++feature_idx) {
             double total_improvement = 0.0;
             std::unordered_map<Node*, double> node_thresholds;
             bool valid_split_found = false;
 
-            for (Node* node : nodes) {
+            for (std::size_t j = 0; j < nodes.size(); ++j) {
+                Node* node = nodes[j];
                 ThresholdResult r = find_best_threshold(
                     X, y, node->indices, feature_idx, params_.criterion,
                     params_.min_samples_split, params_.min_samples_leaf, sample_weight);
                 if (r.found) {
-                    total_improvement += r.improvement;
+                    total_improvement += node_share[j] * r.improvement;
                     node_thresholds[node] = r.threshold;
                     valid_split_found = true;
                 }
@@ -216,11 +230,19 @@ private:
         return {best_feature, best_total_improvement, std::move(best_node_thresholds)};
     }
 
+    static double total_weight(const Node& node, const VectorView* sample_weight) {
+        if (!sample_weight) return static_cast<double>(node.indices.size());
+        double w = 0.0;
+        for (auto idx : node.indices) w += (*sample_weight)[idx];
+        return w;
+    }
+
     std::unique_ptr<Node> build_tree(const MatrixView& X, const VectorView& y,
                                       const VectorView* sample_weight,
                                       std::vector<std::uint32_t> root_indices) {
         auto root = std::make_unique<Node>();
         root->indices = std::move(root_indices);
+        const double root_weight = total_weight(*root, sample_weight);
 
         std::vector<Node*> current_level = {root.get()};
 
@@ -239,9 +261,11 @@ private:
             if (nodes_to_split.empty()) break;
 
             auto [best_feature, best_total_improvement, node_thresholds] =
-                find_optimal_feature_for_depth(X, y, sample_weight, nodes_to_split);
+                find_optimal_feature_for_depth(X, y, sample_weight, nodes_to_split, root_weight);
 
-            if (best_feature < 0 || best_total_improvement < params_.min_impurity_decrease) {
+            // scikit-learn's rule: split unless improvement + EPSILON < min_impurity_decrease.
+            if (best_feature < 0 ||
+                best_total_improvement + std::numeric_limits<double>::epsilon() < params_.min_impurity_decrease) {
                 for (Node* node : nodes_to_split) make_leaf(*node, y, sample_weight);
                 break;
             }

@@ -26,22 +26,17 @@
 //
 // Exactness. For each node this reproduces find_best_threshold's arithmetic
 // operation by operation: the same candidate boundaries (between distinct
-// adjacent values only), the same midpoint, the same min_samples_leaf test,
-// node totals accumulated in the same feature-sorted order, the same running
+// adjacent values only), the same guarded midpoint, the same min_samples_leaf
+// test, the same centring of MSE targets at the node's weighted mean, node
+// totals accumulated in the same feature-sorted order, the same running
 // left/right updates, classes numbered in the same first-encountered order,
 // and the same strict '>' tie-breaking, with the expressions written
-// identically so the compiler contracts them (FMA) the same way. The one
-// unavoidable difference is the order of samples *inside a run of tied
-// feature values*: here it is ascending row id (a stable sort); in
-// find_best_threshold it is whatever std::sort leaves, which is unspecified
-// (libc++, libstdc++ and MSVC all happen to be stable for short ranges). The
-// set of samples on each side of every candidate boundary is the same, so
-// the candidate thresholds are the same; only the last bits of an
-// improvement can differ -- through the rounding of running sums that are
-// not exact (non-integer weights, real-valued targets) or, for
-// classification, which class is encountered first among tied smallest
-// values. A different split can therefore only be chosen between candidates
-// whose improvements are equal to within rounding error.
+// identically so the compiler contracts them (FMA) the same way. Samples
+// inside a run of tied feature values are visited in ascending row id here
+// (a stable presort) and find_best_threshold sorts by (value, row id) for the
+// same reason, so the two searches agree bit for bit on every input. The
+// node-size weighting of the per-node improvements and the zero-weight row
+// exclusion happen in RDTModel, outside the scanner, identically for both.
 namespace rdt {
 
 // A presorted column entry: the row id in the low 31 bits; the high bit is
@@ -233,7 +228,8 @@ struct ScanRow {
 };
 
 // Best split of one node on one feature, as found by DepthScanner. The
-// threshold is the midpoint of rows lo_row's and hi_row's values.
+// threshold is split_threshold() of rows lo_row's and hi_row's values (their
+// guarded midpoint).
 struct NodeSplit {
     bool found = false;
     double improvement = 0.0;
@@ -259,7 +255,10 @@ public:
         for (std::size_t k = 0; k < node_sizes.size(); ++k) node_begin_[k + 1] = node_begin_[k] + node_sizes[k];
         items_.resize(node_begin_.back());
         cursor_.resize(node_sizes.size());
-        if (criterion_ != Criterion::MSE) {
+        if (criterion_ == Criterion::MSE) {
+            raw_sum_.resize(node_sizes.size());
+            weight_sum_.resize(node_sizes.size());
+        } else {
             local_.assign(n_classes_, -1);
             total_.assign(n_classes_, 0.0);
             left_.assign(n_classes_, 0.0);
@@ -278,7 +277,7 @@ public:
             const Item* b = items_.data() + node_begin_[k];
             const Item* e = items_.data() + node_begin_[k + 1];
             if (criterion_ == Criterion::MSE) {
-                score_mse(b, e, out[k]);
+                score_mse(b, e, raw_sum_[k], weight_sum_[k], out[k]);
             } else {
                 score_classification(b, e, out[k]);
             }
@@ -303,6 +302,9 @@ private:
     std::vector<std::size_t> cursor_;
     std::vector<Item> items_;
     std::vector<std::int32_t> local_;     // class -> first-encounter position within the node
+    // MSE: each node's sum(w*y) and sum(w), accumulated while gathering, in the
+    // node's sorted order (the order score_mse would otherwise re-read them in).
+    std::vector<double> raw_sum_, weight_sum_;
     std::vector<double> total_, left_, right_; // per first-encounter position
 
     bool leaf_sizes_ok(std::size_t n_left, std::size_t n_total) const {
@@ -314,6 +316,10 @@ private:
     void gather(const std::uint32_t* sorted, std::size_t n_entries, const ScanRow* rows) {
         const bool mse = criterion_ == Criterion::MSE;
         for (std::size_t k = 0; k < cursor_.size(); ++k) cursor_[k] = node_begin_[k];
+        if (mse) {
+            std::fill(raw_sum_.begin(), raw_sum_.end(), 0.0);
+            std::fill(weight_sum_.begin(), weight_sum_.end(), 0.0);
+        }
         std::uint32_t run = 0;
         for (std::size_t i = 0; i < n_entries; ++i) {
             const std::uint32_t e = sorted[i];
@@ -321,9 +327,12 @@ private:
             const std::uint32_t row = e & kPresortRowMask;
             const ScanRow& r = rows[row];
             if (r.node < 0) continue;
-            Item& item = items_[cursor_[static_cast<std::size_t>(r.node)]++];
+            const std::size_t k = static_cast<std::size_t>(r.node);
+            Item& item = items_[cursor_[k]++];
             if (mse) {
                 item.y = r.y;
+                raw_sum_[k] += r.w * r.y;
+                weight_sum_[k] += r.w;
             } else {
                 item.cls = r.cls;
             }
@@ -336,13 +345,22 @@ private:
     // One node's items in sorted order. A boundary between the node's
     // previous row and the current one is evaluated (with the previous rows
     // on the left) when a new run of values started in between.
-    void score_mse(const Item* begin, const Item* end, NodeSplit& out) const {
+    //
+    // Like find_best_threshold, the running sums are kept on targets centred
+    // at the node's weighted mean, with every centred value rounded to a
+    // double before use, exactly as find_best_threshold stores them -- so both
+    // searches perform the same operations. The mean's sums (`raw_sum`,
+    // `total_weight`) were accumulated by gather() in this same sorted order,
+    // which saves a pass over the node's items per feature.
+    void score_mse(const Item* begin, const Item* end, double raw_sum, double total_weight, NodeSplit& out) const {
         const std::size_t n = static_cast<std::size_t>(end - begin);
-        double total_sum = 0.0, total_sum_sq = 0.0, total_weight = 0.0;
+        const double center = total_weight > 0.0 ? raw_sum / total_weight : 0.0;
+
+        double total_sum = 0.0, total_sum_sq = 0.0;
         for (const Item* p = begin; p != end; ++p) {
-            total_sum += p->w * p->y;
-            total_sum_sq += p->w * p->y * p->y;
-            total_weight += p->w;
+            const double d = p->y - center;
+            total_sum += p->w * d;
+            total_sum_sq += p->w * d * d;
         }
         const double parent_impurity = mse_from_sums(total_sum, total_sum_sq, total_weight);
 
@@ -370,8 +388,9 @@ private:
                     out.hi_row = p->row;
                 }
             }
-            left_sum += p->w * p->y;
-            left_sum_sq += p->w * p->y * p->y;
+            const double d = p->y - center;
+            left_sum += p->w * d;
+            left_sum_sq += p->w * d * d;
             left_weight += p->w;
             ++n_left;
         }

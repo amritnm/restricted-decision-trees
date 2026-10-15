@@ -1,8 +1,10 @@
 """Split-search correctness.
 
 1. A brute-force pure-NumPy reference of the documented algorithm (per depth:
-   score every feature on every node, sum the per-node best improvements,
-   commit the best feature) checked against the native tree on many small
+   score every feature on every node, sum the per-node best improvements
+   weighted by each node's share of the training weight, commit the best
+   feature; rows with zero weight take no part in growth; thresholds are the
+   guarded midpoint) checked against the native tree on many small
    random datasets -- ties, weights (including zeros), every criterion and
    stopping rule. The check is "guided": at each depth it verifies that the
    native choice is optimal (and is *the* reference choice whenever the best
@@ -12,11 +14,9 @@
 
 2. The presorted search (default) against the per-(node, feature) sort search
    it replaced (``presort=False`` on the native classes), bit for bit, on
-   inputs where both are guaranteed to perform the same floating-point
-   operations: no tied feature values, nodes small enough that std::sort is an
-   insertion sort (stable) on every major standard library, or sums that are
-   exact (integer-valued targets and weights). Outside those, the two can only
-   differ by summation order inside a run of tied values.
+   inputs with and without ties. Both searches visit tied feature values in
+   row order (the per-node search sorts by (value, row)), so they perform the
+   same floating-point operations on every input.
 """
 
 import numpy as np
@@ -40,7 +40,7 @@ def _impurity(criterion, y, w):
         return float(-np.sum(p * np.log2(p + 1e-10)))
     if criterion == "mse":
         mean = np.sum(w * y) / W
-        return float(np.sum(w * y * y) / W - mean * mean)
+        return float(np.sum(w * (y - mean) ** 2) / W)
     # mae: weighted median as in the core (average the two middle values on an exact half split)
     order = np.argsort(y, kind="stable")
     ys, ws = y[order], w[order]
@@ -55,6 +55,12 @@ def _impurity(criterion, y, w):
             med = (ys[i] + ys[i + 1]) / 2.0 if i + 1 < len(ys) else ys[i]
             break
     return float(np.sum(ws * np.abs(ys - med)) / W)
+
+
+def _split_threshold(a, b):
+    """The core's guarded midpoint (scikit-learn's rule)."""
+    t = a / 2.0 + b / 2.0
+    return t if a <= t < b else a
 
 
 def _node_candidates(criterion, x, y, w, min_samples_leaf):
@@ -83,7 +89,8 @@ def check_against_reference(model, X, y, w, criterion, max_depth, min_samples_sp
                             min_samples_leaf, min_impurity_decrease):
     root = model.root
     n, p = X.shape
-    level = [(root, np.arange(n))]
+    level = [(root, np.flatnonzero(w != 0))]  # zero-weight rows take no part in growth
+    W_root = float(np.sum(w))
     leaves = []
     for depth in range(max_depth):
         to_split = []
@@ -103,7 +110,7 @@ def check_against_reference(model, X, y, w, criterion, max_depth, min_samples_sp
                 if cands:
                     best = max(c[0] for c in cands)
                     bests.append((best, cands))
-                    total += best
+                    total += float(np.sum(w[idx])) / W_root * best  # node-size weighting
                     valid = True
                 else:
                     bests.append(None)
@@ -135,25 +142,18 @@ def check_against_reference(model, X, y, w, criterion, max_depth, min_samples_sp
                 leaves.append((node, idx))
                 continue
             node_best, cands = nb
-            if node.is_leaf:
-                # the scored split may leave one side empty once applied at the midpoint
-                thr = None
-                for imp, a, b in cands:
-                    if imp >= node_best - TOL * max(1.0, abs(node_best)):
-                        thr = (a + b) / 2.0
-                        break
-                xs = X[idx, f]
-                assert thr is not None and ((xs <= thr).all() or (xs > thr).all())
-                leaves.append((node, idx))
-                continue
+            # The guarded midpoint always reproduces the scored partition, so a
+            # node with a valid candidate is always split (an unguarded midpoint
+            # could round onto the upper value and leave one side empty).
+            assert not node.is_leaf
             assert node.split_feature == f
             thr = node.split_threshold
-            match = [c for c in cands if (c[1] + c[2]) / 2.0 == thr]
-            assert match, "threshold is not a midpoint of adjacent distinct values"
+            match = [c for c in cands if _split_threshold(c[1], c[2]) == thr]
+            assert match, "threshold is not the guarded midpoint of adjacent distinct values"
             assert match[0][0] >= node_best - TOL * max(1.0, abs(node_best))
             near_t = [c for c in cands if c[0] >= node_best - TOL * max(1.0, abs(node_best))]
             if len(near_t) == 1:
-                assert (near_t[0][1] + near_t[0][2]) / 2.0 == thr
+                assert _split_threshold(near_t[0][1], near_t[0][2]) == thr
             left = X[idx, f] <= thr
             next_level += [(node.left, idx[left]), (node.right, idx[~left])]
         level = next_level
@@ -308,6 +308,25 @@ def test_presort_bitwise_equal_to_per_node_sort_exact_sums_with_ties():
         kw = dict(max_depth=int(rng.integers(1, 8)), min_samples_leaf=int(rng.choice([1, 10])))
         assert_same_tree(_native_tree(True, "regression", "mse", X, y, w, **kw),
                          _native_tree(False, "regression", "mse", X, y, w, **kw), X)
+
+
+@pytest.mark.parametrize("criterion", ["gini", "entropy", "mse"])
+def test_presort_bitwise_equal_to_per_node_sort_with_ties_and_inexact_sums(criterion):
+    # Large nodes (std::sort is an introsort there, not stable), heavily tied
+    # values, real-valued targets/weights (inexact running sums) and zero
+    # weights: still bit for bit, because both searches order ties by row.
+    task = "classification" if criterion != "mse" else "regression"
+    rng = np.random.default_rng(14)
+    for _ in range(15):
+        n = int(rng.integers(200, 3000))
+        X, _ = _tree_cases(rng, n, distinct=False)
+        y = (rng.integers(0, 3, size=n).astype(float) if task == "classification"
+             else 1e6 + X[:, 0] * 3.1 + rng.normal(size=n))
+        w = [None, rng.uniform(0.1, 2.0, size=n), np.where(rng.uniform(size=n) < 0.2, 0.0, rng.uniform(0.1, 2.0, size=n))][
+            rng.integers(0, 3)]
+        kw = dict(max_depth=int(rng.integers(1, 8)), min_samples_leaf=int(rng.choice([1, 10])))
+        assert_same_tree(_native_tree(True, task, criterion, X, y, w, **kw),
+                         _native_tree(False, task, criterion, X, y, w, **kw), X)
 
 
 def _ensemble(cls, presort, X, y, w, **kw):

@@ -33,6 +33,18 @@ VectorView to_vector_view(const InputVector& y) {
     return VectorView(y.data(), y.shape(0));
 }
 
+// The core indexes y/sample_weight by row and X by the column numbers seen at
+// fit time without bounds checks, so mismatched shapes must never reach it.
+// (The Python wrappers validate first; these guard direct use of the module.)
+void check_fit_shapes(const InputMatrix& X, const InputVector& y, const std::optional<InputVector>& w) {
+    if (y.shape(0) != X.shape(0)) throw std::invalid_argument("X and y have different numbers of rows");
+    if (w && w->shape(0) != X.shape(0)) throw std::invalid_argument("X and sample_weight have different numbers of rows");
+}
+
+void check_predict_shape(const InputMatrix& X, std::size_t n_features) {
+    if (X.shape(1) != n_features) throw std::invalid_argument("X has a different number of features than during fit");
+}
+
 // fit()/predict() run with the GIL released: the views above are plain
 // pointers into the input arrays, which the bound function's arguments keep
 // alive for the duration of the call, and the core never touches a Python
@@ -112,6 +124,7 @@ auto read(const Model& self, F&& f) {
 template <class Model>
 void fit_released(Model& self, const InputMatrix& X, const InputVector& y,
                   const std::optional<InputVector>& sample_weight) {
+    check_fit_shapes(X, y, sample_weight);
     const MatrixView xv = to_matrix_view(X);
     const VectorView yv = to_vector_view(y);
     std::optional<VectorView> wv;
@@ -127,6 +140,7 @@ OutputArray predict_released(const Model& self, const InputMatrix& X) {
     std::vector<double> out;
     {
         UseGuard guard(&self, /*exclusive=*/false);
+        check_predict_shape(X, self.n_features());
         nb::gil_scoped_release release;
         out = self.predict(xv);
     }
@@ -141,6 +155,7 @@ OutputArray predict_proba_released(const Model& self, const InputMatrix& X) {
     std::size_t k = 0;
     {
         UseGuard guard(&self, /*exclusive=*/false);
+        check_predict_shape(X, self.n_features());
         k = self.n_classes();
         out.resize(xv.n_rows() * k);
         nb::gil_scoped_release release;
@@ -302,7 +317,7 @@ NB_MODULE(_rdt_native, m) {
                           int min_samples_split, int min_samples_leaf, double min_impurity_decrease,
                           int n_estimators, MaxFeaturesSpec max_features, bool bootstrap,
                           double max_samples, bool oob_score, std::uint64_t random_state, int n_jobs,
-                          bool presort) {
+                          std::uint32_t max_samples_count, bool presort) {
                  ForestParams p;
                  p.tree_params.task = (task == "classification") ? Task::Classification : Task::Regression;
                  p.tree_params.criterion = criterion_from_string(criterion);
@@ -314,6 +329,7 @@ NB_MODULE(_rdt_native, m) {
                  p.max_features = max_features;
                  p.bootstrap = bootstrap;
                  p.max_samples = max_samples;
+                 p.max_samples_count = max_samples_count;
                  p.oob_score = oob_score;
                  p.random_state = random_state;
                  p.n_jobs = n_jobs;
@@ -322,7 +338,8 @@ NB_MODULE(_rdt_native, m) {
              }),
              "task"_a, "criterion"_a, "max_depth"_a, "min_samples_split"_a, "min_samples_leaf"_a,
              "min_impurity_decrease"_a, "n_estimators"_a, "max_features"_a, "bootstrap"_a,
-             "max_samples"_a, "oob_score"_a, "random_state"_a, "n_jobs"_a, "presort"_a = true)
+             "max_samples"_a, "oob_score"_a, "random_state"_a, "n_jobs"_a, "max_samples_count"_a = 0,
+             "presort"_a = true)
         .def("fit",
              [](RandomForestModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
                  fit_released(self, X, y, sample_weight);

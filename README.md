@@ -114,14 +114,16 @@ means a parameter can't work exactly like it does elsewhere:
   chosen once, before that tree is fit.
 - **`reg_alpha`/`reg_lambda`** (`GradientBoostingRDT` only) are a real
   effect (post-hoc leaf-value soft-thresholding/shrinkage) but not XGBoost's
-  exact Newton/hessian-derived formula — this engine boosts first-order
-  (Friedman-style), not second-order.
+  exact regularised leaf formula — this engine is Friedman's gradient
+  boosting as in scikit-learn (trees grown on the gradient with a
+  squared-error criterion, then a per-leaf Newton step for `log_loss` and
+  `exponential`), not XGBoost's hessian-weighted tree growth.
 
 See `examples/ensemble_usage.py` for a fuller, runnable example.
 
 ## API reference
 
-### `rdt.RDT(task="classification", criterion=None, max_depth=5, min_samples_split=2, min_samples_leaf=1)`
+### `rdt.RDT(task="classification", criterion=None, max_depth=5, min_samples_split=2, min_samples_leaf=1, min_impurity_decrease=0.0)`
 
 **Parameters**
 
@@ -132,18 +134,32 @@ See `examples/ensemble_usage.py` for a fuller, runnable example.
 - `max_depth` — maximum tree depth.
 - `min_samples_split` — minimum samples required to split a node.
 - `min_samples_leaf` — minimum samples required in a leaf node.
+- `min_impurity_decrease` — a depth is only split if its total weighted
+  impurity decrease (sum over the depth's nodes of
+  `node_samples / total_samples * node_improvement`, scikit-learn's
+  definition and comparison, up to machine epsilon) is at least this value.
 - `presort` — `True` (default): presorted split search; `False`: the original
   per-node sort (see [Performance notes](#performance-notes)).
 
 **Methods**
 
-- `fit(X, y)` — build the tree from training data.
+- `fit(X, y, sample_weight=None)` — build the tree from training data.
 - `predict(X)` — predict target values.
 - `predict_proba(X)` — predict class probabilities (classification only).
+
+All estimators validate their inputs the way scikit-learn does and raise
+`ValueError` for: `X` that is not 2D or is empty; NaN or infinity in `X`,
+`y` or `sample_weight` (missing values are not supported — impute them
+first); `y`/`sample_weight` whose length differs from `X`'s rows; negative
+or all-zero weights (also after `class_weight` / `scale_pos_weight` are
+applied; `scale_pos_weight` must be finite and > 0); and, at predict time, an
+`X` with a different number of features than during `fit`.
 
 **Attributes (after fitting)**
 
 - `depth_features_` — `dict[int, int]`, the feature index chosen at each depth.
+- `depth_improvements_` — `dict[int, float]`, the total weighted impurity
+  decrease achieved at each depth.
 - `n_features_` — number of features seen during `fit`.
 - `classes_`, `n_classes_` — unique class labels and their count (classification only).
 - `root` — the fitted tree's root `Node` (`.is_leaf`, `.split_feature`,
@@ -160,13 +176,23 @@ Bagging ensemble: `n_estimators`, `task`, `criterion`, `max_depth`,
 `min_samples_split`, `min_samples_leaf` (alias `min_child_weight`),
 `min_impurity_decrease` (alias `gamma`), `max_features` (alias
 `colsample_bytree`), `bootstrap`, `max_samples`, `oob_score`, `class_weight`
-(`'balanced'` or dict), `random_state`, `n_jobs`, `presort`. After fitting:
+(`'balanced'` or dict), `random_state`, `n_jobs`, `presort`. `max_samples` follows
+scikit-learn: an int is the number of rows drawn per tree, a float is a
+fraction of `n_samples`, `None` means `n_samples`. After fitting:
 `estimators_` (list of `RDT`, individually introspectable),
 `feature_importances_`, `oob_score_` (if requested).
 
 ### `rdt.ensemble.GradientBoostingRDT`
 
-First-order boosting: `n_estimators`, `task`, `loss` (classification:
+Friedman gradient boosting, matching scikit-learn's
+`GradientBoostingClassifier`/`Regressor`: each round grows an RDT on the
+negative gradient, then sets each leaf to the loss's one-step Newton estimate
+(`log_loss`, `exponential`; the leaf mean is already exact for
+`squared_error`; `absolute_error`/`huber`/`quantile` keep the leaf mean of the
+gradient, a documented simplification). The initial score is the weighted
+prior log-odds / log class priors / weighted mean, median or quantile, and
+`sample_weight` (or `scale_pos_weight`) also weights `train_score_` and the
+early-stopping validation loss. Parameters: `n_estimators`, `task`, `loss` (classification:
 `'log_loss'`, `'exponential'`; regression: `'squared_error'`,
 `'absolute_error'`, `'huber'`, `'quantile'`), `learning_rate`, `max_depth`,
 `min_samples_split`, `min_samples_leaf` (alias `min_child_weight`),
@@ -174,7 +200,8 @@ First-order boosting: `n_estimators`, `task`, `loss` (classification:
 `colsample_bytree`), `validation_fraction`, `n_iter_no_change` (alias
 `early_stopping_rounds`), `tol`, `reg_alpha`, `reg_lambda`,
 `scale_pos_weight` (binary only), `huber_delta`, `quantile_alpha`,
-`random_state`, `n_jobs`, `presort`. After fitting: `feature_importances_`,
+`random_state`, `n_jobs`, `presort`. Classification needs at least two classes in
+`y`. After fitting: `feature_importances_`,
 `train_score_` (loss per round), `n_estimators_` (rounds actually fitted —
 less than `n_estimators` if early stopping triggered).
 
@@ -195,14 +222,10 @@ less than `n_estimators` if early stopping triggered).
   all of its nodes in one pass over the presorted rows, instead of sorting
   every node's samples for every feature at every depth (see
   [docs/ALGORITHM_DETAILS.md](docs/ALGORITHM_DETAILS.md#complexity)).
-- **Results:** the same as the per-node sort (and v0.2.0) except at exact or
-  near ties — two candidate splits whose improvements are equal to within
-  floating-point rounding, typically a column and an affine or mirrored copy
-  of it (e.g. `x` and `1 - x`) — which may be broken the other way; on
-  tie-heavy data `depth_improvements_` / `feature_importances_` can also
-  differ in the last bits. `presort=False` (on `RDT`, `RandomForestRDT`,
-  `GradientBoostingRDT`) uses the per-node sort and reproduces v0.2.0 bit for
-  bit.
+- **Results:** identical to the per-node sort — both searches perform the
+  same floating-point operations, visiting tied feature values in row order.
+  `presort=False` (on `RDT`, `RandomForestRDT`, `GradientBoostingRDT`) selects
+  the per-node sort, e.g. to avoid the presort's memory.
 - **Memory while fitting:** the presorted orders take 4 bytes per (row,
   sorted column) — Gradient Boosting sorts a column the first time a round
   draws it and keeps it until `fit` returns; Random Forest sorts each tree's
@@ -231,20 +254,29 @@ less than `n_estimators` if early stopping triggered).
 
 For each depth, every candidate feature is scored across **all** currently
 active nodes at that depth (summing each node's best achievable impurity
-improvement for that feature); the feature with the highest total wins and is
-locked in for the whole depth, and the per-node thresholds already found
-while scoring it are reused directly as the final split points:
+improvement for that feature, weighted by the node's share of the training
+samples); the feature with the highest total wins and is locked in for the
+whole depth, and the per-node thresholds already found while scoring it are
+reused directly as the final split points:
 
 ```
 For each depth level:
   1. For every candidate feature:
        for every active node at this depth:
          find that node's best threshold for this feature
-       total_improvement = sum of improvements across all nodes
+       total_improvement = sum over nodes of
+                           (node samples / total samples) * node improvement
   2. Choose the feature with the highest total_improvement; lock it in.
   3. Split every node at this depth using the threshold already found
-     for the winning feature.
+     for the winning feature (a node that feature cannot split becomes a leaf).
 ```
+
+The weighted per-node term is scikit-learn's weighted impurity decrease, so a
+`max_depth=1` RDT is the same stump as `DecisionTreeClassifier`/`Regressor`,
+and `depth_improvements_`/`feature_importances_` are scikit-learn-style
+impurity-based (MDI) importances. See `docs/ALGORITHM_DETAILS.md` for details,
+including why a node the depth's feature cannot split is not deferred to a
+later depth.
 
 ## Package structure
 

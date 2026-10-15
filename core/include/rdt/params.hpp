@@ -37,21 +37,24 @@ struct TreeParams {
     int max_depth = 5;
     int min_samples_split = 2;
     int min_samples_leaf = 1;
-    // A depth's winning feature is only committed if its total improvement
-    // meets this threshold; otherwise every node at that depth becomes a
-    // leaf. sklearn calls this min_impurity_decrease; XGBoost/LightGBM call
-    // the equivalent gamma/min_split_loss.
+    // A depth's winning feature is only committed if its total weighted
+    // impurity decrease -- sum over the depth's nodes of
+    // N_t/N * (node improvement), N = total training weight -- plus machine
+    // epsilon reaches this threshold; otherwise every node at that depth
+    // becomes a leaf. Same quantity and comparison as sklearn's
+    // min_impurity_decrease (which gates each node separately rather than
+    // each depth); XGBoost/LightGBM's closest equivalent is
+    // gamma/min_split_loss, on a different (unnormalised gain) scale.
     double min_impurity_decrease = 0.0;
 
     // Implementation choices that do not change which splits are chosen.
     //
     // presort: score every node of a depth in one pass over each feature's
     // presorted rows (presort.hpp) instead of sorting each (node, feature)
-    // pair's samples at every depth. Both searches pick the same features and
-    // thresholds; the only possible difference is floating-point summation
-    // order *within a run of tied feature values* (whose internal order the
-    // per-node std::sort leaves unspecified). MAE always uses the per-node
-    // search. Exposed mainly so tests can compare the two.
+    // pair's samples at every depth. Both searches perform the same
+    // floating-point operations in the same order (tied feature values are
+    // visited in row order by both), so they produce identical trees. MAE
+    // always uses the per-node search.
     bool presort = true;
     // Keep each Node's `indices` (the training rows that reached it) after
     // fit. rdt.visualize's export_tree_dict needs them. Gradient boosting and

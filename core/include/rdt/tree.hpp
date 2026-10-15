@@ -21,8 +21,10 @@
 //
 // Per-depth greedy search: for each depth, every candidate feature is
 // scored across all currently-active nodes at that depth (summing each
-// node's best achievable impurity improvement for the feature); the feature
-// with the highest total wins and is locked in for the whole depth, and the
+// node's best achievable impurity improvement for the feature, weighted by
+// the node's share of the training weight -- scikit-learn's weighted impurity
+// decrease N_t/N * (impurity - N_tL/N_t * left - N_tR/N_t * right)); the
+// feature with the highest total wins and is locked in for the whole depth, and the
 // per-node thresholds already found while scoring it are reused directly as
 // the final split points (see the plan's "two-pass" note: this is
 // result-equivalent to the paper's Algorithm 1, not an approximation of it).
@@ -46,8 +48,9 @@ public:
     RDTModel(RDTModel&&) = default;
     RDTModel& operator=(RDTModel&&) = default;
 
-    void fit(const MatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr) {
-        fit(IndexedMatrixView(X), y, sample_weight, nullptr);
+    void fit(const MatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr,
+             const std::vector<double>* classes = nullptr) {
+        fit(IndexedMatrixView(X), y, sample_weight, nullptr, classes);
     }
 
     // Fit on a row/column-mapped view of a matrix (e.g. a bootstrap sample
@@ -57,14 +60,33 @@ public:
     // fit many trees on related rows (boosting rounds) and sort only once;
     // otherwise the tree presorts its rows itself when TreeParams::presort is
     // set.
+    //
+    // `classes` (classification only; nullptr = the distinct labels of y)
+    // fixes the class list that classes(), leaf class_counts and
+    // predict_proba() columns are aligned to. An ensemble passes its full
+    // class list so a tree whose bootstrap sample lacks some class still
+    // produces probability rows in the ensemble's column order. It must be
+    // sorted, unique, and contain every label in y (std::invalid_argument
+    // otherwise).
     void fit(const IndexedMatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr,
-             const PresortedView* presorted = nullptr) {
+             const PresortedView* presorted = nullptr, const std::vector<double>* classes = nullptr) {
         n_features_ = X.n_cols();
         depth_features_.clear();
         depth_improvements_.clear();
         classes_.clear();
 
-        if (params_.task == Task::Classification) {
+        if (params_.task == Task::Classification && classes) {
+            classes_ = *classes;
+            if (!std::is_sorted(classes_.begin(), classes_.end()) ||
+                std::adjacent_find(classes_.begin(), classes_.end()) != classes_.end()) {
+                throw std::invalid_argument("RDTModel::fit: classes must be sorted and unique");
+            }
+            for (std::size_t i = 0; i < y.size(); ++i) {
+                if (!std::binary_search(classes_.begin(), classes_.end(), y[i])) {
+                    throw std::invalid_argument("RDTModel::fit: y contains a label that is not in classes");
+                }
+            }
+        } else if (params_.task == Task::Classification) {
             std::vector<double> labels(y.size());
             for (std::size_t i = 0; i < y.size(); ++i) labels[i] = y[i];
             std::sort(labels.begin(), labels.end());
@@ -84,8 +106,20 @@ public:
             if (!ok) throw std::invalid_argument("presorted columns must cover exactly X's rows and columns");
         }
 
-        std::vector<std::uint32_t> root_indices(X.n_rows());
-        std::iota(root_indices.begin(), root_indices.end(), std::uint32_t{0});
+        // Zero-weight samples carry no information. Like scikit-learn's
+        // splitter, leave them out of the tree entirely (equivalent to
+        // deleting those rows): otherwise a split could isolate them into a
+        // leaf with zero total weight, i.e. all-zero class counts and a
+        // predict_proba row summing to 0, and they would shift thresholds and
+        // count towards min_samples_split/min_samples_leaf. (With presorted
+        // columns supplied by the caller they are simply never routed to a
+        // node, see build_tree.)
+        std::vector<std::uint32_t> root_indices;
+        root_indices.reserve(X.n_rows());
+        for (std::size_t i = 0; i < X.n_rows(); ++i) {
+            if (sample_weight && (*sample_weight)[i] == 0.0) continue;
+            root_indices.push_back(static_cast<std::uint32_t>(i));
+        }
 
         const bool presort = params_.presort && DepthScanner::supports(params_.criterion) &&
                              X.n_rows() <= kPresortMaxRows;
@@ -131,6 +165,13 @@ public:
         return node;
     }
 
+    // Mutable find_leaf, so gradient boosting can overwrite leaf values after
+    // the fit (its per-leaf line search); the tree structure itself must not
+    // be modified.
+    Node* leaf_for(const MatrixView& X, std::size_t row, const std::uint32_t* col_map = nullptr) {
+        return const_cast<Node*>(find_leaf(X, row, col_map));
+    }
+
     // A leaf's class probabilities (classes() order) into out[0..n_classes()).
     void leaf_proba(const Node* leaf, double* out) const {
         double total = 0.0;
@@ -144,8 +185,10 @@ public:
     const std::vector<double>& classes() const { return classes_; }
     std::size_t n_classes() const { return classes_.size(); }
     const std::map<int, int>& depth_features() const { return depth_features_; }
-    // Total impurity improvement achieved by the winning feature at each
-    // depth -- the basis for feature_importances_ in the ensemble layer.
+    // Weighted impurity decrease achieved by the winning feature at each
+    // depth, sum over the depth's split nodes of N_t/N * (node improvement)
+    // (N = total training weight) -- scikit-learn's per-split importance
+    // definition, and the basis for feature_importances_ in the ensembles.
     const std::map<int, double>& depth_improvements() const { return depth_improvements_; }
     const Node* root() const { return root_.get(); }
     const TreeParams& params() const { return params_; }
@@ -229,9 +272,14 @@ private:
     };
 
     // Reference search: sort each (node, feature) pair (find_best_threshold).
+    // A node's improvement is weighted by its share of the total training
+    // weight (`node_share[k]`, see build_tree), so a feature that helps a tiny
+    // node a lot can't outscore one that helps a large node -- the per-node
+    // improvement is a within-node quantity and is not comparable across
+    // nodes otherwise.
     DepthChoice find_optimal_feature_for_depth(
         const IndexedMatrixView& X, const VectorView& y, const VectorView* sample_weight,
-        const std::vector<Node*>& nodes) const {
+        const std::vector<Node*>& nodes, const std::vector<double>& node_share) const {
 
         DepthChoice best;
         std::vector<char> found(nodes.size());
@@ -248,7 +296,7 @@ private:
                 found[k] = r.found;
                 thresholds[k] = r.threshold;
                 if (r.found) {
-                    total_improvement += r.improvement;
+                    total_improvement += node_share[k] * r.improvement;
                     valid_split_found = true;
                 }
             }
@@ -267,8 +315,8 @@ private:
     // in one pass over its presorted rows. Requires scan_rows[i].node == k
     // for every row i of nodes[k] and -1 for every other row.
     DepthChoice find_optimal_feature_presorted(
-        const IndexedMatrixView& X, const std::vector<Node*>& nodes, const PresortedView& presorted,
-        const std::vector<ScanRow>& scan_rows, DepthScanner& scanner) const {
+        const IndexedMatrixView& X, const std::vector<Node*>& nodes, const std::vector<double>& node_share,
+        const PresortedView& presorted, const std::vector<ScanRow>& scan_rows, DepthScanner& scanner) const {
 
         std::vector<std::size_t> node_sizes(nodes.size());
         for (std::size_t k = 0; k < nodes.size(); ++k) node_sizes[k] = nodes[k]->indices.size();
@@ -281,9 +329,9 @@ private:
                                   scan_rows.data(), splits);
             double total_improvement = 0.0;
             bool valid_split_found = false;
-            for (const NodeSplit& sp : splits) {
-                if (sp.found) {
-                    total_improvement += sp.improvement;
+            for (std::size_t k = 0; k < splits.size(); ++k) {
+                if (splits[k].found) {
+                    total_improvement += node_share[k] * splits[k].improvement;
                     valid_split_found = true;
                 }
             }
@@ -300,7 +348,7 @@ private:
             for (std::size_t k = 0; k < nodes.size(); ++k) {
                 if (!best_splits[k].found) continue;
                 best.found[k] = 1;
-                best.threshold[k] = (X(best_splits[k].lo_row, f) + X(best_splits[k].hi_row, f)) / 2.0;
+                best.threshold[k] = split_threshold(X(best_splits[k].lo_row, f), X(best_splits[k].hi_row, f));
             }
         }
         return best;
@@ -317,6 +365,13 @@ private:
         release_indices(node);
     }
 
+    static double total_weight(const Node& node, const VectorView* sample_weight) {
+        if (!sample_weight) return static_cast<double>(node.indices.size());
+        double w = 0.0;
+        for (auto idx : node.indices) w += (*sample_weight)[idx];
+        return w;
+    }
+
     std::unique_ptr<Node> build_tree(const IndexedMatrixView& X, const VectorView& y,
                                       const VectorView* sample_weight,
                                       std::vector<std::uint32_t> root_indices,
@@ -324,6 +379,7 @@ private:
         auto root = std::make_unique<Node>();
         root->n_samples = root_indices.size();
         root->indices = std::move(root_indices);
+        const double root_weight = total_weight(*root, sample_weight);
 
         // Labels that cannot be located in classes_ (NaN) have no class
         // index for the presorted search; use the per-node search instead.
@@ -370,21 +426,30 @@ private:
 
             if (nodes_to_split.empty()) break;
 
+            // Each node's share of the total training weight (both searches
+            // weight a node's improvement by it).
+            std::vector<double> node_share(nodes_to_split.size(), 0.0);
+            for (std::size_t k = 0; k < nodes_to_split.size(); ++k) {
+                node_share[k] = root_weight > 0.0 ? total_weight(*nodes_to_split[k], sample_weight) / root_weight : 0.0;
+            }
+
             DepthChoice choice;
             if (presorted) {
                 for (std::size_t k = 0; k < nodes_to_split.size(); ++k) {
                     for (auto idx : nodes_to_split[k]->indices) scan_rows[idx].node = static_cast<std::int32_t>(k);
                 }
-                choice = find_optimal_feature_presorted(X, nodes_to_split, *presorted, scan_rows, scanner);
+                choice = find_optimal_feature_presorted(X, nodes_to_split, node_share, *presorted, scan_rows, scanner);
                 for (Node* node : nodes_to_split) {
                     for (auto idx : node->indices) scan_rows[idx].node = -1;
                 }
             } else {
-                choice = find_optimal_feature_for_depth(X, y, sample_weight, nodes_to_split);
+                choice = find_optimal_feature_for_depth(X, y, sample_weight, nodes_to_split, node_share);
             }
             const int best_feature = choice.feature;
 
-            if (best_feature < 0 || choice.total_improvement < params_.min_impurity_decrease) {
+            // scikit-learn's rule: split unless improvement + EPSILON < min_impurity_decrease.
+            if (best_feature < 0 ||
+                choice.total_improvement + std::numeric_limits<double>::epsilon() < params_.min_impurity_decrease) {
                 for (Node* node : nodes_to_split) finish_leaf(*node, y, sample_weight);
                 break;
             }

@@ -12,6 +12,7 @@ from typing import Optional
 import numpy as np
 
 from . import _rdt_native
+from ._validation import check_X, check_X_y
 
 __all__ = ["RDT"]
 
@@ -33,18 +34,22 @@ class RDT:
     min_samples_leaf : int, default=1
         Minimum samples required in a leaf node.
     min_impurity_decrease : float, default=0.0
-        A depth's winning feature is only committed if its total impurity
-        improvement meets this threshold; otherwise every node at that depth
-        becomes a leaf. Matches sklearn's parameter of the same name (and is
-        XGBoost/LightGBM's gamma/min_split_loss).
+        A depth's winning feature is only committed if its total weighted
+        impurity decrease -- the sum over the depth's nodes of
+        ``N_t / N * (impurity - N_t_L / N_t * left_impurity - N_t_R / N_t * right_impurity)``,
+        with ``N`` the total (weighted) number of training samples -- meets
+        this threshold (up to machine epsilon, as in scikit-learn); otherwise
+        every node at that depth becomes a leaf. Same quantity and
+        comparison as sklearn's parameter of the same name, which sklearn
+        applies per node rather than per depth (XGBoost/LightGBM's closest
+        equivalent is gamma/min_split_loss).
     presort : bool, default=True
         Split search implementation. True (default) sorts each feature once
         per fit and scores every node of a depth in one pass. False sorts
-        every (node, feature) pair's samples at every depth, as v0.2.0 did,
-        and reproduces v0.2.0's results bit for bit. Both choose the same
-        splits except between candidates whose improvements are equal to
-        within floating-point rounding (e.g. a column and an affine or
-        mirrored copy of it); see docs/ALGORITHM_DETAILS.md.
+        every (node, feature) pair's samples at every depth. Both perform the
+        same floating-point operations (tied feature values are visited in
+        row order by both), so they produce identical trees; False only
+        trades speed for the presort's memory (4 bytes per row and feature).
     """
 
     def __init__(
@@ -109,10 +114,7 @@ class RDT:
         return self
 
     def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None) -> "RDT":
-        X = np.asarray(X, dtype=np.float64, order="C")
-        y = np.asarray(y, dtype=np.float64, order="C")
-        if sample_weight is not None:
-            sample_weight = np.asarray(sample_weight, dtype=np.float64, order="C")
+        X, y, sample_weight = check_X_y(X, y, sample_weight)
 
         self.n_features_ = X.shape[1]
 
@@ -139,7 +141,7 @@ class RDT:
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self._model is None:
             raise ValueError("Tree not fitted yet. Call fit() first.")
-        X = np.asarray(X, dtype=np.float64, order="C")
+        X = check_X(X, self.n_features_)
         return np.array(self._model.predict(X))
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -147,5 +149,5 @@ class RDT:
             raise ValueError("predict_proba only available for classification")
         if self._model is None:
             raise ValueError("Tree not fitted yet. Call fit() first.")
-        X = np.asarray(X, dtype=np.float64, order="C")
+        X = check_X(X, self.n_features_)
         return np.array(self._model.predict_proba(X))

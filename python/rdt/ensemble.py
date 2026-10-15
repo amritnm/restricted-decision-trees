@@ -11,15 +11,18 @@ version:
   scikit-learn's usual way -- a fresh random subset *per node*. Instead each
   tree gets ONE random column subset chosen before its own fit(), matching
   this project's earlier Python ``ensemble/random_forest_rdt.py``.
-- ``min_samples_leaf`` / ``min_child_weight``: aliases. There's no hessian
-  in this first-order boosting engine, so ``min_child_weight`` (normally
-  hessian-based in XGBoost) is treated as a plain sample-count constraint.
+- ``min_samples_leaf`` / ``min_child_weight``: aliases. Trees are grown on
+  the gradient alone (hessians only enter the per-leaf Newton step), so
+  ``min_child_weight`` (normally hessian-based in XGBoost) is treated as a
+  plain sample-count constraint.
 - ``min_impurity_decrease`` / ``gamma``: real, aliases of the same pruning
   threshold.
 - ``reg_alpha`` / ``reg_lambda`` (GradientBoostingRDT only): a real effect
   (post-hoc leaf-value soft-thresholding / ridge-style shrinkage) but not
-  XGBoost's exact Newton/hessian-derived leaf formula -- this engine is
-  first-order (Friedman-style), not second-order.
+  XGBoost's exact regularised leaf formula -- this engine is Friedman's
+  gradient boosting as in scikit-learn (squared-error trees on the gradient,
+  then one Newton step per leaf for log_loss/exponential), not XGBoost's
+  hessian-weighted tree growth.
 - ``n_iter_no_change`` / ``early_stopping_rounds``: aliases.
 """
 
@@ -30,6 +33,7 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 
 from . import RDT, _rdt_native
+from ._validation import check_X, check_X_y, check_sample_weight
 
 __all__ = ["RandomForestRDT", "GradientBoostingRDT"]
 
@@ -75,6 +79,28 @@ def _resolve_n_jobs(n_jobs) -> int:
     return 1 if n_jobs is None else int(n_jobs)
 
 
+def _resolve_max_samples(max_samples):
+    """scikit-learn semantics -> (fraction, absolute count) for the native core.
+
+    None draws n_samples rows, an int draws exactly that many rows, a float
+    draws ``floor(max_samples * n_samples)`` rows (at least 1). A count of 0
+    tells the core to use the fraction.
+    """
+    if max_samples is None:
+        return 1.0, 0
+    if isinstance(max_samples, (bool, np.bool_)):
+        raise ValueError(f"Invalid max_samples: {max_samples!r}")
+    if isinstance(max_samples, (int, np.integer)):
+        if not 1 <= max_samples <= np.iinfo(np.uint32).max:
+            raise ValueError(f"max_samples as an int must be >= 1, got {max_samples!r}")
+        return 1.0, int(max_samples)
+    if isinstance(max_samples, (float, np.floating)):
+        if not (np.isfinite(max_samples) and max_samples > 0.0):
+            raise ValueError(f"max_samples as a float must be finite and > 0, got {max_samples!r}")
+        return float(max_samples), 0
+    raise ValueError(f"Invalid max_samples: {max_samples!r}")
+
+
 def _class_weight_to_sample_weight(y: np.ndarray, classes: np.ndarray, class_weight,
                                     base_sample_weight: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
     if class_weight is None:
@@ -109,16 +135,25 @@ class RandomForestRDT:
     min_child_weight : int, optional
         XGBoost-style alias of ``min_samples_leaf`` (see module docstring).
     min_impurity_decrease : float, default=0.0
+        A tree splits a depth only if the depth's total weighted impurity
+        decrease -- the sum over its nodes of ``N_t / N * (node improvement)``,
+        scikit-learn's scale (see ``rdt.RDT``) -- reaches this value.
     gamma : float, optional
-        XGBoost-style alias of ``min_impurity_decrease``.
+        XGBoost-style alias of ``min_impurity_decrease`` (same scale, not
+        XGBoost's gain scale).
     max_features : {'sqrt', 'log2', None} or int or float, default='sqrt'
         Chosen once per tree, not per node (see module docstring).
     colsample_bytree : {'sqrt', 'log2', None} or int or float, optional
         XGBoost/LightGBM-style alias of ``max_features``.
     bootstrap : bool, default=True
-    max_samples : float, default=1.0
-        Fraction of samples to draw (with replacement) per tree when
-        ``bootstrap=True``.
+    max_samples : int, float or None, default=1.0
+        Number of samples to draw (with replacement) per tree when
+        ``bootstrap=True``, as in scikit-learn: an int draws exactly
+        ``max_samples`` rows, a float draws
+        ``max(1, floor(max_samples * n_samples))`` rows, None draws
+        ``n_samples`` rows. (Up to 0.2.0 an int was treated as a fraction,
+        so e.g. ``max_samples=50`` drew ``50 * n_samples`` rows per tree and
+        ``max_samples=1`` drew all rows; it now draws one.)
     oob_score : bool, default=False
     class_weight : 'balanced' or dict, optional
         Converted to per-sample weights internally.
@@ -129,11 +164,10 @@ class RandomForestRDT:
     presort : bool, default=True
         Split search implementation. True (default) sorts each feature once
         per fit and scores every node of a depth in one pass. False sorts
-        every (node, feature) pair's samples at every depth, as v0.2.0 did,
-        and reproduces v0.2.0's results bit for bit. Both choose the same
-        splits except between candidates whose improvements are equal to
-        within floating-point rounding (e.g. a column and an affine or
-        mirrored copy of it); see docs/ALGORITHM_DETAILS.md.
+        every (node, feature) pair's samples at every depth. Both perform the
+        same floating-point operations (tied feature values are visited in
+        row order by both), so they produce identical models; False only
+        trades speed for the presort's memory (4 bytes per row and feature).
 
     Attributes (after fitting)
     ---------------------------
@@ -160,7 +194,7 @@ class RandomForestRDT:
         max_features: Union[str, int, float, None] = "sqrt",
         colsample_bytree: Union[str, int, float, None] = None,
         bootstrap: bool = True,
-        max_samples: float = 1.0,
+        max_samples: Union[int, float, None] = 1.0,
         oob_score: bool = False,
         class_weight: Optional[Union[str, Dict]] = None,
         random_state: Optional[int] = None,
@@ -207,8 +241,7 @@ class RandomForestRDT:
         self._model = None
 
     def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None) -> "RandomForestRDT":
-        X = np.asarray(X, dtype=np.float64, order="C")
-        y = np.asarray(y, dtype=np.float64, order="C")
+        X, y, sample_weight = check_X_y(X, y, sample_weight)
         self.n_features_ = X.shape[1]
 
         if self.task == "classification":
@@ -216,15 +249,17 @@ class RandomForestRDT:
             self.n_classes_ = len(self.classes_)
             sample_weight = _class_weight_to_sample_weight(y, self.classes_, self.class_weight, sample_weight)
         if sample_weight is not None:
-            sample_weight = np.asarray(sample_weight, dtype=np.float64, order="C")
+            sample_weight = check_sample_weight(sample_weight, len(y), "sample_weight combined with class_weight")
 
+        max_samples_fraction, max_samples_count = _resolve_max_samples(self.max_samples)
         # The native fit runs with the GIL released; only publish the model
         # once it is fully fitted.
         model = _rdt_native.RandomForestModel(
             self.task, self.criterion, self.max_depth, self.min_samples_split, self.min_samples_leaf,
             self.min_impurity_decrease, self.n_estimators, _resolve_max_features(self.max_features),
-            self.bootstrap, self.max_samples, self.oob_score,
-            _resolve_random_state(self.random_state), _resolve_n_jobs(self.n_jobs), presort=self.presort,
+            self.bootstrap, max_samples_fraction, self.oob_score,
+            _resolve_random_state(self.random_state), _resolve_n_jobs(self.n_jobs),
+            max_samples_count, presort=self.presort,
         )
         model.fit(X, y, sample_weight)
         self._model = model
@@ -247,7 +282,7 @@ class RandomForestRDT:
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self._model is None:
             raise ValueError("Forest not fitted yet. Call fit() first.")
-        X = np.asarray(X, dtype=np.float64, order="C")
+        X = check_X(X, self.n_features_)
         return np.array(self._model.predict(X))
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -255,14 +290,23 @@ class RandomForestRDT:
             raise ValueError("predict_proba only available for classification")
         if self._model is None:
             raise ValueError("Forest not fitted yet. Call fit() first.")
-        X = np.asarray(X, dtype=np.float64, order="C")
+        X = check_X(X, self.n_features_)
         return np.array(self._model.predict_proba(X))
 
 
 class GradientBoostingRDT:
     """Gradient Boosting of Restricted Decision Trees, backed by a native
-    C++ core. First-order (Friedman-style) boosting -- see module docstring
-    for how reg_alpha/reg_lambda differ from XGBoost's exact mechanics.
+    C++ core. Friedman's gradient boosting, as in scikit-learn's
+    GradientBoostingClassifier/Regressor: each round fits an RDT to the
+    negative gradient, then replaces each leaf value by the loss's one-step
+    Newton estimate sum(w*g)/sum(w*h) (log_loss, exponential; squared_error's
+    leaf mean is already exact; absolute_error/huber/quantile keep the leaf
+    mean of the gradient). The initial score is the weighted constant
+    minimiser of the loss (prior log-odds, log class priors, mean, median,
+    quantile). ``sample_weight``/``scale_pos_weight`` weight the trees, the
+    init, the leaf values, ``train_score_`` and the early-stopping
+    validation loss. See the module docstring for how reg_alpha/reg_lambda
+    differ from XGBoost's exact mechanics.
 
     Parameters
     ----------
@@ -279,8 +323,13 @@ class GradientBoostingRDT:
     min_child_weight : int, optional
         XGBoost-style alias of ``min_samples_leaf``.
     min_impurity_decrease : float, default=0.0
+        Each round's tree splits a depth only if the depth's total weighted
+        decrease in squared error of the gradient -- the sum over its nodes of
+        ``N_t / N * (node improvement)``, scikit-learn's scale (see
+        ``rdt.RDT``) -- reaches this value.
     gamma : float, optional
-        XGBoost-style alias of ``min_impurity_decrease``.
+        XGBoost-style alias of ``min_impurity_decrease`` (same scale, not
+        XGBoost's gain scale).
     subsample : float, default=1.0
         Row fraction per round (without replacement) -- stochastic GB.
     max_features : {'sqrt', 'log2', None} or int or float, default=None (all)
@@ -311,17 +360,17 @@ class GradientBoostingRDT:
     presort : bool, default=True
         Split search implementation. True (default) sorts each feature once
         per fit and scores every node of a depth in one pass. False sorts
-        every (node, feature) pair's samples at every depth, as v0.2.0 did,
-        and reproduces v0.2.0's results bit for bit. Both choose the same
-        splits except between candidates whose improvements are equal to
-        within floating-point rounding (e.g. a column and an affine or
-        mirrored copy of it); see docs/ALGORITHM_DETAILS.md.
+        every (node, feature) pair's samples at every depth. Both perform the
+        same floating-point operations (tied feature values are visited in
+        row order by both), so they produce identical models; False only
+        trades speed for the presort's memory (4 bytes per row and feature).
 
     Attributes (after fitting)
     ---------------------------
     feature_importances_ : ndarray of shape (n_features,)
     train_score_ : ndarray
-        Training loss at each round actually fitted.
+        Training loss (sample-weighted if weights were given) at each round
+        actually fitted.
     n_estimators_ : int
         Rounds actually fitted -- less than ``n_estimators`` if early
         stopping triggered.
@@ -404,23 +453,29 @@ class GradientBoostingRDT:
         self._model = None
 
     def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None) -> "GradientBoostingRDT":
-        X = np.asarray(X, dtype=np.float64, order="C")
-        y = np.asarray(y, dtype=np.float64, order="C")
+        X, y, sample_weight = check_X_y(X, y, sample_weight)
         self.n_features_ = X.shape[1]
 
         if self.task == "classification":
             self.classes_ = np.unique(y)
             self.n_classes_ = len(self.classes_)
+            if self.n_classes_ < 2:
+                raise ValueError(
+                    f"GradientBoostingRDT classification needs at least 2 classes in y; "
+                    f"got {self.n_classes_} ({self.classes_.tolist()})."
+                )
             if self.loss == "exponential" and self.n_classes_ != 2:
                 raise ValueError("loss='exponential' only supports binary classification")
             if self.scale_pos_weight is not None:
+                if not (np.isfinite(self.scale_pos_weight) and self.scale_pos_weight > 0):
+                    raise ValueError(f"scale_pos_weight must be a finite number > 0, got {self.scale_pos_weight!r}")
                 if self.n_classes_ != 2:
                     raise ValueError("scale_pos_weight only supports binary classification")
                 base = np.ones(len(y), dtype=np.float64) if sample_weight is None else np.array(sample_weight, dtype=np.float64)
                 base[y == self.classes_[1]] *= self.scale_pos_weight
                 sample_weight = base
         if sample_weight is not None:
-            sample_weight = np.asarray(sample_weight, dtype=np.float64, order="C")
+            sample_weight = check_sample_weight(sample_weight, len(y), "sample_weight combined with scale_pos_weight")
 
         # The native fit runs with the GIL released; only publish the model
         # once it is fully fitted.
@@ -443,7 +498,7 @@ class GradientBoostingRDT:
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self._model is None:
             raise ValueError("Model not fitted yet. Call fit() first.")
-        X = np.asarray(X, dtype=np.float64, order="C")
+        X = check_X(X, self.n_features_)
         return np.array(self._model.predict(X))
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -451,5 +506,5 @@ class GradientBoostingRDT:
             raise ValueError("predict_proba only available for classification")
         if self._model is None:
             raise ValueError("Model not fitted yet. Call fit() first.")
-        X = np.asarray(X, dtype=np.float64, order="C")
+        X = check_X(X, self.n_features_)
         return np.array(self._model.predict_proba(X))

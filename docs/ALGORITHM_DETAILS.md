@@ -30,7 +30,8 @@ This is the key distinction from:
 
 For each depth, every candidate feature is scored across *all* currently
 active nodes at that depth — summing each node's best achievable impurity
-improvement for that feature — before any split is committed:
+improvement for that feature, weighted by the node's share of the training
+samples (sample weight) — before any split is committed:
 
 ```
 function BuildRestrictedTree(X, y, max_depth):
@@ -54,15 +55,22 @@ function BuildRestrictedTree(X, y, max_depth):
             for node in nodes_to_split:
                 threshold, improvement = find_best_threshold(node, feature)
                 if threshold is not None:
-                    total_improvement += improvement
+                    total_improvement += (node.weight / root.weight) * improvement
                     thresholds[node] = threshold
 
             if total_improvement > best_total_improvement:
                 best_total_improvement = total_improvement
                 best_feature, best_thresholds = feature, thresholds
 
+        if best_feature is None or best_total_improvement + EPSILON < min_impurity_decrease:
+            make every node in nodes_to_split a leaf
+            break
+
         next_level = []
         for node in nodes_to_split:
+            if node not in best_thresholds:
+                make node a leaf        # best_feature cannot split it (see below)
+                continue
             threshold = best_thresholds[node]
             node.left, node.right = split(node, best_feature, threshold)
             next_level += [node.left, node.right]
@@ -71,6 +79,37 @@ function BuildRestrictedTree(X, y, max_depth):
 
     return root
 ```
+
+`node.weight` is the node's number of training samples (or their total
+`sample_weight`), so `(node.weight / root.weight) * improvement` is exactly
+scikit-learn's *weighted impurity decrease* of a split,
+`N_t / N * (impurity - N_t_L / N_t * left_impurity - N_t_R / N_t * right_impurity)`.
+Without that weighting a node's within-node improvement would count the same
+whether the node holds 10 samples or 10,000, and a feature that perfectly
+separates a tiny node could win the whole depth over one that substantially
+improves the large nodes. The winning total is stored per depth as
+`depth_improvements_` (the basis of the ensembles' `feature_importances_`), and
+`min_impurity_decrease` is compared against it: a depth is committed unless
+its total weighted impurity decrease plus `EPSILON` (machine epsilon) is below
+the threshold. For a single node (the root, or `max_depth=1`) this is exactly
+scikit-learn's quantity and rule;
+the difference is that scikit-learn applies it node by node while an RDT
+applies it to the whole depth, since the depth shares one feature.
+
+### Nodes the depth's feature cannot split
+
+The winning feature may have no valid threshold in some node — it is constant
+there, or every threshold would violate `min_samples_leaf`. Such a node
+becomes a leaf at that depth, even if a feature chosen for a later depth
+could have split it. This is deliberate: deferring the node and splitting it
+later with depth `d+1`'s feature would place a depth-`d+1` feature at depth
+`d` (breaking "all nodes at depth `d` use the same feature"), or would need a
+pass-through node with a single child, which neither the tree structure nor
+the per-depth feature map (`depth_features_`) can represent; it would also
+break the "two-pass" equivalence argument below, which relies on every node
+at a depth being split by that depth's feature. Weighting each node's
+improvement by its size makes it unlikely that the depth's feature is one
+that cannot split the large nodes, which is what makes freezing costly.
 
 ### Finding the best threshold for a (node, feature) pair
 
@@ -91,6 +130,13 @@ function find_best_threshold(node, feature):
     return best_threshold, best_improvement
 ```
 
+A candidate threshold between consecutive distinct values `a < b` is their
+midpoint, except that — as in scikit-learn — `a` itself is used when the
+midpoint is not strictly below `b` (adjacent floating-point values) or is not
+finite, so `x <= threshold` always reproduces the scored partition. Tied
+feature values are visited in row order, so the search performs the same
+floating-point operations with every C++ standard library.
+
 The native core sweeps the split point with incrementally-updated running
 class counts / sums, rather than rescanning all samples for every candidate
 threshold — an `O(1)`-amortized-per-candidate scan instead of `O(n)` per
@@ -102,19 +148,13 @@ same candidate feature, so each feature's rows are **sorted once per fit**
 feature's presorted rows routes every row to its node and sweeps all of the
 depth's nodes together (`core/include/rdt/presort.hpp`). Gradient Boosting
 sorts each column once per `fit()` (the first time a round draws it) and
-derives each round's (subsampled) order from it in linear time. This chooses
-the same features and thresholds as the per-node sort — same candidate
-boundaries, midpoints, sample-count constraints, summation order of the
-running statistics and tie-breaking — except that the order of samples
-*within a run of tied feature values* is fixed (row order) where `std::sort`
-left it unspecified. That can change the last bits of an improvement when the
-running sums are inexact (so `depth_improvements_` / `feature_importances_`
-may differ in the last bits on tie-heavy data), and so can only change a
-split when two candidates' improvements are equal to within rounding error —
-in practice a column and an affine or mirrored copy of it, which induce the
-same partition. Which of two such candidates the per-node sort picks depends
-on the standard library's `std::sort`, so it can already differ between
-platforms. MAE keeps the per-node path; `presort=False` selects it everywhere.
+derives each round's (subsampled) order from it in linear time. This performs
+exactly the same floating-point operations as the per-node sort — same
+candidate boundaries, guarded midpoints, sample-count constraints, node
+weighting, centred MSE sums, summation order of the running statistics
+(tied feature values are visited in row order by both searches) and
+tie-breaking — so both produce identical trees, on every platform. MAE keeps
+the per-node path; `presort=False` selects it everywhere.
 
 ### On "two-pass"
 
@@ -177,6 +217,14 @@ by whichever class was encountered first while scanning the leaf's samples).
 implementation always uses the mean as the leaf value, independent of which
 regression criterion was used to choose splits.
 
+With `sample_weight`, counts and means are weighted. Samples whose weight is
+zero take no part in growing the tree, exactly as if those rows were removed
+(as in scikit-learn), so no node — in particular no leaf — has zero total
+weight. A Random Forest bootstrap sample that happens to contain only
+zero-weight rows is redrawn (up to 100 times, deterministically for a given
+`random_state`); if none of the draws contains a positively weighted row,
+`fit` raises `ValueError`.
+
 ## Prediction
 
 ```
@@ -196,8 +244,13 @@ Tree growth stops at a node when:
 1. **Max depth reached**: `depth >= max_depth`.
 2. **Insufficient samples**: `n_samples < min_samples_split`.
 3. **Pure node**: all samples share the same target value.
-4. **No valid split**: no candidate feature/threshold satisfies
-   `min_samples_leaf` on both sides.
+4. **No valid split on the depth's feature**: the feature selected for this
+   depth has no threshold satisfying `min_samples_leaf` on both sides of this
+   node (e.g. it is constant within the node). The node becomes a leaf even
+   if another feature could split it — see "Nodes the depth's feature cannot
+   split" above.
+5. **Insufficient improvement**: the depth's total weighted impurity decrease
+   is below `min_impurity_decrease` (every node at that depth becomes a leaf).
 
 ## Complexity
 
@@ -238,6 +291,9 @@ every round).
 - **No categorical feature encoding** in this implementation — all inputs
   are treated as continuous; encode categoricals (e.g. one-hot or ordinal)
   before calling `fit`.
+- **No missing-value support**: NaN or infinity in `X` raises `ValueError`
+  at both `fit` and `predict`; impute (or encode missingness as an extra
+  column) beforehand.
 
 ## References and related work
 

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "rdt/matrix.hpp"
@@ -58,12 +60,19 @@ inline std::uint32_t resolve_max_features(const MaxFeaturesSpec& spec, std::uint
 // cache across trees. Per-row accumulation order over trees is unchanged.
 constexpr std::size_t kPredictRowBlock = 256;
 
+// A bootstrap sample containing only zero-weight rows is redrawn at most
+// this many times in total before RandomForestModel::fit gives up.
+constexpr int kMaxBootstrapDraws = 100;
+
 struct ForestParams {
     TreeParams tree_params;
     int n_estimators = 100;
     MaxFeaturesSpec max_features = MaxFeaturesSpec::Sqrt();
     bool bootstrap = true;
     double max_samples = 1.0; // fraction of n_samples per bootstrap draw (only used if bootstrap)
+    // Absolute bootstrap draw size; when > 0 it overrides max_samples
+    // (scikit-learn's integer max_samples).
+    std::uint32_t max_samples_count = 0;
     bool oob_score = false;
     std::uint64_t random_state = 0;
     int n_jobs = 1; // sklearn convention: caller passes 1 for "None", -1 for "all cores"
@@ -92,9 +101,11 @@ public:
         }
 
         const std::uint32_t k = resolve_max_features(params_.max_features, static_cast<std::uint32_t>(n_features_));
-        const std::uint32_t bootstrap_size = params_.bootstrap
-            ? static_cast<std::uint32_t>(std::max(1.0, params_.max_samples * static_cast<double>(n_samples_)))
-            : static_cast<std::uint32_t>(n_samples_);
+        const std::uint32_t bootstrap_size = !params_.bootstrap
+            ? static_cast<std::uint32_t>(n_samples_)
+            : params_.max_samples_count > 0
+                ? params_.max_samples_count
+                : static_cast<std::uint32_t>(std::max(1.0, params_.max_samples * static_cast<double>(n_samples_)));
 
         const std::size_t n_est = static_cast<std::size_t>(params_.n_estimators);
         TreeParams tree_params = params_.tree_params;
@@ -107,6 +118,10 @@ public:
         for (std::size_t i = 0; i < n_est; ++i) trees_.emplace_back(tree_params);
         feature_subsets_.assign(n_est, {});
         std::vector<std::vector<std::uint32_t>> oob_row_indices(n_est);
+        // Trees whose bootstrap never drew a positively weighted row; reported
+        // after the pool has finished, for the lowest such tree, so the error
+        // does not depend on thread scheduling.
+        std::vector<char> no_weighted_rows(n_est, 0);
 
         ThreadPool pool(resolve_n_jobs(params_.n_jobs));
         pool.parallel_for(n_est, [&](std::size_t t) {
@@ -115,6 +130,21 @@ public:
             std::vector<std::uint32_t> row_indices;
             if (params_.bootstrap) {
                 row_indices = rng.sample_with_replacement(static_cast<std::uint32_t>(n_samples_), bootstrap_size);
+                // A sample made only of zero-weight rows carries no information
+                // (the tree would be a single leaf with zero class counts, i.e.
+                // a predict_proba row of zeros, or value 0): redraw it from the
+                // same per-tree generator, so the result stays deterministic.
+                if (sample_weight) {
+                    int draws = 1;
+                    while (!has_positive_weight(*sample_weight, row_indices) && draws < kMaxBootstrapDraws) {
+                        row_indices = rng.sample_with_replacement(static_cast<std::uint32_t>(n_samples_), bootstrap_size);
+                        ++draws;
+                    }
+                    if (!has_positive_weight(*sample_weight, row_indices)) {
+                        no_weighted_rows[t] = 1;
+                        return;
+                    }
+                }
                 if (params_.oob_score) {
                     std::vector<bool> in_bag(n_samples_, false);
                     for (auto idx : row_indices) in_bag[idx] = true;
@@ -147,13 +177,27 @@ public:
             }
             VectorView sub_Y(sub_y.data(), sub_y.size());
 
+            // Every tree is aligned to the forest's classes_, not just the
+            // labels its bootstrap sample happens to contain, so predict_proba
+            // and the OOB vote can add tree rows column-by-column.
+            const std::vector<double>* tree_classes =
+                params_.tree_params.task == Task::Classification ? &classes_ : nullptr;
             if (sample_weight) {
                 VectorView sub_W(sub_w.data(), sub_w.size());
-                trees_[t].fit(sub, sub_Y, &sub_W);
+                trees_[t].fit(sub, sub_Y, &sub_W, nullptr, tree_classes);
             } else {
-                trees_[t].fit(sub, sub_Y);
+                trees_[t].fit(sub, sub_Y, nullptr, nullptr, tree_classes);
             }
         });
+
+        for (std::size_t t = 0; t < n_est; ++t) {
+            if (no_weighted_rows[t]) {
+                throw std::invalid_argument(
+                    "every bootstrap sample drawn for a tree (" + std::to_string(kMaxBootstrapDraws) +
+                    " attempts) contained only rows with zero sample_weight; increase max_samples or give "
+                    "more rows a positive weight");
+            }
+        }
 
         compute_feature_importances();
         if (params_.oob_score) compute_oob_score(X, y, oob_row_indices);
@@ -216,6 +260,7 @@ public:
     const std::vector<double>& feature_importances() const { return feature_importances_; }
     double oob_score() const { return oob_score_; }
     bool has_oob_score() const { return params_.oob_score; }
+    std::size_t n_features() const { return n_features_; }
 
 private:
     ForestParams params_;
@@ -227,6 +272,13 @@ private:
     std::size_t n_features_ = 0;
     std::size_t n_samples_ = 0;
 
+    static bool has_positive_weight(const VectorView& w, const std::vector<std::uint32_t>& rows) {
+        for (auto r : rows) {
+            if (w[r] > 0.0) return true;
+        }
+        return false;
+    }
+
     static std::size_t argmax(const double* v, std::size_t n) {
         std::size_t best = 0;
         for (std::size_t i = 1; i < n; ++i) if (v[i] > v[best]) best = i;
@@ -236,11 +288,10 @@ private:
     static std::size_t argmax(const std::vector<double>& v) { return argmax(v.data(), v.size()); }
 
     // Adds one tree's class probabilities for a row into `acc` (forest
-    // classes() order). The tree's probabilities are indexed by the tree's own
-    // classes(), and are added position by position into the forest's
-    // columns, as in v0.2.0; a tree whose bootstrap sample missed a class has
-    // fewer columns, and v0.2.0 then read past the end of its row (undefined
-    // behaviour) -- those positions contribute 0 here.
+    // classes() order). Every classification tree is fitted with the forest's
+    // classes_ (see fit), so its columns are the forest's columns; the min()
+    // only guards against a tree with fewer columns, which v0.2.0 produced
+    // when a bootstrap sample missed a class (and then read out of bounds).
     void add_tree_proba(const RDTModel& tree, const Node* leaf, std::vector<double>& buf, double* acc) const {
         const std::size_t tree_k = tree.n_classes();
         tree.leaf_proba(leaf, buf.data());

@@ -12,6 +12,7 @@ from typing import Optional
 import numpy as np
 
 from . import _rdt_native
+from ._validation import check_X, check_X_y
 
 __all__ = ["RDT"]
 
@@ -99,10 +100,7 @@ class RDT:
         return self
 
     def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None) -> "RDT":
-        X = np.asarray(X, dtype=np.float64, order="C")
-        y = np.asarray(y, dtype=np.float64, order="C")
-        if sample_weight is not None:
-            sample_weight = np.asarray(sample_weight, dtype=np.float64, order="C")
+        X, y, sample_weight = check_X_y(X, y, sample_weight)
 
         self.n_features_ = X.shape[1]
 
@@ -125,7 +123,7 @@ class RDT:
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self._model is None:
             raise ValueError("Tree not fitted yet. Call fit() first.")
-        X = np.asarray(X, dtype=np.float64, order="C")
+        X = check_X(X, self.n_features_)
         return np.array(self._model.predict(X))
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -133,5 +131,5 @@ class RDT:
             raise ValueError("predict_proba only available for classification")
         if self._model is None:
             raise ValueError("Tree not fitted yet. Call fit() first.")
-        X = np.asarray(X, dtype=np.float64, order="C")
+        X = check_X(X, self.n_features_)
         return np.array(self._model.predict_proba(X))

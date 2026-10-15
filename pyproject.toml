@@ -32,3 +32,9 @@ Repository = "https://github.com/amritnm/restricted-decision-trees"
 wheel.packages = ["python/rdt"]
 build.verbose = true
 logging.level = "INFO"
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: long-running shape/scenario grids (deselected by default; run with -m slow)",
+]
+addopts = "-m 'not slow'"

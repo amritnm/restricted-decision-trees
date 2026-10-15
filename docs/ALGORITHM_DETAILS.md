@@ -91,6 +91,13 @@ function find_best_threshold(node, feature):
     return best_threshold, best_improvement
 ```
 
+A candidate threshold between consecutive distinct values `a < b` is their
+midpoint, except that — as in scikit-learn — `a` itself is used when the
+midpoint is not strictly below `b` (adjacent floating-point values) or is not
+finite, so `x <= threshold` always reproduces the scored partition. Tied
+feature values are visited in row order, so the search performs the same
+floating-point operations with every C++ standard library.
+
 The native core sorts each `(node, feature)` pair's values once and sweeps
 the split point with incrementally-updated running class counts / sums,
 rather than rescanning all samples for every candidate threshold — an

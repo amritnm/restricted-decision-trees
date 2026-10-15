@@ -254,3 +254,37 @@ def test_gb_invalid_loss_for_task_raises():
         GradientBoostingRDT(task="regression", loss="log_loss")
     with pytest.raises(ValueError):
         GradientBoostingRDT(task="classification", loss="squared_error")
+
+
+@pytest.mark.parametrize("loss", ["squared_error", "huber", "log_loss", "log_loss_multiclass"])
+def test_gb_train_score_is_the_loss_of_predict_on_the_training_set(loss):
+    # train_score_ is computed from the raw scores accumulated during fit; predicting the
+    # training set afterwards must reproduce them -- through each tree's column subset and with
+    # reg_alpha / reg_lambda shrinkage applied exactly as in fit.
+    rng = np.random.default_rng(31)
+    n = 800
+    X = rng.normal(size=(n, 8))
+    X[:, 1] = np.round(X[:, 1])
+    s = X[:, 0] - 0.5 * X[:, 1] + 0.5 * rng.normal(size=n)
+    kw = dict(n_estimators=15, max_depth=3, learning_rate=0.3, subsample=0.8, colsample_bytree=0.5,
+              reg_lambda=1.0, reg_alpha=0.01, random_state=0)
+    if loss in ("squared_error", "huber"):
+        y = 2.0 * s
+        gb = GradientBoostingRDT(task="regression", loss=loss, **kw).fit(X, y)
+        diff = y - gb.predict(X)
+        if loss == "squared_error":
+            value = np.mean(diff * diff)
+        else:
+            d = gb.huber_delta
+            value = np.mean(np.where(np.abs(diff) <= d, 0.5 * diff * diff, d * (np.abs(diff) - 0.5 * d)))
+    elif loss == "log_loss":
+        y = (s > 0).astype(float)
+        gb = GradientBoostingRDT(**kw).fit(X, y)
+        p = np.clip(gb.predict_proba(X)[:, 1], 1e-12, 1 - 1e-12)
+        value = np.mean(-(y * np.log(p) + (1 - y) * np.log(1 - p)))
+    else:
+        y = np.digitize(s, [-0.5, 0.5]).astype(float)
+        gb = GradientBoostingRDT(**kw).fit(X, y)
+        P = gb.predict_proba(X)
+        value = np.mean(-np.log(P[np.arange(n), np.searchsorted(gb.classes_, y)]))
+    np.testing.assert_allclose(value, gb.train_score_[-1], rtol=1e-10)

@@ -31,24 +31,36 @@
 // (weighted-count leaf constraints are a separate, not-yet-added parameter).
 namespace rdt {
 
-inline double gini_from_counts(const std::vector<double>& weighted_counts, double total_weight) {
+// `weighted_counts` are summed in the order given; callers that need results
+// bit-identical to each other must present the classes in the same order
+// (find_best_threshold and the presorted search both use first-encountered
+// order along the feature-sorted samples).
+inline double gini_from_counts(const double* weighted_counts, std::size_t n_counts, double total_weight) {
     if (total_weight <= 0.0) return 0.0;
     double sum_sq = 0.0;
-    for (double c : weighted_counts) {
-        double p = c / total_weight;
+    for (std::size_t i = 0; i < n_counts; ++i) {
+        double p = weighted_counts[i] / total_weight;
         sum_sq += p * p;
     }
     return 1.0 - sum_sq;
 }
 
-inline double entropy_from_counts(const std::vector<double>& weighted_counts, double total_weight) {
+inline double entropy_from_counts(const double* weighted_counts, std::size_t n_counts, double total_weight) {
     if (total_weight <= 0.0) return 0.0;
     double h = 0.0;
-    for (double c : weighted_counts) {
-        double p = c / total_weight;
+    for (std::size_t i = 0; i < n_counts; ++i) {
+        double p = weighted_counts[i] / total_weight;
         h -= p * std::log2(p + 1e-10);
     }
     return h;
+}
+
+inline double gini_from_counts(const std::vector<double>& weighted_counts, double total_weight) {
+    return gini_from_counts(weighted_counts.data(), weighted_counts.size(), total_weight);
+}
+
+inline double entropy_from_counts(const std::vector<double>& weighted_counts, double total_weight) {
+    return entropy_from_counts(weighted_counts.data(), weighted_counts.size(), total_weight);
 }
 
 // Pass sums of values *centred* near their mean (see find_best_threshold's
@@ -179,8 +191,15 @@ struct ThresholdResult {
 // node. `indices` are the sample indices belonging to the node. `weights`
 // (nullptr = uniform 1.0) are indexed the same way as `y`/`X`, i.e. by the
 // original sample index, not by position within `indices`.
-inline ThresholdResult find_best_threshold(
-    const MatrixView& X,
+//
+// This per-(node, feature) sort is the reference algorithm. RDTModel normally
+// scores all nodes of a depth at once from presorted columns instead (see
+// presort.hpp), which yields the same thresholds and improvements; this path
+// is still used for MAE and when presorting is disabled. `Matrix` is
+// MatrixView or IndexedMatrixView.
+template <class Matrix>
+ThresholdResult find_best_threshold(
+    const Matrix& X,
     const VectorView& y,
     const std::vector<std::uint32_t>& indices,
     int feature_idx,
@@ -371,8 +390,9 @@ inline ThresholdResult find_best_threshold(
 // Partition `indices` (in their original relative order) into left/right
 // children for a chosen (feature, threshold), matching the Python
 // reference's order-preserving boolean-mask split exactly.
-inline void split_indices(
-    const MatrixView& X,
+template <class Matrix>
+void split_indices(
+    const Matrix& X,
     const std::vector<std::uint32_t>& indices,
     int feature_idx,
     double threshold,

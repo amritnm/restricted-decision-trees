@@ -161,6 +161,13 @@ class RandomForestRDT:
     n_jobs : int, optional
         Number of threads for parallel tree building. None = 1 (sequential),
         -1 = all available hardware threads.
+    presort : bool, default=True
+        Split search implementation. True (default) sorts each feature once
+        per fit and scores every node of a depth in one pass. False sorts
+        every (node, feature) pair's samples at every depth. Both perform the
+        same floating-point operations (tied feature values are visited in
+        row order by both), so they produce identical models; False only
+        trades speed for the presort's memory (4 bytes per row and feature).
 
     Attributes (after fitting)
     ---------------------------
@@ -192,6 +199,7 @@ class RandomForestRDT:
         class_weight: Optional[Union[str, Dict]] = None,
         random_state: Optional[int] = None,
         n_jobs: Optional[int] = None,
+        presort: bool = True,
     ):
         self.task = task.lower()
         if self.task not in ("classification", "regression"):
@@ -221,6 +229,7 @@ class RandomForestRDT:
         self.class_weight = class_weight
         self.random_state = random_state
         self.n_jobs = n_jobs
+        self.presort = presort
 
         self.estimators_: List[RDT] = []
         self.feature_importances_ = None
@@ -243,14 +252,17 @@ class RandomForestRDT:
             sample_weight = check_sample_weight(sample_weight, len(y), "sample_weight combined with class_weight")
 
         max_samples_fraction, max_samples_count = _resolve_max_samples(self.max_samples)
-        self._model = _rdt_native.RandomForestModel(
+        # The native fit runs with the GIL released; only publish the model
+        # once it is fully fitted.
+        model = _rdt_native.RandomForestModel(
             self.task, self.criterion, self.max_depth, self.min_samples_split, self.min_samples_leaf,
             self.min_impurity_decrease, self.n_estimators, _resolve_max_features(self.max_features),
             self.bootstrap, max_samples_fraction, self.oob_score,
             _resolve_random_state(self.random_state), _resolve_n_jobs(self.n_jobs),
-            max_samples_count,
+            max_samples_count, presort=self.presort,
         )
-        self._model.fit(X, y, sample_weight)
+        model.fit(X, y, sample_weight)
+        self._model = model
 
         self.feature_importances_ = np.array(self._model.feature_importances_)
         if self.oob_score:
@@ -345,6 +357,13 @@ class GradientBoostingRDT:
         Threads for a multiclass round's per-class trees (independent within
         a round); boosting rounds themselves are inherently sequential.
         None = 1, -1 = all available hardware threads.
+    presort : bool, default=True
+        Split search implementation. True (default) sorts each feature once
+        per fit and scores every node of a depth in one pass. False sorts
+        every (node, feature) pair's samples at every depth. Both perform the
+        same floating-point operations (tied feature values are visited in
+        row order by both), so they produce identical models; False only
+        trades speed for the presort's memory (4 bytes per row and feature).
 
     Attributes (after fitting)
     ---------------------------
@@ -383,6 +402,7 @@ class GradientBoostingRDT:
         quantile_alpha: float = 0.5,
         random_state: Optional[int] = None,
         n_jobs: Optional[int] = None,
+        presort: bool = True,
     ):
         self.task = task.lower()
         if self.task not in ("classification", "regression"):
@@ -421,6 +441,7 @@ class GradientBoostingRDT:
         self.quantile_alpha = quantile_alpha
         self.random_state = random_state
         self.n_jobs = n_jobs
+        self.presort = presort
 
         self.feature_importances_ = None
         self.train_score_ = None
@@ -456,15 +477,18 @@ class GradientBoostingRDT:
         if sample_weight is not None:
             sample_weight = check_sample_weight(sample_weight, len(y), "sample_weight combined with scale_pos_weight")
 
-        self._model = _rdt_native.GradientBoostingModel(
+        # The native fit runs with the GIL released; only publish the model
+        # once it is fully fitted.
+        model = _rdt_native.GradientBoostingModel(
             self.task, self.loss, self.max_depth, self.min_samples_split, self.min_samples_leaf,
             self.min_impurity_decrease, self.n_estimators, self.learning_rate, self.subsample,
             _resolve_max_features(self.max_features), self.validation_fraction,
             self.n_iter_no_change if self.n_iter_no_change is not None else 0, self.tol,
             self.reg_alpha, self.reg_lambda, self.huber_delta, self.quantile_alpha,
-            _resolve_random_state(self.random_state), _resolve_n_jobs(self.n_jobs),
+            _resolve_random_state(self.random_state), _resolve_n_jobs(self.n_jobs), presort=self.presort,
         )
-        self._model.fit(X, y, sample_weight)
+        model.fit(X, y, sample_weight)
+        self._model = model
 
         self.feature_importances_ = np.array(self._model.feature_importances_)
         self.train_score_ = np.array(self._model.train_score_)

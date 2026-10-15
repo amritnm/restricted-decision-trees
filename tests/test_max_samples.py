@@ -19,7 +19,7 @@ def _rows_per_tree(max_samples, n=400, bootstrap=True):
     y = (X[:, 0] > 0).astype(float)
     rf = RandomForestRDT(n_estimators=3, max_depth=2, max_features=None, max_samples=max_samples,
                          bootstrap=bootstrap, random_state=0).fit(X, y)
-    return [len(t.root.indices) for t in rf.estimators_]
+    return [t.root.n_samples for t in rf.estimators_]
 
 
 def test_int_max_samples_is_a_row_count():

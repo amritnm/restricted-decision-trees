@@ -43,6 +43,13 @@ class RDT:
         comparison as sklearn's parameter of the same name, which sklearn
         applies per node rather than per depth (XGBoost/LightGBM's closest
         equivalent is gamma/min_split_loss).
+    presort : bool, default=True
+        Split search implementation. True (default) sorts each feature once
+        per fit and scores every node of a depth in one pass. False sorts
+        every (node, feature) pair's samples at every depth. Both perform the
+        same floating-point operations (tied feature values are visited in
+        row order by both), so they produce identical trees; False only
+        trades speed for the presort's memory (4 bytes per row and feature).
     """
 
     def __init__(
@@ -53,6 +60,7 @@ class RDT:
         min_samples_split: int = 2,
         min_samples_leaf: int = 1,
         min_impurity_decrease: float = 0.0,
+        presort: bool = True,
     ):
         self.task = task.lower()
         if self.task not in ("classification", "regression"):
@@ -72,6 +80,7 @@ class RDT:
         self.min_samples_split = min_samples_split
         self.min_samples_leaf = min_samples_leaf
         self.min_impurity_decrease = min_impurity_decrease
+        self.presort = presort
 
         self.root = None
         self.n_features_ = None
@@ -109,11 +118,15 @@ class RDT:
 
         self.n_features_ = X.shape[1]
 
-        self._model = _rdt_native.RDTModel(
+        # The native fit runs with the GIL released; only publish the model
+        # once it is fully fitted.
+        model = _rdt_native.RDTModel(
             self.task, self.criterion, self.max_depth,
             self.min_samples_split, self.min_samples_leaf, self.min_impurity_decrease,
+            presort=self.presort,
         )
-        self._model.fit(X, y, sample_weight)
+        model.fit(X, y, sample_weight)
+        self._model = model
 
         if self.task == "classification":
             self.classes_ = np.array(self._model.classes_)

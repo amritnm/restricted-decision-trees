@@ -9,9 +9,10 @@
 #include <utility>
 #include <vector>
 
-#include "rdt/forest.hpp" // MaxFeaturesSpec, resolve_max_features, extract_submatrix, SubMatrix
+#include "rdt/forest.hpp" // MaxFeaturesSpec, resolve_max_features, kPredictRowBlock
 #include "rdt/matrix.hpp"
 #include "rdt/params.hpp"
+#include "rdt/presort.hpp"
 #include "rdt/rng.hpp"
 #include "rdt/thread_pool.hpp"
 #include "rdt/tree.hpp"
@@ -152,6 +153,20 @@ public:
         const std::size_t n_est = static_cast<std::size_t>(params_.n_estimators);
         ThreadPool pool(resolve_n_jobs(params_.n_jobs));
 
+        // Every round's trees are fitted on a subset of train_rows, so each
+        // column's training rows are sorted once per fit -- lazily, the first
+        // time a round draws the column -- and kept (4 bytes per (training
+        // row, sorted column) for the duration of fit()); each round derives
+        // its trees' presorted columns from these in O(n) per column
+        // (presort.hpp).
+        const bool presort = params_.tree_params.presort && n <= kPresortMaxRows;
+        LazySortedColumns sorted_columns(X, presort ? train_rows : std::vector<std::uint32_t>());
+
+        // Negative gradient per output, indexed by sample (only train_rows
+        // are written/read); reused across rounds. Replaces v0.2.0's per-round
+        // unordered_map from row to residual.
+        std::vector<std::vector<double>> residual(n_outputs, std::vector<double>(n, 0.0));
+
         for (std::size_t round = 0; round < n_est; ++round) {
             std::vector<RDTModel> round_trees;
             round_trees.reserve(n_outputs);
@@ -159,21 +174,22 @@ public:
                 TreeParams tp = params_.tree_params;
                 tp.task = Task::Regression;
                 tp.criterion = Criterion::MSE;
+                tp.retain_indices = false; // see TreeParams::retain_indices
                 round_trees.emplace_back(tp);
             }
+            std::vector<std::vector<std::uint32_t>> round_fit_rows(n_outputs);
             std::vector<std::vector<std::uint32_t>> round_col_subsets(n_outputs);
             std::vector<std::vector<double>> round_raw_preds(n_outputs);
 
-            pool.parallel_for(n_outputs, [&](std::size_t k) {
+            // Row / column subsets. Each (round, output) has its own seeded
+            // Rng, so drawing them here, sequentially and before the
+            // residuals, gives the same subsets as drawing them inside the
+            // parallel per-output work; it lets the columns the round needs be
+            // presorted up front, outside the threads.
+            for (std::size_t k = 0; k < n_outputs; ++k) {
                 Rng rng(derive_seed(params_.random_state, round * 1000 + k + 1));
 
-                std::vector<double> residual_train(train_rows.size());
-                for (std::size_t r = 0; r < train_rows.size(); ++r) {
-                    std::uint32_t i = train_rows[r];
-                    residual_train[r] = negative_gradient(i, k, y_enc, F, n_outputs);
-                }
-
-                std::vector<std::uint32_t> fit_rows;
+                std::vector<std::uint32_t>& fit_rows = round_fit_rows[k];
                 if (params_.subsample < 1.0) {
                     std::uint32_t m = static_cast<std::uint32_t>(
                         std::max(1.0, params_.subsample * static_cast<double>(train_rows.size())));
@@ -184,43 +200,68 @@ public:
                     fit_rows = train_rows;
                 }
 
-                std::uint32_t k_features = resolve_max_features(params_.max_features, static_cast<std::uint32_t>(n_features_));
-                std::vector<std::uint32_t> col_subset;
+                std::uint32_t k_features =
+                    resolve_max_features(params_.max_features, static_cast<std::uint32_t>(n_features_));
+                std::vector<std::uint32_t>& col_subset = round_col_subsets[k];
                 if (k_features < n_features_) {
                     col_subset = rng.sample_without_replacement(static_cast<std::uint32_t>(n_features_), k_features);
                 } else {
                     col_subset.resize(n_features_);
                     for (std::uint32_t f = 0; f < n_features_; ++f) col_subset[f] = f;
                 }
-                round_col_subsets[k] = col_subset;
+                if (presort) sorted_columns.ensure(col_subset);
+            }
 
-                SubMatrix fit_sub = extract_submatrix(X, &fit_rows, col_subset);
-                std::vector<double> fit_residual(fit_rows.size());
+            pool.parallel_for(n_outputs, [&](std::size_t k) {
+                std::vector<double>& residual_k = residual[k];
+                for (std::size_t r = 0; r < train_rows.size(); ++r) {
+                    std::uint32_t i = train_rows[r];
+                    residual_k[i] = negative_gradient(i, k, y_enc, F, n_outputs);
+                }
+                const std::vector<std::uint32_t>& fit_rows = round_fit_rows[k];
+                const std::vector<std::uint32_t>& col_subset = round_col_subsets[k];
+
+                // The tree sees X[fit_rows, col_subset] as a view (no copy of
+                // X); only its residuals / weights are gathered.
+                const std::size_t m = fit_rows.size();
+                IndexedMatrixView X_sub(X, fit_rows.data(), m, col_subset.data(), col_subset.size());
+                std::vector<double> fit_residual(m);
                 std::vector<double> fit_weight;
-                if (sample_weight) fit_weight.resize(fit_rows.size());
-                // Build a row_indices->residual map restricted to fit_rows (a subset of train_rows).
-                std::unordered_map<std::uint32_t, double> residual_by_row;
-                residual_by_row.reserve(train_rows.size());
-                for (std::size_t r = 0; r < train_rows.size(); ++r) residual_by_row[train_rows[r]] = residual_train[r];
-                for (std::size_t r = 0; r < fit_rows.size(); ++r) {
-                    fit_residual[r] = residual_by_row[fit_rows[r]];
+                if (sample_weight) fit_weight.resize(m);
+                for (std::size_t r = 0; r < m; ++r) {
+                    fit_residual[r] = residual_k[fit_rows[r]];
                     if (sample_weight) fit_weight[r] = (*sample_weight)[fit_rows[r]];
                 }
-                VectorView residual_view(fit_residual.data(), fit_residual.size());
+                VectorView residual_view(fit_residual.data(), m);
+                VectorView w_view(fit_weight.data(), fit_weight.size());
 
-                if (sample_weight) {
-                    VectorView w_view(fit_weight.data(), fit_weight.size());
-                    round_trees[k].fit(fit_sub.view, residual_view, &w_view);
-                } else {
-                    round_trees[k].fit(fit_sub.view, residual_view);
+                // This round's presorted columns: the per-fit ones for
+                // col_subset, restricted to fit_rows and renumbered to the
+                // tree's row ids 0..m-1 (fit_rows is ascending, so tied
+                // values stay in row order).
+                SortedColumns round_sorted;
+                PresortedView presorted;
+                if (presort) {
+                    presorted = sorted_columns.view(col_subset);
+                    const bool all_rows = m == n; // fit_rows == 0..n-1: ids already match
+                    if (!all_rows) {
+                        std::vector<std::int32_t> new_id(n, -1);
+                        for (std::size_t r = 0; r < m; ++r) new_id[fit_rows[r]] = static_cast<std::int32_t>(r);
+                        round_sorted = SortedColumns(presorted, new_id.data(), m);
+                        presorted = round_sorted.view();
+                    }
                 }
+                round_trees[k].fit(X_sub, residual_view, sample_weight ? &w_view : nullptr,
+                                   presort ? &presorted : nullptr);
                 if (has_newton_leaf_step()) {
-                    update_leaf_values(round_trees[k], fit_sub.view, fit_rows, fit_residual,
+                    update_leaf_values(round_trees[k], X, col_subset, fit_rows, fit_residual,
                                        sample_weight ? &fit_weight : nullptr, y_enc[k], n_outputs);
                 }
 
-                SubMatrix all_sub = extract_submatrix(X, nullptr, col_subset);
-                std::vector<double> raw_pred = round_trees[k].predict(all_sub.view);
+                std::vector<double> raw_pred(n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    raw_pred[i] = round_trees[k].find_leaf(X, i, col_subset.data())->value;
+                }
                 shrink_leaf_values(raw_pred);
                 round_raw_preds[k] = std::move(raw_pred);
             });
@@ -274,28 +315,17 @@ public:
     }
 
     std::vector<std::vector<double>> predict_proba(const MatrixView& X) const {
-        auto F = accumulate_scores(X);
-        std::vector<std::vector<double>> out(X.n_rows(), std::vector<double>(classes_.size(), 0.0));
-        if (n_outputs_ == 1) {
-            for (std::size_t i = 0; i < X.n_rows(); ++i) {
-                double p1 = positive_proba(F[0][i]);
-                out[i][0] = 1.0 - p1;
-                out[i][1] = p1;
-            }
-        } else {
-            for (std::size_t i = 0; i < X.n_rows(); ++i) {
-                double max_f = F[0][i];
-                for (std::size_t k = 1; k < n_outputs_; ++k) max_f = std::max(max_f, F[k][i]);
-                double sum = 0.0;
-                std::vector<double> exp_vals(n_outputs_);
-                for (std::size_t k = 0; k < n_outputs_; ++k) {
-                    exp_vals[k] = std::exp(F[k][i] - max_f);
-                    sum += exp_vals[k];
-                }
-                for (std::size_t k = 0; k < n_outputs_; ++k) out[i][k] = exp_vals[k] / sum;
-            }
-        }
+        const std::size_t k = classes_.size();
+        std::vector<double> flat(X.n_rows() * k);
+        predict_proba_into(X, flat.data());
+        std::vector<std::vector<double>> out(X.n_rows());
+        for (std::size_t i = 0; i < out.size(); ++i) out[i].assign(flat.begin() + i * k, flat.begin() + (i + 1) * k);
         return out;
+    }
+
+    // predict_proba into a row-major n_samples x n_classes buffer.
+    void predict_proba_into(const MatrixView& X, double* out) const {
+        scores_to_proba(accumulate_scores(X), X.n_rows(), out);
     }
 
     const std::vector<double>& classes() const { return classes_; }
@@ -454,7 +484,10 @@ private:
     // to; the hessian follows from it: p*(1-p) with p = y - g for log_loss,
     // |g| = exp(-y~*F) for exponential. Multiclass scales the numerator by
     // (K-1)/K. A leaf whose hessian sum is ~0 (all p in {0,1}) gets 0.
-    void update_leaf_values(RDTModel& tree, const MatrixView& fit_X, const std::vector<std::uint32_t>& fit_rows,
+    // Rows are routed through the full X and the tree's column subset, which
+    // evaluates exactly the X(row, col) values the fit partitioned on.
+    void update_leaf_values(RDTModel& tree, const MatrixView& X, const std::vector<std::uint32_t>& col_subset,
+                            const std::vector<std::uint32_t>& fit_rows,
                             const std::vector<double>& fit_residual, const std::vector<double>* fit_weight,
                             const std::vector<double>& enc, std::size_t n_outputs) const {
         std::unordered_map<Node*, std::pair<double, double>> sums; // leaf -> (sum w*g, sum w*h)
@@ -468,7 +501,7 @@ private:
                 h = p * (1.0 - p);
             }
             const double w = fit_weight ? (*fit_weight)[r] : 1.0;
-            auto& acc = sums[tree.leaf_for(fit_X, r)];
+            auto& acc = sums[tree.leaf_for(X, fit_rows[r], col_subset.data())];
             acc.first += w * g;
             acc.second += w * h;
         }
@@ -514,12 +547,41 @@ private:
         return 0.0;
     }
 
+    double shrink_leaf_value(double v) const {
+        if (params_.reg_lambda == 0.0 && params_.reg_alpha == 0.0) return v;
+        double shrunk = v / (1.0 + params_.reg_lambda);
+        double sign = shrunk > 0 ? 1.0 : (shrunk < 0 ? -1.0 : 0.0);
+        return sign * std::max(std::abs(shrunk) - params_.reg_alpha, 0.0);
+    }
+
     void shrink_leaf_values(std::vector<double>& values) const {
         if (params_.reg_lambda == 0.0 && params_.reg_alpha == 0.0) return;
-        for (double& v : values) {
-            double shrunk = v / (1.0 + params_.reg_lambda);
-            double sign = shrunk > 0 ? 1.0 : (shrunk < 0 ? -1.0 : 0.0);
-            v = sign * std::max(std::abs(shrunk) - params_.reg_alpha, 0.0);
+        for (double& v : values) v = shrink_leaf_value(v);
+    }
+
+    // Raw scores F (n_outputs x n) -> row-major n x n_classes probabilities.
+    void scores_to_proba(const std::vector<std::vector<double>>& F, std::size_t n, double* out) const {
+        const std::size_t n_cls = classes_.size();
+        if (n_outputs_ == 1) {
+            for (std::size_t i = 0; i < n; ++i) {
+                double p1 = positive_proba(F[0][i]);
+                // v0.2.0 also wrote out[i][1] for single-class y, past the end of the row
+                // (fit now refuses fewer than 2 classes; the guards stay as cheap insurance).
+                if (n_cls > 0) out[i * n_cls + 0] = 1.0 - p1;
+                if (n_cls > 1) out[i * n_cls + 1] = p1;
+            }
+        } else {
+            std::vector<double> exp_vals(n_outputs_);
+            for (std::size_t i = 0; i < n; ++i) {
+                double max_f = F[0][i];
+                for (std::size_t k = 1; k < n_outputs_; ++k) max_f = std::max(max_f, F[k][i]);
+                double sum = 0.0;
+                for (std::size_t k = 0; k < n_outputs_; ++k) {
+                    exp_vals[k] = std::exp(F[k][i] - max_f);
+                    sum += exp_vals[k];
+                }
+                for (std::size_t k = 0; k < n_outputs_; ++k) out[i * n_cls + k] = exp_vals[k] / sum;
+            }
         }
     }
 
@@ -586,17 +648,25 @@ private:
         return total_weight > 0.0 ? weighted_total / total_weight : 0.0;
     }
 
+    // Raw scores of every fitted tree, predicting through each tree's column
+    // subset (no copy of X). Rows are processed in blocks across all trees;
+    // each F[k][i] still accumulates trees in round order.
     std::vector<std::vector<double>> accumulate_scores(const MatrixView& X) const {
-        std::vector<std::vector<double>> F(n_outputs_, std::vector<double>(X.n_rows()));
+        const std::size_t n = X.n_rows();
+        std::vector<std::vector<double>> F(n_outputs_, std::vector<double>(n));
         for (std::size_t k = 0; k < n_outputs_; ++k) {
             std::fill(F[k].begin(), F[k].end(), init_scores_[k]);
         }
-        for (std::size_t t = 0; t < trees_.size(); ++t) {
-            std::size_t k = t % n_outputs_;
-            SubMatrix sub = extract_submatrix(X, nullptr, feature_subsets_[t]);
-            auto raw = trees_[t].predict(sub.view);
-            shrink_leaf_values(raw);
-            for (std::size_t i = 0; i < raw.size(); ++i) F[k][i] += params_.learning_rate * raw[i];
+        for (std::size_t b = 0; b < n; b += kPredictRowBlock) {
+            const std::size_t e = std::min(n, b + kPredictRowBlock);
+            for (std::size_t t = 0; t < trees_.size(); ++t) {
+                std::size_t k = t % n_outputs_;
+                const std::uint32_t* cols = feature_subsets_[t].data();
+                for (std::size_t i = b; i < e; ++i) {
+                    double raw = shrink_leaf_value(trees_[t].find_leaf(X, i, cols)->value);
+                    F[k][i] += params_.learning_rate * raw;
+                }
+            }
         }
         return F;
     }

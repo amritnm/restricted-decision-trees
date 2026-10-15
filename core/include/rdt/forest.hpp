@@ -55,30 +55,10 @@ inline std::uint32_t resolve_max_features(const MaxFeaturesSpec& spec, std::uint
     return std::max<std::uint32_t>(1, std::min(k, n_features));
 }
 
-// Materializes an owning contiguous buffer for X[row_indices, col_indices]
-// (row_indices == nullptr means "all rows"). Used at both fit time (bagging)
-// and predict time (each tree needs the same column subset it was trained
-// on) so there's exactly one place this logic lives.
-struct SubMatrix {
-    std::vector<double> buffer;
-    MatrixView view;
-};
-
-inline SubMatrix extract_submatrix(const MatrixView& X, const std::vector<std::uint32_t>* row_indices,
-                                    const std::vector<std::uint32_t>& col_indices) {
-    std::size_t n_rows = row_indices ? row_indices->size() : X.n_rows();
-    std::size_t n_cols = col_indices.size();
-    SubMatrix out;
-    out.buffer.resize(n_rows * n_cols);
-    for (std::size_t r = 0; r < n_rows; ++r) {
-        std::uint32_t orig_row = row_indices ? (*row_indices)[r] : static_cast<std::uint32_t>(r);
-        for (std::size_t c = 0; c < n_cols; ++c) {
-            out.buffer[r * n_cols + c] = X(orig_row, col_indices[c]);
-        }
-    }
-    out.view = MatrixView(out.buffer.data(), n_rows, n_cols, /*row_major=*/true);
-    return out;
-}
+// Rows per block when an ensemble predicts: every tree is applied to a block
+// of rows before moving to the next block, so a block's rows of X stay in
+// cache across trees. Per-row accumulation order over trees is unchanged.
+constexpr std::size_t kPredictRowBlock = 256;
 
 // A bootstrap sample containing only zero-weight rows is redrawn at most
 // this many times in total before RandomForestModel::fit gives up.
@@ -128,14 +108,19 @@ public:
                 : static_cast<std::uint32_t>(std::max(1.0, params_.max_samples * static_cast<double>(n_samples_)));
 
         const std::size_t n_est = static_cast<std::size_t>(params_.n_estimators);
+        TreeParams tree_params = params_.tree_params;
+        // Without bootstrap a tree's rows are the training rows themselves, so
+        // its node indices stay meaningful (rdt.visualize); with bootstrap they
+        // would be positions in the sample. See TreeParams::retain_indices.
+        tree_params.retain_indices = !params_.bootstrap;
         trees_.clear();
         trees_.reserve(n_est);
-        for (std::size_t i = 0; i < n_est; ++i) trees_.emplace_back(params_.tree_params);
+        for (std::size_t i = 0; i < n_est; ++i) trees_.emplace_back(tree_params);
         feature_subsets_.assign(n_est, {});
         std::vector<std::vector<std::uint32_t>> oob_row_indices(n_est);
         // Trees whose bootstrap never drew a positively weighted row; reported
-        // after the pool has finished (an exception thrown inside a pool task
-        // would leave the other tasks running against this frame).
+        // after the pool has finished, for the lowest such tree, so the error
+        // does not depend on thread scheduling.
         std::vector<char> no_weighted_rows(n_est, 0);
 
         ThreadPool pool(resolve_n_jobs(params_.n_jobs));
@@ -181,7 +166,8 @@ public:
             }
             feature_subsets_[t] = col_indices;
 
-            SubMatrix sub = extract_submatrix(X, &row_indices, col_indices);
+            // The tree's rows/columns as a view of X: nothing is copied.
+            IndexedMatrixView sub(X, row_indices.data(), row_indices.size(), col_indices.data(), col_indices.size());
             std::vector<double> sub_y(row_indices.size());
             std::vector<double> sub_w;
             if (sample_weight) sub_w.resize(row_indices.size());
@@ -198,9 +184,9 @@ public:
                 params_.tree_params.task == Task::Classification ? &classes_ : nullptr;
             if (sample_weight) {
                 VectorView sub_W(sub_w.data(), sub_w.size());
-                trees_[t].fit(sub.view, sub_Y, &sub_W, tree_classes);
+                trees_[t].fit(sub, sub_Y, &sub_W, nullptr, tree_classes);
             } else {
-                trees_[t].fit(sub.view, sub_Y, nullptr, tree_classes);
+                trees_[t].fit(sub, sub_Y, nullptr, nullptr, tree_classes);
             }
         });
 
@@ -218,34 +204,53 @@ public:
     }
 
     std::vector<double> predict(const MatrixView& X) const {
+        const std::size_t n = X.n_rows();
         if (params_.tree_params.task == Task::Classification) {
-            auto proba = predict_proba(X);
-            std::vector<double> out(proba.size());
-            for (std::size_t i = 0; i < proba.size(); ++i) out[i] = classes_[argmax(proba[i])];
+            const std::size_t k = classes_.size();
+            std::vector<double> proba(n * k);
+            predict_proba_into(X, proba.data());
+            std::vector<double> out(n);
+            for (std::size_t i = 0; i < n; ++i) out[i] = classes_[argmax(proba.data() + i * k, k)];
             return out;
         }
-        std::vector<double> sums(X.n_rows(), 0.0);
-        for (std::size_t t = 0; t < trees_.size(); ++t) {
-            SubMatrix sub = extract_submatrix(X, nullptr, feature_subsets_[t]);
-            auto preds = trees_[t].predict(sub.view);
-            for (std::size_t i = 0; i < preds.size(); ++i) sums[i] += preds[i];
+        std::vector<double> sums(n, 0.0);
+        for (std::size_t b = 0; b < n; b += kPredictRowBlock) {
+            const std::size_t e = std::min(n, b + kPredictRowBlock);
+            for (std::size_t t = 0; t < trees_.size(); ++t) {
+                const std::uint32_t* cols = feature_subsets_[t].data();
+                for (std::size_t i = b; i < e; ++i) sums[i] += trees_[t].find_leaf(X, i, cols)->value;
+            }
         }
         for (double& s : sums) s /= static_cast<double>(trees_.size());
         return sums;
     }
 
     std::vector<std::vector<double>> predict_proba(const MatrixView& X) const {
-        std::vector<std::vector<double>> out(X.n_rows(), std::vector<double>(classes_.size(), 0.0));
-        for (std::size_t t = 0; t < trees_.size(); ++t) {
-            SubMatrix sub = extract_submatrix(X, nullptr, feature_subsets_[t]);
-            auto proba = trees_[t].predict_proba(sub.view);
-            for (std::size_t i = 0; i < proba.size(); ++i) {
-                for (std::size_t c = 0; c < classes_.size(); ++c) out[i][c] += proba[i][c];
+        const std::size_t k = classes_.size();
+        std::vector<double> flat(X.n_rows() * k);
+        predict_proba_into(X, flat.data());
+        std::vector<std::vector<double>> out(X.n_rows());
+        for (std::size_t i = 0; i < out.size(); ++i) out[i].assign(flat.begin() + i * k, flat.begin() + (i + 1) * k);
+        return out;
+    }
+
+    // predict_proba into a row-major n_samples x n_classes buffer.
+    void predict_proba_into(const MatrixView& X, double* out) const {
+        const std::size_t n = X.n_rows();
+        const std::size_t k = classes_.size();
+        std::fill(out, out + n * k, 0.0);
+        std::vector<double> tree_proba(k);
+        for (std::size_t b = 0; b < n; b += kPredictRowBlock) {
+            const std::size_t e = std::min(n, b + kPredictRowBlock);
+            for (std::size_t t = 0; t < trees_.size(); ++t) {
+                const std::uint32_t* cols = feature_subsets_[t].data();
+                for (std::size_t i = b; i < e; ++i) {
+                    add_tree_proba(trees_[t], trees_[t].find_leaf(X, i, cols), tree_proba, out + i * k);
+                }
             }
         }
         double denom = static_cast<double>(trees_.size());
-        for (auto& row : out) for (double& v : row) v /= denom;
-        return out;
+        for (std::size_t j = 0; j < n * k; ++j) out[j] /= denom;
     }
 
     const std::vector<double>& classes() const { return classes_; }
@@ -274,10 +279,24 @@ private:
         return false;
     }
 
-    static std::size_t argmax(const std::vector<double>& v) {
+    static std::size_t argmax(const double* v, std::size_t n) {
         std::size_t best = 0;
-        for (std::size_t i = 1; i < v.size(); ++i) if (v[i] > v[best]) best = i;
+        for (std::size_t i = 1; i < n; ++i) if (v[i] > v[best]) best = i;
         return best;
+    }
+
+    static std::size_t argmax(const std::vector<double>& v) { return argmax(v.data(), v.size()); }
+
+    // Adds one tree's class probabilities for a row into `acc` (forest
+    // classes() order). Every classification tree is fitted with the forest's
+    // classes_ (see fit), so its columns are the forest's columns; the min()
+    // only guards against a tree with fewer columns, which v0.2.0 produced
+    // when a bootstrap sample missed a class (and then read out of bounds).
+    void add_tree_proba(const RDTModel& tree, const Node* leaf, std::vector<double>& buf, double* acc) const {
+        const std::size_t tree_k = tree.n_classes();
+        tree.leaf_proba(leaf, buf.data());
+        const std::size_t k = std::min(classes_.size(), tree_k);
+        for (std::size_t c = 0; c < k; ++c) acc[c] += buf[c];
     }
 
     void compute_feature_importances() {
@@ -312,20 +331,20 @@ private:
             std::vector<double>(classification ? classes_.size() : 1, 0.0));
         std::vector<int> vote_counts(n_samples_, 0);
 
+        std::vector<double> tree_proba(classes_.size());
         for (std::size_t t = 0; t < trees_.size(); ++t) {
             const auto& oob = oob_row_indices[t];
             if (oob.empty()) continue;
-            SubMatrix sub = extract_submatrix(X, &oob, feature_subsets_[t]);
+            const std::uint32_t* cols = feature_subsets_[t].data();
             if (classification) {
-                auto proba = trees_[t].predict_proba(sub.view);
                 for (std::size_t i = 0; i < oob.size(); ++i) {
-                    for (std::size_t c = 0; c < classes_.size(); ++c) vote_sums[oob[i]][c] += proba[i][c];
+                    const Node* leaf = trees_[t].find_leaf(X, oob[i], cols);
+                    add_tree_proba(trees_[t], leaf, tree_proba, vote_sums[oob[i]].data());
                     vote_counts[oob[i]]++;
                 }
             } else {
-                auto preds = trees_[t].predict(sub.view);
                 for (std::size_t i = 0; i < oob.size(); ++i) {
-                    vote_sums[oob[i]][0] += preds[i];
+                    vote_sums[oob[i]][0] += trees_[t].find_leaf(X, oob[i], cols)->value;
                     vote_counts[oob[i]]++;
                 }
             }

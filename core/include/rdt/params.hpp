@@ -46,6 +46,22 @@ struct TreeParams {
     // each depth); XGBoost/LightGBM's closest equivalent is
     // gamma/min_split_loss, on a different (unnormalised gain) scale.
     double min_impurity_decrease = 0.0;
+
+    // Implementation choices that do not change which splits are chosen.
+    //
+    // presort: score every node of a depth in one pass over each feature's
+    // presorted rows (presort.hpp) instead of sorting each (node, feature)
+    // pair's samples at every depth. Both searches perform the same
+    // floating-point operations in the same order (tied feature values are
+    // visited in row order by both), so they produce identical trees. MAE
+    // always uses the per-node search.
+    bool presort = true;
+    // Keep each Node's `indices` (the training rows that reached it) after
+    // fit. rdt.visualize's export_tree_dict needs them. Gradient boosting and
+    // bootstrapped forests turn this off -- they would otherwise retain
+    // ~4 * n_samples * (max_depth + 1) bytes per fitted tree, and a bootstrap
+    // tree's indices are positions in its bootstrap sample, not training rows.
+    bool retain_indices = true;
 };
 
 } // namespace rdt

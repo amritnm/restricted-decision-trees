@@ -5,8 +5,12 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include <map>
+
+#include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
 
 #include "rdt/forest.hpp"
 #include "rdt/gradient_boosting.hpp"
@@ -41,6 +45,145 @@ void check_predict_shape(const InputMatrix& X, std::size_t n_features) {
     if (X.shape(1) != n_features) throw std::invalid_argument("X has a different number of features than during fit");
 }
 
+// fit()/predict() run with the GIL released: the views above are plain
+// pointers into the input arrays, which the bound function's arguments keep
+// alive for the duration of the call, and the core never touches a Python
+// object. Results are copied into NumPy arrays only after the GIL is
+// re-acquired.
+using OutputArray = nb::ndarray<nb::numpy, double>;
+
+OutputArray to_numpy(std::vector<double>&& values, std::size_t n_rows, std::size_t n_cols, bool two_d) {
+    auto* heap = new std::vector<double>(std::move(values));
+    nb::capsule owner(heap, [](void* p) noexcept { delete static_cast<std::vector<double>*>(p); });
+    if (!two_d) return OutputArray(heap->data(), {n_rows}, owner);
+    // v0.2.0 returned a list of per-row lists; for zero rows np.array() of
+    // that is shape (0,), so keep that shape.
+    if (n_rows == 0) return OutputArray(heap->data(), {std::size_t{0}}, owner);
+    return OutputArray(heap->data(), {n_rows, n_cols}, owner);
+}
+
+// The native models are not internally synchronized, and their fit/predict
+// run with the GIL released, so concurrent use of one native object is
+// checked here: fit() needs the object to itself; predict(), predict_proba()
+// and attribute reads may share it. A conflicting call raises RuntimeError
+// instead of racing. (The rdt Python estimators fit a fresh native object and
+// publish it only once fitted, so they never conflict.)
+class UseRegistry {
+public:
+    static UseRegistry& instance() {
+        static UseRegistry registry;
+        return registry;
+    }
+
+    void acquire(const void* obj, bool exclusive) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = users_.find(obj);
+        if (it != users_.end()) {
+            if (it->second < 0) throw std::runtime_error("this model is being fitted by another thread");
+            if (exclusive) throw std::runtime_error("fit() called while this model is in use by another thread");
+        }
+        if (exclusive) {
+            users_[obj] = -1;
+        } else {
+            ++users_[obj];
+        }
+    }
+
+    void release(const void* obj, bool exclusive) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = users_.find(obj);
+        if (exclusive || --it->second == 0) users_.erase(it);
+    }
+
+private:
+    std::mutex mutex_;
+    std::unordered_map<const void*, long> users_; // -1: being fitted; > 0: number of readers
+};
+
+class UseGuard {
+public:
+    UseGuard(const void* obj, bool exclusive) : obj_(obj), exclusive_(exclusive) {
+        UseRegistry::instance().acquire(obj_, exclusive_);
+    }
+    ~UseGuard() { UseRegistry::instance().release(obj_, exclusive_); }
+    UseGuard(const UseGuard&) = delete;
+    UseGuard& operator=(const UseGuard&) = delete;
+
+private:
+    const void* obj_;
+    bool exclusive_;
+};
+
+// Attribute read under a shared UseGuard.
+template <class Model, class F>
+auto read(const Model& self, F&& f) {
+    UseGuard guard(&self, /*exclusive=*/false);
+    return f(self);
+}
+
+template <class Model>
+void fit_released(Model& self, const InputMatrix& X, const InputVector& y,
+                  const std::optional<InputVector>& sample_weight) {
+    check_fit_shapes(X, y, sample_weight);
+    const MatrixView xv = to_matrix_view(X);
+    const VectorView yv = to_vector_view(y);
+    std::optional<VectorView> wv;
+    if (sample_weight) wv = to_vector_view(*sample_weight);
+    UseGuard guard(&self, /*exclusive=*/true);
+    nb::gil_scoped_release release;
+    self.fit(xv, yv, wv ? &*wv : nullptr);
+}
+
+template <class Model>
+OutputArray predict_released(const Model& self, const InputMatrix& X) {
+    const MatrixView xv = to_matrix_view(X);
+    std::vector<double> out;
+    {
+        UseGuard guard(&self, /*exclusive=*/false);
+        check_predict_shape(X, self.n_features());
+        nb::gil_scoped_release release;
+        out = self.predict(xv);
+    }
+    const std::size_t n = out.size();
+    return to_numpy(std::move(out), n, 1, /*two_d=*/false);
+}
+
+template <class Model>
+OutputArray predict_proba_released(const Model& self, const InputMatrix& X) {
+    const MatrixView xv = to_matrix_view(X);
+    std::vector<double> out;
+    std::size_t k = 0;
+    {
+        UseGuard guard(&self, /*exclusive=*/false);
+        check_predict_shape(X, self.n_features());
+        k = self.n_classes();
+        out.resize(xv.n_rows() * k);
+        nb::gil_scoped_release release;
+        self.predict_proba_into(xv, out.data());
+    }
+    return to_numpy(std::move(out), xv.n_rows(), k, /*two_d=*/true);
+}
+
+using U32Array = nb::ndarray<nb::numpy, std::uint32_t>;
+
+U32Array to_numpy_u32(std::vector<std::uint32_t>&& values, std::size_t n_rows, std::size_t n_cols) {
+    auto* heap = new std::vector<std::uint32_t>(std::move(values));
+    nb::capsule owner(heap, [](void* p) noexcept { delete static_cast<std::vector<std::uint32_t>*>(p); });
+    return U32Array(heap->data(), {n_rows, n_cols}, owner);
+}
+
+nb::dict int_map_to_dict(const std::map<int, int>& m) {
+    nb::dict d;
+    for (const auto& kv : m) d[nb::int_(kv.first)] = kv.second;
+    return d;
+}
+
+nb::dict double_map_to_dict(const std::map<int, double>& m) {
+    nb::dict d;
+    for (const auto& kv : m) d[nb::int_(kv.first)] = kv.second;
+    return d;
+}
+
 GBLoss loss_from_string(const std::string& loss) {
     if (loss == "log_loss") return GBLoss::LogLoss;
     if (loss == "exponential") return GBLoss::Exponential;
@@ -56,7 +199,18 @@ GBLoss loss_from_string(const std::string& loss) {
 NB_MODULE(_rdt_native, m) {
     nb::class_<Node>(m, "Node")
         .def_prop_ro("is_leaf", &Node::is_leaf)
-        .def_prop_ro("indices", [](const Node& n) { return n.indices; })
+        .def_prop_ro("indices",
+                      [](const Node& n) {
+                          if (!n.has_indices) {
+                              throw nb::attribute_error(
+                                  "Node.indices is not retained for this tree: gradient boosting trees and "
+                                  "bootstrapped random forest trees drop their per-node training indices after "
+                                  "fitting (a standalone RDT and RandomForestRDT(bootstrap=False) keep them). "
+                                  "Node.n_samples holds the count.");
+                          }
+                          return n.indices;
+                      })
+        .def_prop_ro("n_samples", [](const Node& n) { return n.n_samples; })
         .def_ro("split_feature", &Node::split_feature)
         .def_ro("split_threshold", &Node::split_threshold)
         .def_ro("value", &Node::value)
@@ -68,7 +222,8 @@ NB_MODULE(_rdt_native, m) {
 
     nb::class_<RDTModel>(m, "RDTModel")
         .def(nb::new_([](std::string task, std::string criterion, int max_depth,
-                          int min_samples_split, int min_samples_leaf, double min_impurity_decrease) {
+                          int min_samples_split, int min_samples_leaf, double min_impurity_decrease,
+                          bool presort) {
                  TreeParams p;
                  p.task = (task == "classification") ? Task::Classification : Task::Regression;
                  p.criterion = criterion_from_string(criterion);
@@ -76,53 +231,76 @@ NB_MODULE(_rdt_native, m) {
                  p.min_samples_split = min_samples_split;
                  p.min_samples_leaf = min_samples_leaf;
                  p.min_impurity_decrease = min_impurity_decrease;
+                 p.presort = presort;
                  return new RDTModel(p);
              }),
              "task"_a, "criterion"_a, "max_depth"_a, "min_samples_split"_a, "min_samples_leaf"_a,
-             "min_impurity_decrease"_a = 0.0)
+             "min_impurity_decrease"_a = 0.0, "presort"_a = true)
         .def("fit",
              [](RDTModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
-                 check_fit_shapes(X, y, sample_weight);
-                 if (sample_weight) {
-                     VectorView wv = to_vector_view(*sample_weight);
-                     self.fit(to_matrix_view(X), to_vector_view(y), &wv);
-                 } else {
-                     self.fit(to_matrix_view(X), to_vector_view(y));
-                 }
+                 fit_released(self, X, y, sample_weight);
              },
              "X"_a, "y"_a, "sample_weight"_a = nb::none())
-        .def("predict",
-             [](const RDTModel& self, InputMatrix X) {
-                 check_predict_shape(X, self.n_features());
-                 return self.predict(to_matrix_view(X));
-             },
+        .def("predict", [](const RDTModel& self, InputMatrix X) { return predict_released(self, X); }, "X"_a)
+        .def("predict_proba", [](const RDTModel& self, InputMatrix X) { return predict_proba_released(self, X); },
              "X"_a)
-        .def("predict_proba",
-             [](const RDTModel& self, InputMatrix X) {
-                 check_predict_shape(X, self.n_features());
-                 return self.predict_proba(to_matrix_view(X));
-             },
-             "X"_a)
-        .def_prop_ro("classes_", [](const RDTModel& self) { return self.classes(); })
-        .def_prop_ro("n_classes_", [](const RDTModel& self) { return self.n_classes(); })
+        .def_prop_ro("classes_", [](const RDTModel& self) { return read(self, [](auto& m) { return m.classes(); }); })
+        .def_prop_ro("n_classes_",
+                      [](const RDTModel& self) { return read(self, [](auto& m) { return m.n_classes(); }); })
         .def_prop_ro("depth_features_",
                       [](const RDTModel& self) {
-                          nb::dict d;
-                          for (const auto& kv : self.depth_features()) {
-                              d[nb::int_(kv.first)] = kv.second;
-                          }
-                          return d;
+                          return read(self, [](auto& m) { return int_map_to_dict(m.depth_features()); });
                       })
         .def_prop_ro("depth_improvements_",
                       [](const RDTModel& self) {
-                          nb::dict d;
-                          for (const auto& kv : self.depth_improvements()) {
-                              d[nb::int_(kv.first)] = kv.second;
-                          }
-                          return d;
+                          return read(self, [](auto& m) { return double_map_to_dict(m.depth_improvements()); });
                       })
-        .def_prop_ro("root", [](const RDTModel& self) -> const Node* { return self.root(); },
+        .def_prop_ro("root",
+                      [](const RDTModel& self) -> const Node* {
+                          return read(self, [](auto& m) { return m.root(); });
+                      },
                       nb::rv_policy::reference_internal);
+
+    // Test hooks for the presort encoding (tests/test_split_search.py): the
+    // presorted columns of X's `rows` (shape (n_cols, len(rows)); see
+    // presort.hpp for the entry encoding), and the per-round derivation used by
+    // gradient boosting (rows with new_id < 0 dropped, the rest renumbered).
+    using U32Input = nb::ndarray<const std::uint32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+    using U32Matrix = nb::ndarray<const std::uint32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+    using I32Input = nb::ndarray<const std::int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+    m.def("_presort", [](InputMatrix X, U32Input rows) {
+        const MatrixView xv = to_matrix_view(X);
+        std::vector<std::uint32_t> r(rows.data(), rows.data() + rows.shape(0));
+        for (auto v : r) {
+            if (v >= xv.n_rows()) throw std::out_of_range("row out of range");
+        }
+        SortedColumns sorted(IndexedMatrixView(xv), r);
+        std::vector<std::uint32_t> out(sorted.n_cols() * sorted.n_entries());
+        for (std::size_t c = 0; c < sorted.n_cols(); ++c) {
+            std::copy(sorted.column(c), sorted.column(c) + sorted.n_entries(), out.begin() + c * sorted.n_entries());
+        }
+        return to_numpy_u32(std::move(out), sorted.n_cols(), sorted.n_entries());
+    }, "X"_a, "rows"_a);
+    m.def("_presort_restrict", [](U32Matrix sorted, I32Input new_id, std::size_t n_kept) {
+        PresortedView src;
+        src.n_entries = sorted.shape(1);
+        for (std::size_t c = 0; c < sorted.shape(0); ++c) {
+            const std::uint32_t* col = sorted.data() + c * src.n_entries;
+            for (std::size_t i = 0; i < src.n_entries; ++i) {
+                if ((col[i] & kPresortRowMask) >= new_id.shape(0)) throw std::out_of_range("row out of range");
+            }
+            std::size_t kept = 0;
+            for (std::size_t i = 0; i < src.n_entries; ++i) kept += new_id.data()[col[i] & kPresortRowMask] >= 0;
+            if (kept != n_kept) throw std::invalid_argument("n_kept does not match new_id");
+            src.columns.push_back(col);
+        }
+        SortedColumns derived(src, new_id.data(), n_kept);
+        std::vector<std::uint32_t> out(derived.n_cols() * n_kept);
+        for (std::size_t c = 0; c < derived.n_cols(); ++c) {
+            std::copy(derived.column(c), derived.column(c) + n_kept, out.begin() + c * n_kept);
+        }
+        return to_numpy_u32(std::move(out), derived.n_cols(), n_kept);
+    }, "sorted"_a, "new_id"_a, "n_kept"_a);
 
     // MaxFeaturesSpec is opaque from Python; constructed only via these
     // factories, which the rdt.ensemble wrapper calls after normalizing the
@@ -139,7 +317,7 @@ NB_MODULE(_rdt_native, m) {
                           int min_samples_split, int min_samples_leaf, double min_impurity_decrease,
                           int n_estimators, MaxFeaturesSpec max_features, bool bootstrap,
                           double max_samples, bool oob_score, std::uint64_t random_state, int n_jobs,
-                          std::uint32_t max_samples_count) {
+                          std::uint32_t max_samples_count, bool presort) {
                  ForestParams p;
                  p.tree_params.task = (task == "classification") ? Task::Classification : Task::Regression;
                  p.tree_params.criterion = criterion_from_string(criterion);
@@ -155,45 +333,46 @@ NB_MODULE(_rdt_native, m) {
                  p.oob_score = oob_score;
                  p.random_state = random_state;
                  p.n_jobs = n_jobs;
+                 p.tree_params.presort = presort;
                  return new RandomForestModel(p);
              }),
              "task"_a, "criterion"_a, "max_depth"_a, "min_samples_split"_a, "min_samples_leaf"_a,
              "min_impurity_decrease"_a, "n_estimators"_a, "max_features"_a, "bootstrap"_a,
-             "max_samples"_a, "oob_score"_a, "random_state"_a, "n_jobs"_a, "max_samples_count"_a = 0)
+             "max_samples"_a, "oob_score"_a, "random_state"_a, "n_jobs"_a, "max_samples_count"_a = 0,
+             "presort"_a = true)
         .def("fit",
              [](RandomForestModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
-                 check_fit_shapes(X, y, sample_weight);
-                 if (sample_weight) {
-                     VectorView wv = to_vector_view(*sample_weight);
-                     self.fit(to_matrix_view(X), to_vector_view(y), &wv);
-                 } else {
-                     self.fit(to_matrix_view(X), to_vector_view(y));
-                 }
+                 fit_released(self, X, y, sample_weight);
              },
              "X"_a, "y"_a, "sample_weight"_a = nb::none())
-        .def("predict",
-             [](const RandomForestModel& self, InputMatrix X) {
-                 check_predict_shape(X, self.n_features());
-                 return self.predict(to_matrix_view(X));
-             }, "X"_a)
+        .def("predict", [](const RandomForestModel& self, InputMatrix X) { return predict_released(self, X); },
+             "X"_a)
         .def("predict_proba",
-             [](const RandomForestModel& self, InputMatrix X) {
-                 check_predict_shape(X, self.n_features());
-                 return self.predict_proba(to_matrix_view(X));
-             }, "X"_a)
-        .def_prop_ro("classes_", [](const RandomForestModel& self) { return self.classes(); })
-        .def_prop_ro("n_classes_", [](const RandomForestModel& self) { return self.n_classes(); })
-        .def_prop_ro("feature_importances_", [](const RandomForestModel& self) { return self.feature_importances(); })
-        .def_prop_ro("oob_score_", [](const RandomForestModel& self) { return self.oob_score(); })
+             [](const RandomForestModel& self, InputMatrix X) { return predict_proba_released(self, X); }, "X"_a)
+        .def_prop_ro("classes_",
+                      [](const RandomForestModel& self) { return read(self, [](auto& m) { return m.classes(); }); })
+        .def_prop_ro("n_classes_",
+                      [](const RandomForestModel& self) { return read(self, [](auto& m) { return m.n_classes(); }); })
+        .def_prop_ro("feature_importances_",
+                      [](const RandomForestModel& self) {
+                          return read(self, [](auto& m) { return m.feature_importances(); });
+                      })
+        .def_prop_ro("oob_score_",
+                      [](const RandomForestModel& self) { return read(self, [](auto& m) { return m.oob_score(); }); })
         .def_prop_ro("has_oob_score_", [](const RandomForestModel& self) { return self.has_oob_score(); })
-        .def_prop_ro("feature_subsets_", [](const RandomForestModel& self) { return self.feature_subsets(); })
+        .def_prop_ro("feature_subsets_",
+                      [](const RandomForestModel& self) {
+                          return read(self, [](auto& m) { return m.feature_subsets(); });
+                      })
         .def_prop_ro(
             "estimators_",
             [](const RandomForestModel& self) {
-                std::vector<const RDTModel*> out;
-                out.reserve(self.estimators().size());
-                for (const auto& t : self.estimators()) out.push_back(&t);
-                return out;
+                return read(self, [](auto& m) {
+                    std::vector<const RDTModel*> out;
+                    out.reserve(m.estimators().size());
+                    for (const auto& t : m.estimators()) out.push_back(&t);
+                    return out;
+                });
             },
             nb::rv_policy::reference_internal);
 
@@ -203,7 +382,7 @@ NB_MODULE(_rdt_native, m) {
                           int n_estimators, double learning_rate, double subsample,
                           MaxFeaturesSpec max_features, double validation_fraction, int n_iter_no_change,
                           double tol, double reg_alpha, double reg_lambda, double huber_delta,
-                          double quantile_alpha, std::uint64_t random_state, int n_jobs) {
+                          double quantile_alpha, std::uint64_t random_state, int n_jobs, bool presort) {
                  GBParams p;
                  p.tree_params.task = (task == "classification") ? Task::Classification : Task::Regression;
                  p.tree_params.max_depth = max_depth;
@@ -224,36 +403,42 @@ NB_MODULE(_rdt_native, m) {
                  p.quantile_alpha = quantile_alpha;
                  p.random_state = random_state;
                  p.n_jobs = n_jobs;
+                 p.tree_params.presort = presort;
                  return new GradientBoostingModel(p);
              }),
              "task"_a, "loss"_a, "max_depth"_a, "min_samples_split"_a, "min_samples_leaf"_a,
              "min_impurity_decrease"_a, "n_estimators"_a, "learning_rate"_a, "subsample"_a,
              "max_features"_a, "validation_fraction"_a, "n_iter_no_change"_a, "tol"_a,
-             "reg_alpha"_a, "reg_lambda"_a, "huber_delta"_a, "quantile_alpha"_a, "random_state"_a, "n_jobs"_a)
+             "reg_alpha"_a, "reg_lambda"_a, "huber_delta"_a, "quantile_alpha"_a, "random_state"_a, "n_jobs"_a,
+             "presort"_a = true)
         .def("fit",
              [](GradientBoostingModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
-                 check_fit_shapes(X, y, sample_weight);
-                 if (sample_weight) {
-                     VectorView wv = to_vector_view(*sample_weight);
-                     self.fit(to_matrix_view(X), to_vector_view(y), &wv);
-                 } else {
-                     self.fit(to_matrix_view(X), to_vector_view(y));
-                 }
+                 fit_released(self, X, y, sample_weight);
              },
              "X"_a, "y"_a, "sample_weight"_a = nb::none())
         .def("predict",
-             [](const GradientBoostingModel& self, InputMatrix X) {
-                 check_predict_shape(X, self.n_features());
-                 return self.predict(to_matrix_view(X));
-             }, "X"_a)
+             [](const GradientBoostingModel& self, InputMatrix X) { return predict_released(self, X); }, "X"_a)
         .def("predict_proba",
-             [](const GradientBoostingModel& self, InputMatrix X) {
-                 check_predict_shape(X, self.n_features());
-                 return self.predict_proba(to_matrix_view(X));
-             }, "X"_a)
-        .def_prop_ro("classes_", [](const GradientBoostingModel& self) { return self.classes(); })
-        .def_prop_ro("n_classes_", [](const GradientBoostingModel& self) { return self.n_classes(); })
-        .def_prop_ro("feature_importances_", [](const GradientBoostingModel& self) { return self.feature_importances(); })
-        .def_prop_ro("train_score_", [](const GradientBoostingModel& self) { return self.train_score(); })
-        .def_prop_ro("n_estimators_fitted_", [](const GradientBoostingModel& self) { return self.n_estimators_fitted(); });
+             [](const GradientBoostingModel& self, InputMatrix X) { return predict_proba_released(self, X); },
+             "X"_a)
+        .def_prop_ro("classes_",
+                      [](const GradientBoostingModel& self) {
+                          return read(self, [](auto& m) { return m.classes(); });
+                      })
+        .def_prop_ro("n_classes_",
+                      [](const GradientBoostingModel& self) {
+                          return read(self, [](auto& m) { return m.n_classes(); });
+                      })
+        .def_prop_ro("feature_importances_",
+                      [](const GradientBoostingModel& self) {
+                          return read(self, [](auto& m) { return m.feature_importances(); });
+                      })
+        .def_prop_ro("train_score_",
+                      [](const GradientBoostingModel& self) {
+                          return read(self, [](auto& m) { return m.train_score(); });
+                      })
+        .def_prop_ro("n_estimators_fitted_",
+                      [](const GradientBoostingModel& self) {
+                          return read(self, [](auto& m) { return m.n_estimators_fitted(); });
+                      });
 }

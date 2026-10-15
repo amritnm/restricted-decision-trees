@@ -114,8 +114,10 @@ means a parameter can't work exactly like it does elsewhere:
   chosen once, before that tree is fit.
 - **`reg_alpha`/`reg_lambda`** (`GradientBoostingRDT` only) are a real
   effect (post-hoc leaf-value soft-thresholding/shrinkage) but not XGBoost's
-  exact Newton/hessian-derived formula — this engine boosts first-order
-  (Friedman-style), not second-order.
+  exact regularised leaf formula — this engine is Friedman's gradient
+  boosting as in scikit-learn (trees grown on the gradient with a
+  squared-error criterion, then a per-leaf Newton step for `log_loss` and
+  `exponential`), not XGBoost's hessian-weighted tree growth.
 
 See `examples/ensemble_usage.py` for a fuller, runnable example.
 
@@ -176,7 +178,15 @@ fraction of `n_samples`, `None` means `n_samples`. After fitting:
 
 ### `rdt.ensemble.GradientBoostingRDT`
 
-First-order boosting: `n_estimators`, `task`, `loss` (classification:
+Friedman gradient boosting, matching scikit-learn's
+`GradientBoostingClassifier`/`Regressor`: each round grows an RDT on the
+negative gradient, then sets each leaf to the loss's one-step Newton estimate
+(`log_loss`, `exponential`; the leaf mean is already exact for
+`squared_error`; `absolute_error`/`huber`/`quantile` keep the leaf mean of the
+gradient, a documented simplification). The initial score is the weighted
+prior log-odds / log class priors / weighted mean, median or quantile, and
+`sample_weight` (or `scale_pos_weight`) also weights `train_score_` and the
+early-stopping validation loss. Parameters: `n_estimators`, `task`, `loss` (classification:
 `'log_loss'`, `'exponential'`; regression: `'squared_error'`,
 `'absolute_error'`, `'huber'`, `'quantile'`), `learning_rate`, `max_depth`,
 `min_samples_split`, `min_samples_leaf` (alias `min_child_weight`),

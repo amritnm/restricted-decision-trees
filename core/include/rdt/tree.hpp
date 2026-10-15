@@ -5,6 +5,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -40,13 +41,32 @@ public:
     RDTModel(RDTModel&&) = default;
     RDTModel& operator=(RDTModel&&) = default;
 
-    void fit(const MatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr) {
+    // `classes` (classification only; nullptr = the distinct labels of y)
+    // fixes the class list that classes(), leaf class_counts and
+    // predict_proba() columns are aligned to. An ensemble passes its full
+    // class list so a tree whose bootstrap sample lacks some class still
+    // produces probability rows in the ensemble's column order. It must be
+    // sorted, unique, and contain every label in y (std::invalid_argument
+    // otherwise).
+    void fit(const MatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr,
+             const std::vector<double>* classes = nullptr) {
         n_features_ = X.n_cols();
         depth_features_.clear();
         depth_improvements_.clear();
         classes_.clear();
 
-        if (params_.task == Task::Classification) {
+        if (params_.task == Task::Classification && classes) {
+            classes_ = *classes;
+            if (!std::is_sorted(classes_.begin(), classes_.end()) ||
+                std::adjacent_find(classes_.begin(), classes_.end()) != classes_.end()) {
+                throw std::invalid_argument("RDTModel::fit: classes must be sorted and unique");
+            }
+            for (std::size_t i = 0; i < y.size(); ++i) {
+                if (!std::binary_search(classes_.begin(), classes_.end(), y[i])) {
+                    throw std::invalid_argument("RDTModel::fit: y contains a label that is not in classes");
+                }
+            }
+        } else if (params_.task == Task::Classification) {
             std::vector<double> labels(y.size());
             for (std::size_t i = 0; i < y.size(); ++i) labels[i] = y[i];
             std::sort(labels.begin(), labels.end());

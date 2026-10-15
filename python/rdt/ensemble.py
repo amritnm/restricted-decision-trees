@@ -76,6 +76,28 @@ def _resolve_n_jobs(n_jobs) -> int:
     return 1 if n_jobs is None else int(n_jobs)
 
 
+def _resolve_max_samples(max_samples):
+    """scikit-learn semantics -> (fraction, absolute count) for the native core.
+
+    None draws n_samples rows, an int draws exactly that many rows, a float
+    draws ``floor(max_samples * n_samples)`` rows (at least 1). A count of 0
+    tells the core to use the fraction.
+    """
+    if max_samples is None:
+        return 1.0, 0
+    if isinstance(max_samples, (bool, np.bool_)):
+        raise ValueError(f"Invalid max_samples: {max_samples!r}")
+    if isinstance(max_samples, (int, np.integer)):
+        if not 1 <= max_samples <= np.iinfo(np.uint32).max:
+            raise ValueError(f"max_samples as an int must be >= 1, got {max_samples!r}")
+        return 1.0, int(max_samples)
+    if isinstance(max_samples, (float, np.floating)):
+        if not (np.isfinite(max_samples) and max_samples > 0.0):
+            raise ValueError(f"max_samples as a float must be finite and > 0, got {max_samples!r}")
+        return float(max_samples), 0
+    raise ValueError(f"Invalid max_samples: {max_samples!r}")
+
+
 def _class_weight_to_sample_weight(y: np.ndarray, classes: np.ndarray, class_weight,
                                     base_sample_weight: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
     if class_weight is None:
@@ -117,9 +139,14 @@ class RandomForestRDT:
     colsample_bytree : {'sqrt', 'log2', None} or int or float, optional
         XGBoost/LightGBM-style alias of ``max_features``.
     bootstrap : bool, default=True
-    max_samples : float, default=1.0
-        Fraction of samples to draw (with replacement) per tree when
-        ``bootstrap=True``.
+    max_samples : int, float or None, default=1.0
+        Number of samples to draw (with replacement) per tree when
+        ``bootstrap=True``, as in scikit-learn: an int draws exactly
+        ``max_samples`` rows, a float draws
+        ``max(1, floor(max_samples * n_samples))`` rows, None draws
+        ``n_samples`` rows. (Up to 0.2.0 an int was treated as a fraction,
+        so e.g. ``max_samples=50`` drew ``50 * n_samples`` rows per tree and
+        ``max_samples=1`` drew all rows; it now draws one.)
     oob_score : bool, default=False
     class_weight : 'balanced' or dict, optional
         Converted to per-sample weights internally.
@@ -153,7 +180,7 @@ class RandomForestRDT:
         max_features: Union[str, int, float, None] = "sqrt",
         colsample_bytree: Union[str, int, float, None] = None,
         bootstrap: bool = True,
-        max_samples: float = 1.0,
+        max_samples: Union[int, float, None] = 1.0,
         oob_score: bool = False,
         class_weight: Optional[Union[str, Dict]] = None,
         random_state: Optional[int] = None,
@@ -208,11 +235,13 @@ class RandomForestRDT:
         if sample_weight is not None:
             sample_weight = check_sample_weight(sample_weight, len(y), "sample_weight combined with class_weight")
 
+        max_samples_fraction, max_samples_count = _resolve_max_samples(self.max_samples)
         self._model = _rdt_native.RandomForestModel(
             self.task, self.criterion, self.max_depth, self.min_samples_split, self.min_samples_leaf,
             self.min_impurity_decrease, self.n_estimators, _resolve_max_features(self.max_features),
-            self.bootstrap, self.max_samples, self.oob_score,
+            self.bootstrap, max_samples_fraction, self.oob_score,
             _resolve_random_state(self.random_state), _resolve_n_jobs(self.n_jobs),
+            max_samples_count,
         )
         self._model.fit(X, y, sample_weight)
 

@@ -319,7 +319,11 @@ centred at the parent's mean and re-centred to the node's before the sweep
 rounded differently from directly built ones (class weights excepted when
 every weight is 1: counts subtract exactly), so a split score can change in
 its last bits and an exact tie between two splits may be decided the other
-way; `hist_subtraction=False` builds every histogram directly. A split between a node's adjacent non-empty
+way; `hist_subtraction=False` builds every histogram directly. A depth where
+no candidate's parent histograms were kept (`max_hist_cache_mb=0`, or no
+overlap with the previous depth's `colsample_bylevel` draw) is built directly
+with the direct build's arithmetic (MSE centred at each node's own mean), bit
+for bit. A split between a node's adjacent non-empty
 bins `lo < hi` gets the threshold `split_threshold(max training value of bin
 lo, min training value of bin hi)` — the exact search's threshold whenever
 every bin holds one value — moved to the nearest bin boundary when a row
@@ -335,7 +339,8 @@ binning costs one sort per feature over the training rows. Memory for the
 subtraction cache: `nodes * sum over kept features of bins * (8 * stats + 4)`
 bytes per depth (`stats` = 2 for Newton, 3 for MSE, the number of classes for
 Gini / entropy), the current and the previous depth's together at most
-`max_hist_cache_mb`.
+`max_hist_cache_mb` per tree being fitted (Random Forest: up to `n_jobs`
+trees at once; a multiclass boosting round: up to `min(n_jobs, n_classes)`).
 
 ## Complexity
 
@@ -373,7 +378,8 @@ Memory during `fit` (in addition to `X`, `y` and the fitted trees):
   Newton, 24 for MSE, 12 for Gini / entropy), no per-node row indices (unless
   kept for `rdt.visualize`), and the subtraction caches: at most
   `max_hist_cache_mb` per tree being fitted, reused from round to round by
-  gradient boosting.
+  gradient boosting (one cache per tree fitted at the same time, not one per
+  class).
 
 No copy of `X` is made by the ensembles at fit or predict time — each tree
 reads its bootstrap rows / column subset through an index mapping (v0.2.0

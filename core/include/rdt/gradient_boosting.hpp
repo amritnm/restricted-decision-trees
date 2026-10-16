@@ -6,6 +6,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -400,8 +401,25 @@ private:
         // the gradient dL/dF rather than its negative).
         std::vector<std::vector<double>> hessian(newton() ? n_outputs : 0, std::vector<double>(n, 0.0));
         std::vector<double> loss_terms; // compute_loss's per-row scratch
-        // Each output's subtraction caches (hist), reused round after round.
-        std::vector<HistArena> arenas(n_outputs);
+        // The subtraction caches (hist), reused round after round: one arena
+        // per tree being fitted at the same time -- a multiclass round's
+        // trees take one from this free list and give it back, so its kept
+        // histograms take at most max_hist_cache_bytes per tree in flight
+        // (min(n_jobs, n_outputs)), not per output. Which arena a tree gets
+        // does not change the tree.
+        std::mutex arena_mutex;
+        std::vector<std::unique_ptr<HistArena>> free_arenas;
+        auto take_arena = [&]() -> std::unique_ptr<HistArena> {
+            std::lock_guard<std::mutex> lock(arena_mutex);
+            if (free_arenas.empty()) return std::make_unique<HistArena>();
+            std::unique_ptr<HistArena> a = std::move(free_arenas.back());
+            free_arenas.pop_back();
+            return a;
+        };
+        auto give_arena = [&](std::unique_ptr<HistArena> a) {
+            std::lock_guard<std::mutex> lock(arena_mutex);
+            free_arenas.push_back(std::move(a));
+        };
 
         for (std::size_t round = 0; round < n_est; ++round) {
             std::vector<RDTModel> round_trees;
@@ -504,9 +522,11 @@ private:
 
                 // Newton trees set their own leaf values (and take the
                 // sample weights only to leave zero-weight rows out).
+                std::unique_ptr<HistArena> arena = take_arena();
                 source.fit_tree(round_trees[k], fit_rows, col_subset, residual_view,
                                 sample_weight ? &w_view : nullptr, newton() ? &h_view : nullptr, tree_pool,
-                                &arenas[k]);
+                                arena.get());
+                give_arena(std::move(arena));
                 // Rows are routed through the source (X and the tree's column
                 // subset, or the bins), which evaluates exactly what the fit
                 // partitioned on.

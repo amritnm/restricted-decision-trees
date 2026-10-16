@@ -210,6 +210,37 @@ def test_zero_cache_is_the_direct_build():
     assert a.depth_improvements_ == b.depth_improvements_
 
 
+@pytest.mark.parametrize("name", ["rdt-mse", "rf-mse", "gb-friedman", "gb-friedman-regression"])
+def test_zero_cache_is_the_direct_build_for_mse(name):
+    # MSE statistics are centred at the parent's mean (and re-centred) only at a depth that subtracts: with
+    # nothing cached every depth is built directly, with the direct build's arithmetic, so the improvements and
+    # importances are bit for bit those of hist_subtraction=False -- not only the trees.
+    regression = name in ("rdt-mse", "rf-mse", "gb-friedman-regression")
+    X, y = _task(4000, 10, seed=5, kind="regression" if regression else "binary")
+    w = np.random.default_rng(2).uniform(0.2, 2.0, len(y))
+
+    def make(**kw):
+        if name == "rdt-mse":
+            return RDT(task="regression", max_depth=7, tree_method="hist", **kw)
+        if name == "rf-mse":
+            return RandomForestRDT(task="regression", n_estimators=4, max_depth=7, tree_method="hist",
+                                   random_state=0, colsample_bylevel=0.7, **kw)
+        return GradientBoostingRDT(task="regression" if regression else "classification", n_estimators=5,
+                                   max_depth=6, subsample=0.8, tree_method="hist", random_state=0, **kw)
+
+    a = make(hist_subtraction=False).fit(X, y, sample_weight=w)
+    b = make(max_hist_cache_mb=0).fit(X, y, sample_weight=w)
+    if name == "rdt-mse":
+        assert a.depth_improvements_ == b.depth_improvements_
+    elif name == "rf-mse":
+        assert [e.depth_improvements_ for e in a.estimators_] == [e.depth_improvements_ for e in b.estimators_]
+    else:
+        assert a.depth_improvements_ == b.depth_improvements_
+    if name != "rdt-mse":
+        assert np.array_equal(a.feature_importances_, b.feature_importances_)
+    assert np.array_equal(a.predict(X), b.predict(X))
+
+
 # --------------------------------------------------------------------------- larger tasks
 def _task(n, p, seed=0, kind="binary"):
     rng = np.random.default_rng(seed)
@@ -331,6 +362,43 @@ def test_cache_budget_bounds_memory():
     direct, bounded, unbounded = growth(0), growth(32), growth(4096)
     assert bounded < direct + (32 + 16) * 2**20, (direct / 2**20, bounded / 2**20)
     assert unbounded > bounded + 100 * 2**20, (bounded / 2**20, unbounded / 2**20)
+
+
+_MULTICLASS_MEMORY_SCRIPT = textwrap.dedent("""
+    import resource, sys
+    import numpy as np
+    from rdt.ensemble import GradientBoostingRDT
+
+    def peak():
+        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return r if sys.platform == "darwin" else r * 1024
+
+    rng = np.random.default_rng(0)
+    n, p = 20000, 200
+    X = rng.standard_normal((n, p)).astype(np.float32)
+    y = np.digitize(X[:, 0] + X[:, 1] + rng.standard_normal(n), [-1.2, -0.4, 0.4, 1.2]).astype(float)
+    m = GradientBoostingRDT(n_estimators=2, max_depth=10, split_criterion="newton", tree_method="hist",
+                            random_state=0, min_child_weight=0, n_jobs=1, max_hist_cache_mb=float(sys.argv[1]))
+    m.fit(X[:300], y[:300])  # warm up allocators and imports
+    before = peak()
+    m.fit(X, y)
+    print(peak() - before)
+""")
+
+
+def test_multiclass_cache_budget_is_per_tree_being_fitted():
+    pytest.importorskip("resource")
+
+    def growth(mb):
+        out = subprocess.run([sys.executable, "-c", _MULTICLASS_MEMORY_SCRIPT, str(mb)], capture_output=True,
+                             text=True, check=True).stdout.split()
+        return int(out[0])
+
+    # Five classes, one tree per class and round, fitted one at a time (n_jobs=1). Each tree's full cache is
+    # ~390 MiB, so each fills the budget; the caches must take the budget once (one tree is being fitted at a
+    # time), not once per class (~5 x 64 MiB).
+    direct, bounded = growth(0), growth(64)
+    assert bounded < direct + (64 + 32) * 2**20, (direct / 2**20, bounded / 2**20)
 
 
 # --------------------------------------------------------------------------- validation

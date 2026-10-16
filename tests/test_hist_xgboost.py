@@ -191,3 +191,92 @@ def test_cuts_match_xgboost_up_to_max_bin_distinct_values():
     d = xgb.DMatrix(X, label=rng.random(500))
     xgb.train(dict(tree_method="hist", max_bin=64, max_depth=1), d, 1)
     assert _cuts_match(X, d, 64)
+
+
+def _non_dyadic_scenario(kind, seed):
+    """('ok', worst bound ratio) | ('near', None) | ('cuts', None): float32 feature values with arbitrary
+    mantissas, float32 weights, random regularisation. Each round's root feature and row partition must
+    equal XGBoost's exactly, and the margins must agree within a float32 error bound (XGBoost evaluates
+    the link and each row's gradient / hessian in float32 and stores leaves and margins in float32)."""
+    rng = np.random.default_rng(seed)
+    n, p_feat, max_bin = int(rng.integers(60, 300)), int(rng.integers(1, 5)), int(rng.choice([16, 64, 256]))
+    cols = []
+    for _ in range(p_feat):
+        vals = np.unique(rng.standard_normal(int(rng.integers(2, max_bin + 1))).astype(np.float32)
+                         * np.float32(rng.choice([0.01, 1.0, 300.0])))
+        cols.append(vals[rng.integers(0, len(vals), n)].astype(np.float64))
+    X = np.column_stack(cols)
+    s = X[:, 0] / (X[:, 0].std() + 1e-30) + rng.normal(0, 0.7, n)
+    if kind == "binary":
+        y = (s > rng.normal(0, 0.5)).astype(float)
+        y[:2] = [0, 1]
+    elif kind == "multi":
+        y = np.digitize(s, np.quantile(s, [0.35, 0.7])).astype(float)
+        y[:3] = [0, 1, 2]
+    else:
+        y = (s * 1.7 + 0.3).astype(np.float32).astype(float)
+    w = rng.uniform(0.2, 3.0, n).astype(np.float32).astype(float) if rng.random() < 0.5 else None
+    p = dict(lam=float(rng.choice([0.0, 1.0, 7.5])), alpha=float(rng.choice([0.0, 0.8])),
+             gamma=float(rng.choice([0.0, 0.3])), mcw=float(rng.choice([0.0, 1.0, 4.0])),
+             mds=float(rng.choice([0.0, 0.5])))
+    rounds, lr = int(rng.integers(2, 6)), float(rng.choice([0.3, 1.0]))
+    m = GradientBoostingRDT(task="regression" if kind == "reg" else "classification",
+                            loss="squared_error" if kind == "reg" else "log_loss", split_criterion="newton",
+                            tree_method="hist", max_bin=max_bin, n_estimators=rounds, learning_rate=lr, max_depth=1,
+                            reg_lambda=p["lam"], reg_alpha=p["alpha"], gamma=p["gamma"], min_child_weight=p["mcw"],
+                            max_delta_step=p["mds"], random_state=0).fit(X, y, sample_weight=w)
+    stages = list(m.staged_predict(X)) if kind == "reg" else list(m.staged_decision_function(X))
+    init = np.asarray(m._model.init_scores_)
+    k_out = 3 if kind == "multi" else 1
+    params = dict(tree_method="hist", max_bin=max_bin, max_depth=1, eta=lr, reg_lambda=p["lam"], reg_alpha=p["alpha"],
+                  gamma=p["gamma"], min_child_weight=p["mcw"], max_delta_step=p["mds"], nthread=1)
+    params.update({"binary": dict(objective="binary:logistic"), "reg": dict(objective="reg:squarederror"),
+                   "multi": dict(objective="multi:softprob", num_class=3)}[kind])
+    d = xgb.DMatrix(X, label=y, weight=w, base_margin=np.tile(init, (n, 1)) if kind == "multi" else np.full(n, init[0]))
+    booster = xgb.train(params, d, rounds)
+    if not _cuts_match(X, d, max_bin):
+        return "cuts", None
+    leaves = booster.predict(d, pred_leaf=True).reshape(n, -1)
+    roots = [int(t.split("[f", 1)[1].split("<", 1)[0]) if t.startswith("0:[") else -1
+             for t in booster.get_dump()]
+    ew = np.ones(n) if w is None else w
+    eps = float(np.finfo(np.float32).eps)
+    prev = np.tile(init, (n, 1)) if kind == "multi" else np.full(n, init[0])
+    bound = np.zeros((n, k_out))
+    worst = 0.0
+    for r in range(rounds):
+        gh = _gradients(kind, prev, y, ew)
+        if any(_stump_is_near_tie(X, g, h, p) for g, h in gh):
+            return "near", None
+        ours = stages[r].reshape(n, k_out)
+        theirs = booster.predict(d, output_margin=True, iteration_range=(0, r + 1)).reshape(n, k_out)
+        assert [m.depth_features_[r * k_out + k].get(0, -1) for k in range(k_out)] == roots[r * k_out:(r + 1) * k_out]
+        for k in range(k_out):
+            inc = (ours[:, k] - prev.reshape(n, k_out)[:, k]) / lr
+            lid = leaves[:, r * k_out + k]
+            # the same partition: one increment per XGBoost leaf, different between leaves
+            tol = 1e-9 * max(1.0, float(np.abs(inc).max()))
+            means = [inc[lid == leaf].mean() for leaf in np.unique(lid)]
+            assert all(np.ptp(inc[lid == leaf]) <= tol for leaf in np.unique(lid))
+            assert len(means) == 1 or abs(means[0] - means[1]) > tol
+            g, h = gh[k]
+            for leaf in np.unique(lid):
+                rows = lid == leaf
+                wr, wl = ew[rows], abs(inc[rows][0])
+                if kind == "reg":
+                    dg, dh = 2 * eps * (np.abs(g[rows]) + wr * np.abs(y[rows])).sum(), eps * wr.sum()
+                else:
+                    dg = dh = 2 * eps * wr.sum()
+                bnd = 4 * (dg + wl * dh) / max(h[rows].sum() + p["lam"], 1e-300) + 2 * eps * max(wl, 1.0)
+                bound[rows, k] += lr * bnd + eps * np.maximum(np.abs(ours[rows, k]), 1.0)
+        worst = max(worst, float(np.max(np.abs(theirs - ours) / bound)))
+        prev = stages[r]
+    return "ok", worst
+
+
+@pytest.mark.parametrize("kind", ["binary", "multi", "reg"])
+def test_xgboost_hist_depth1_partitions_non_dyadic(kind):
+    results = [_non_dyadic_scenario(kind, 1000 + i) for i in range(25)]
+    ok = [u for s, u in results if s == "ok"]
+    assert sum(s == "cuts" for s, _ in results) == 0
+    assert len(ok) >= 20 and max(ok) <= 1.0, (len(ok), max(ok))

@@ -411,63 +411,109 @@ struct HistDepth {
 
 // Histogram subtraction (TreeParams::hist_subtraction): one depth's scored
 // nodes' histograms of some features, kept so the next depth can derive a
-// child's histogram as parent - sibling. The features are added first, then
-// allocate() makes one buffer for all of them (so freeing it returns the
-// memory); each feature's histograms are filled by the task that scores it.
+// child's histogram as parent - sibling. The features are added first; then
+// the cache is bound to memory of bytes() bytes (HistArena), and each
+// feature's histograms are filled by the task that scores it.
 class HistCache {
 public:
+    // Each feature's histograms start on their own cache line (the scoring
+    // threads write different features concurrently).
+    static constexpr std::size_t kAlign = 128;
+
     HistCache() = default;
     HistCache(std::size_t n_features, std::size_t n_nodes, std::size_t n_stats)
         : slot_(n_features, -1), n_nodes_(n_nodes), n_stats_(n_stats) {}
 
-    // Bytes the histograms of n_nodes nodes of a feature with n_bins bins take.
+    // Bytes the histograms of n_nodes nodes of a feature with n_bins bins
+    // take in a cache (padded to a whole number of kAlign blocks).
     static std::size_t bytes_for(std::size_t n_nodes, std::size_t n_bins, std::size_t n_stats) {
-        return n_nodes * n_bins * (n_stats * sizeof(double) + sizeof(std::uint32_t));
+        const std::size_t bytes = n_nodes * n_bins * (n_stats * sizeof(double) + sizeof(std::uint32_t));
+        return (bytes + kAlign - 1) / kAlign * kAlign;
     }
     void add(std::size_t feature, std::size_t n_bins) {
         slot_[feature] = static_cast<std::int32_t>(entries_.size());
-        // Each feature's histograms start on their own cache line: the
-        // scoring threads write different features concurrently.
-        const std::size_t bytes = (bytes_for(n_nodes_, n_bins, n_stats_) + kAlign - 1) / kAlign * kAlign;
-        entries_.push_back(Entry{n_bins, bytes_, nullptr, nullptr});
-        bytes_ += bytes;
+        entries_.push_back(Entry{n_bins, bytes_});
+        bytes_ += bytes_for(n_nodes_, n_bins, n_stats_);
     }
-    void allocate() {
-        if (bytes_ == 0) return;
-        buffer_.reset(static_cast<unsigned char*>(::operator new(bytes_, std::align_val_t{kAlign})));
-        for (Entry& e : entries_) {
-            e.hist = reinterpret_cast<double*>(buffer_.get() + e.offset);
-            e.count = reinterpret_cast<std::uint32_t*>(buffer_.get() + e.offset +
-                                                       n_nodes_ * e.n_bins * n_stats_ * sizeof(double));
-        }
-    }
+    // Places the histograms at `base` (kAlign-aligned, bytes() bytes); a
+    // filled cache may be moved (its bytes copied) and bound again.
+    void bind(unsigned char* base) { base_ = base; }
+    unsigned char* base() const { return base_; }
     // The feature's slot, or -1 when it is not kept.
     std::int32_t slot(std::size_t feature) const { return slot_.empty() ? -1 : slot_[feature]; }
     std::size_t bytes() const { return bytes_; }
     double* hist(std::int32_t slot, std::size_t node) const {
         const Entry& e = entries_[static_cast<std::size_t>(slot)];
-        return e.hist + node * e.n_bins * n_stats_;
+        return reinterpret_cast<double*>(base_ + e.offset) + node * e.n_bins * n_stats_;
     }
     std::uint32_t* count(std::int32_t slot, std::size_t node) const {
         const Entry& e = entries_[static_cast<std::size_t>(slot)];
-        return e.count + node * e.n_bins;
+        return reinterpret_cast<std::uint32_t*>(base_ + e.offset + n_nodes_ * e.n_bins * n_stats_ * sizeof(double)) +
+               node * e.n_bins;
     }
 
 private:
-    static constexpr std::size_t kAlign = 128; // a cache line (two on x86)
-    struct AlignedFree {
-        void operator()(unsigned char* p) const { ::operator delete(p, std::align_val_t{kAlign}); }
-    };
     struct Entry {
         std::size_t n_bins;
         std::size_t offset;
-        double* hist;
-        std::uint32_t* count;
     };
     std::vector<std::int32_t> slot_; // per feature of the tree's view
     std::vector<Entry> entries_;
-    std::unique_ptr<unsigned char, AlignedFree> buffer_;
+    unsigned char* base_ = nullptr;
     std::size_t n_nodes_ = 0, n_stats_ = 0, bytes_ = 0;
+};
+
+// Memory for the subtraction caches of a tree's depths: one buffer, the
+// previous depth's cache at one end and the next depth's placed at the other,
+// so a fit holds at most what the two caches it uses at once take (and
+// reuses the same pages from depth to depth -- and from tree to tree, when a
+// gradient boosting fit passes the same arena to every round).
+class HistArena {
+public:
+    // Binds `next` beside `prev` (already bound in this arena, or empty),
+    // growing the buffer -- and moving prev's bytes -- if they do not fit.
+    void place(HistCache& prev, HistCache& next) {
+        const std::size_t p = prev.bytes(), n = next.bytes();
+        if (n == 0) return;
+        if (capacity_ < p + n) {
+            const std::size_t a = HistCache::kAlign;
+            const std::size_t cap = (std::max(p + n, capacity_ + capacity_ / 2) + a - 1) / a * a;
+            Buffer grown(static_cast<unsigned char*>(::operator new(cap, std::align_val_t{HistCache::kAlign})));
+            if (p > 0) {
+                std::copy(prev.base(), prev.base() + p, grown.get());
+                prev.bind(grown.get());
+            }
+            buffer_ = std::move(grown);
+            capacity_ = cap;
+        }
+        unsigned char* start = buffer_.get();
+        // Ends are kAlign-aligned: capacities and cache sizes are multiples of kAlign.
+        if (p > 0 && prev.base() == start) {
+            next.bind(start + capacity_ - n);
+        } else {
+            next.bind(start);
+        }
+    }
+    // Makes the buffer at least `bytes` long, before a tree's first place()
+    // (nothing is kept then): one allocation per tree -- or per fit, when it
+    // is reused -- whose untouched pages cost nothing.
+    void reserve(std::size_t bytes) {
+        const std::size_t a = HistCache::kAlign;
+        bytes = (bytes + a - 1) / a * a;
+        if (capacity_ >= bytes) return;
+        buffer_.reset();
+        buffer_.reset(static_cast<unsigned char*>(::operator new(bytes, std::align_val_t{a})));
+        capacity_ = bytes;
+    }
+    std::size_t capacity() const { return capacity_; }
+
+private:
+    struct AlignedFree {
+        void operator()(unsigned char* q) const { ::operator delete(q, std::align_val_t{HistCache::kAlign}); }
+    };
+    using Buffer = std::unique_ptr<unsigned char, AlignedFree>;
+    Buffer buffer_;
+    std::size_t capacity_ = 0;
 };
 
 class HistScanner {

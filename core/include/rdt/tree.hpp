@@ -145,15 +145,18 @@ public:
     // classes and hessian as in fit(). Each node's threshold is the cut after
     // its split bin, so predicting with the raw X routes every row as its
     // bins did. `pool` (may be nullptr) scores a depth's features in parallel;
-    // the result does not depend on it. Not available for MAE.
+    // the result does not depend on it. Not available for MAE. `arena` (may
+    // be nullptr) holds the subtraction caches; a caller fitting many trees
+    // one after another can pass the same one to reuse its memory.
     void fit_binned(const BinnedView& X, const VectorView& y, const VectorView* sample_weight = nullptr,
                     const std::vector<double>* classes = nullptr, const VectorView* hessian = nullptr,
-                    ThreadPool* pool = nullptr) {
+                    ThreadPool* pool = nullptr, HistArena* arena = nullptr) {
         if (params_.criterion == Criterion::MAE) {
             throw std::invalid_argument("tree_method='hist' does not support criterion='mae'");
         }
         std::vector<std::uint32_t> root_indices = begin_fit(X.n_cols, X.n_rows, y, sample_weight, classes, hessian);
-        root_ = build_tree_hist(X, y, sample_weight, std::move(root_indices), pool);
+        HistArena own_arena;
+        root_ = build_tree_hist(X, y, sample_weight, std::move(root_indices), pool, arena ? *arena : own_arena);
         hessian_ = nullptr;
     }
 
@@ -747,7 +750,8 @@ private:
     // features are scored in parallel (HistScanner); none of it depends on the
     // number of threads.
     std::unique_ptr<Node> build_tree_hist(const BinnedView& X, const VectorView& y, const VectorView* sample_weight,
-                                          std::vector<std::uint32_t> root_indices, ThreadPool* pool) {
+                                          std::vector<std::uint32_t> root_indices, ThreadPool* pool,
+                                          HistArena& arena) {
         const std::size_t m = root_indices.size();
         auto root = std::make_unique<Node>();
         root->n_samples = m;
@@ -802,6 +806,28 @@ private:
             make_leaf(*ln.node, vrow[cur].data() + ln.begin, ln.end - ln.begin, y, sample_weight);
         };
 
+        if (subtraction && params_.max_depth > 1) {
+            // The most the two caches in use at once can take: depth d keeps
+            // at most min(2^d, m / min_samples_split) nodes' histograms of
+            // (at most) every column of the bins, for d < max_depth - 1. (All
+            // columns, not this tree's: the bound is then the same for every
+            // tree of an ensemble, which reuses one arena without growing it.)
+            std::size_t row_bytes = 0;
+            for (std::size_t c = 0; c < X.m->n_cols(); ++c) {
+                const std::size_t nb = X.m->n_bins(c);
+                if (nb >= 2) row_bytes += nb * (S * sizeof(double) + sizeof(std::uint32_t));
+            }
+            const std::size_t max_nodes = m / static_cast<std::size_t>(std::max(params_.min_samples_split, 2)) + 1;
+            auto nodes_at = [&](int d) { return d >= 62 ? max_nodes : std::min(std::size_t{1} << d, max_nodes); };
+            // (Each feature's histograms are padded to a kAlign block.)
+            const std::size_t pad = HistCache::kAlign * X.m->n_cols();
+            std::size_t need = 0;
+            for (int d = 0; d + 1 < params_.max_depth; ++d) {
+                need = std::max(need, (nodes_at(d) + (d > 0 ? nodes_at(d - 1) : 0)) * row_bytes + 2 * pad);
+                if (nodes_at(d) == max_nodes) break;
+            }
+            arena.reserve(std::min(need, params_.max_hist_cache_bytes));
+        }
         LevelSampler level_sampler(params_, n_features_);
         // Histogram subtraction: the next depth's candidates (drawn one depth
         // early, from the same sequence of draws) and the cached histograms of
@@ -963,7 +989,7 @@ private:
                     next_cache.add(f, nb);
                     used += b;
                 }
-                next_cache.allocate();
+                arena.place(prev_cache, next_cache);
             }
             scanner.begin_depth(std::move(sizes), std::move(totals));
             scanner.score(X, hd, candidates, sub_depth ? &prev_cache : nullptr, keep ? &next_cache : nullptr, results,

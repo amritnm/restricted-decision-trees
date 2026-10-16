@@ -163,7 +163,7 @@ private:
 
         void fit_tree(RDTModel& tree, const std::vector<std::uint32_t>& fit_rows,
                       const std::vector<std::uint32_t>& col_subset, const VectorView& residual,
-                      const VectorView* weight, const VectorView* hessian, ThreadPool*) const {
+                      const VectorView* weight, const VectorView* hessian, ThreadPool*, HistArena*) const {
             // The tree sees X[fit_rows, col_subset] as a view (no copy of X).
             const std::size_t n = X_.n_rows();
             const std::size_t m = fit_rows.size();
@@ -209,9 +209,10 @@ private:
 
         void fit_tree(RDTModel& tree, const std::vector<std::uint32_t>& fit_rows,
                       const std::vector<std::uint32_t>& col_subset, const VectorView& residual,
-                      const VectorView* weight, const VectorView* hessian, ThreadPool* pool) const {
+                      const VectorView* weight, const VectorView* hessian, ThreadPool* pool,
+                      HistArena* arena) const {
             BinnedView view(bins_, fit_rows.data(), fit_rows.size(), col_subset.data(), col_subset.size());
-            tree.fit_binned(view, residual, weight, nullptr, hessian, pool);
+            tree.fit_binned(view, residual, weight, nullptr, hessian, pool, arena);
         }
 
         Node* leaf(RDTModel& tree, std::size_t row, const std::uint32_t* cols) const {
@@ -306,6 +307,8 @@ private:
         // the gradient dL/dF rather than its negative).
         std::vector<std::vector<double>> hessian(newton() ? n_outputs : 0, std::vector<double>(n, 0.0));
         std::vector<double> loss_terms; // compute_loss's per-row scratch
+        // Each output's subtraction caches (hist), reused round after round.
+        std::vector<HistArena> arenas(n_outputs);
 
         for (std::size_t round = 0; round < n_est; ++round) {
             std::vector<RDTModel> round_trees;
@@ -409,7 +412,8 @@ private:
                 // Newton trees set their own leaf values (and take the
                 // sample weights only to leave zero-weight rows out).
                 source.fit_tree(round_trees[k], fit_rows, col_subset, residual_view,
-                                sample_weight ? &w_view : nullptr, newton() ? &h_view : nullptr, tree_pool);
+                                sample_weight ? &w_view : nullptr, newton() ? &h_view : nullptr, tree_pool,
+                                &arenas[k]);
                 // Rows are routed through the source (X and the tree's column
                 // subset, or the bins), which evaluates exactly what the fit
                 // partitioned on.

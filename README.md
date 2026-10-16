@@ -302,8 +302,8 @@ Two ways, both with the patience `n_iter_no_change` (alias `early_stopping_round
   improvement fitting stops and the model is **truncated to its best round**:
   `best_iteration_` (0-based, as XGBoost), `best_score_`,
   `n_estimators_ = best_iteration_ + 1`, and `predict`, `predict_proba`,
-  `staged_*`, `train_score_`, `feature_importances_` and `depth_features_`
-  all describe the truncated model — also when `n_estimators` runs out
+  `staged_*`, `train_score_`, `feature_importances_`, `depth_features_` and
+  `depth_improvements_` all describe the truncated model — also when `n_estimators` runs out
   first. `evals_result_` (`{metric: [score after each round]}`) covers every
   round run, the discarded patience rounds included. The eval set never
   influences training, so the result is bit-for-bit the model

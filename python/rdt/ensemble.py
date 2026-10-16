@@ -429,8 +429,9 @@ class GradientBoostingRDT:
       training: the kept model is bit-for-bit the model
       ``fit(X, y)`` with ``n_estimators=best_iteration_ + 1`` and no early
       stopping gives (predictions, staged predictions, ``train_score_``,
-      importances, ``depth_features_``). Without a patience the metric is
-      only recorded.
+      importances, ``depth_features_``, ``depth_improvements_``), with
+      ``hist_subtraction`` on or off. Without a patience the metric is only
+      recorded.
 
     Parameters
     ----------

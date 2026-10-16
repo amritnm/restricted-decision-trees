@@ -776,7 +776,9 @@ private:
         std::vector<std::uint32_t> vrow[2], mrow[2];
         vrow[0] = std::move(root_indices);
         mrow[0].resize(m);
-        for (std::size_t e = 0; e < m; ++e) mrow[0][e] = static_cast<std::uint32_t>(X.row(vrow[0][e]));
+        for_blocks(pool, m, [&](std::size_t e0, std::size_t e1) {
+            for (std::size_t e = e0; e < e1; ++e) mrow[0][e] = static_cast<std::uint32_t>(X.row(vrow[0][e]));
+        });
         vrow[1].resize(m);
         mrow[1].resize(m);
         int cur = 0;

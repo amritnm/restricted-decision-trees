@@ -36,6 +36,17 @@ public:
             std::uint32_t j = dist(engine_);
             std::swap(pool[i], pool[j]);
         }
+        // The first n entries in ascending order: for a large sample, mark
+        // them and read them back in order (linear) instead of sorting.
+        if (n >= population / 16) {
+            std::vector<char> chosen(population, 0);
+            for (std::uint32_t i = 0; i < n; ++i) chosen[pool[i]] = 1;
+            pool.clear();
+            for (std::uint32_t v = 0; v < population; ++v) {
+                if (chosen[v]) pool.push_back(v);
+            }
+            return pool;
+        }
         pool.resize(n);
         std::sort(pool.begin(), pool.end());
         return pool;

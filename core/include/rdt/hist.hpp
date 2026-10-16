@@ -132,6 +132,15 @@ void run_balanced(ThreadPool* pool, std::size_t n, W&& weight, F&& f) {
     });
 }
 
+// Runs f(begin, end) over [0, n) in fixed blocks of 16384, on the pool. For
+// per-element work, so the result does not depend on the pool.
+template <class F>
+void for_blocks(ThreadPool* pool, std::size_t n, F&& f) {
+    constexpr std::size_t kBlock = 16384;
+    const std::size_t n_blocks = (n + kBlock - 1) / kBlock;
+    run_tasks(pool, n_blocks, [&](std::size_t b) { f(b * kBlock, std::min(n, (b + 1) * kBlock)); });
+}
+
 // Prefetch the cache line at p for reading (a no-op where unsupported).
 inline void prefetch_read(const void* p) {
 #if defined(__GNUC__) || defined(__clang__)

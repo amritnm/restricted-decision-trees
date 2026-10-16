@@ -138,3 +138,27 @@ def test_validation():
         with pytest.raises(ValueError, match="colsample_bylevel"):
             RandomForestRDT(colsample_bylevel=bad)
     assert GradientBoostingRDT(colsample_bylevel=1).colsample_bylevel == 1.0
+
+
+@pytest.mark.parametrize("make", [
+    lambda: GradientBoostingRDT(n_estimators=60, max_depth=4, random_state=0),
+    lambda: RandomForestRDT(n_estimators=60, max_depth=4, max_features=None, bootstrap=False, random_state=0),
+], ids=["gb", "rf"])
+def test_level_features_are_replayed_on_access_not_kept_by_fit(make):
+    # level_features_ lists every tree's candidate columns per depth: n_trees x depths x columns
+    # Python ints (all columns at the default 1.0). fit must not build and keep them; they are
+    # replayed from the seeds on access (here 60 x 4 x 400 = 96k ints, ~3.5 MB as lists).
+    import tracemalloc
+    X, y = _data(n=200, p=400, seed=1)
+    m = make()
+    tracemalloc.start()
+    try:
+        m.fit(X, y)
+        kept, _ = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert kept < 1_000_000, f"fit kept {kept / 1e6:.1f} MB of Python objects"
+    levels = m.level_features_
+    assert len(levels) == len(m.depth_features_) == 60
+    assert all(cols == list(range(400)) for d in levels for cols in d.values())
+    assert m.level_features_ == levels  # replayed identically

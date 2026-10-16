@@ -19,6 +19,19 @@ Scenarios are skipped (and counted) when the comparison is not meaningful:
   'exact' prunes by gamma after growing (bottom-up, so such a split survives
   when a split below it reaches gamma); this implementation applies gamma to
   each node as the tree grows, as XGBoost 'hist' does.
+
+Needs XGBoost >= 3.4.0 (skipped otherwise). The newton mode follows the
+current XGBoost formulas; XGBoost 3.0-3.3 differ in two corners, so the
+comparison would fail there for reasons that are not bugs here:
+
+- max_delta_step > 0 with reg_alpha > 0: 3.0-3.3 score a child at its
+  (clipped) weight w as -(2 G w + (H + lambda) w^2), without the
+  2 * alpha * |w| term (so even an unclipped weight then scores
+  (G^2 - alpha^2) / (H + lambda) rather than T(G)^2 / (H + lambda)); 3.4 adds
+  the term, as here.
+- a node that becomes a leaf with a hessian sum below min_child_weight (only
+  the root can: every other node is a child of a valid split): 3.0-3.3 give
+  it weight 0, 3.4 (and this implementation) -T(G) / (H + lambda).
 """
 
 import itertools
@@ -27,7 +40,7 @@ import json
 import numpy as np
 import pytest
 
-xgb = pytest.importorskip("xgboost")
+xgb = pytest.importorskip("xgboost", minversion="3.4.0")
 
 from rdt.ensemble import GradientBoostingRDT  # noqa: E402
 

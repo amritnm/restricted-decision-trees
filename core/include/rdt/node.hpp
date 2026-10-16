@@ -25,7 +25,7 @@ struct Node {
     int split_feature = -1;
     double split_threshold = 0.0;
     // Hist trees: rows whose bin of split_feature is <= split_bin go left --
-    // the same rows as x <= split_threshold (the bin's upper cut). -1 otherwise.
+    // the same rows of the fitted X as x <= split_threshold. -1 otherwise.
     std::int32_t split_bin = -1;
 
     bool has_value = false;

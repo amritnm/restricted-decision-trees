@@ -389,7 +389,7 @@ ThresholdResult find_best_threshold(
 }
 
 // ---------------------------------------------------------------- Newton gain
-// XGBoost's second-order split scoring (src/tree/param.h, split_evaluator.h),
+// XGBoost's second-order split scoring (src/tree/param.h, split_evaluator.h; as of 3.4),
 // on per-row gradients g = dL/dF and hessians h (already multiplied by the
 // sample weight). G and H are a node's (or child's) sums.
 
@@ -405,8 +405,9 @@ inline double newton_threshold_l1(double G, double alpha) {
 }
 
 // Leaf weight -T(G) / (H + lambda), clipped to +-max_delta_step when that is
-// > 0; 0 when H <= 0 (XGBoost's CalcWeight). Not yet multiplied by the
-// learning rate.
+// > 0; 0 when H <= 0 (XGBoost >= 3.4's CalcWeight; 3.0-3.3 also returned 0
+// when H < min_child_weight, which only a root that cannot split can have).
+// Not yet multiplied by the learning rate.
 inline double newton_leaf_weight(double G, double H, const NewtonParams& p) {
     if (H <= 0.0) return 0.0;
     double w = -newton_threshold_l1(G, p.reg_alpha) / (H + p.reg_lambda);
@@ -416,9 +417,10 @@ inline double newton_leaf_weight(double G, double H, const NewtonParams& p) {
 
 // score(G, H) = T(G)^2 / (H + lambda) -- the loss reduction of the node's
 // optimal weight. With max_delta_step > 0 the weight may be clipped, so (as
-// XGBoost's CalcGain does) the score is evaluated at the clipped weight w:
-// -(2 G w + (H + lambda) w^2 + 2 alpha |w|), which equals T(G)^2 / (H + lambda)
-// when w is not clipped. 0 when H <= 0.
+// XGBoost >= 3.4's CalcGainGivenWeight does) the score is evaluated at the
+// clipped weight w: -(2 G w + (H + lambda) w^2 + 2 alpha |w|), which equals
+// T(G)^2 / (H + lambda) when w is not clipped. (XGBoost 3.0-3.3 left out the
+// 2 alpha |w| term.) 0 when H <= 0.
 inline double newton_score(double G, double H, const NewtonParams& p) {
     if (H <= 0.0) return 0.0;
     if (p.max_delta_step == 0.0) {

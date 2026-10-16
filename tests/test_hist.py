@@ -203,6 +203,41 @@ def test_hist_equals_exact_up_to_rational_ties(kind):
     assert equal >= 100, (equal, ties)
 
 
+@pytest.mark.parametrize("kind", ["gini", "entropy", "mse", "newton"])
+def test_hist_equals_exact_on_non_dyadic_values(kind):
+    # The grid problems above are dyadic, so every sum is exact and only rational ties can diverge.
+    # Here values, targets, weights and hessians are arbitrary doubles (few distinct feature values,
+    # spread over scales from 1e-3 to 1e4, real-valued weights, zero-weight rows holding training
+    # values): the searches round differently, yet the models must agree bit for bit.
+    rng = np.random.default_rng({"gini": 11, "entropy": 12, "mse": 13, "newton": 14}[kind])
+    for _ in range(40):
+        n, p, max_bin = int(rng.integers(100, 800)), int(rng.integers(2, 6)), int(rng.choice([16, 256]))
+        grids = [np.unique(rng.standard_normal(int(rng.integers(2, max_bin + 1))) * rng.choice([1e-3, 1.0, 1e4]))
+                 for _ in range(p)]
+        X = np.column_stack([g[rng.integers(0, len(g), n)] for g in grids])
+        w = rng.uniform(0.1, 3.0, n)
+        zero = rng.random(n) < 0.1
+        w[zero] = 0.0
+        X[zero] = X[np.flatnonzero(~zero)[rng.integers(0, (~zero).sum(), zero.sum())]]  # values seen in training
+        s = X[:, 0] / X[:, 0].std() + rng.normal(0, 1, n)
+        depth, msl = int(rng.integers(1, 6)), int(rng.choice([1, 5]))
+        if kind == "newton":
+            models = []
+            for tm in ("exact", "hist"):
+                m = _rdt_native.RDTModel("regression", "newton", depth, 2, msl, 0.0, reg_lambda=1.0, reg_alpha=0.1,
+                                         tree_method=tm, max_bin=max_bin)
+                (m.fit if tm == "exact" else m.fit_hist)(X, np.sin(s) * w, hessian=w)
+                models.append(m)
+        else:
+            y = np.digitize(s, [-0.5, 0.7]).astype(float) if kind in ("gini", "entropy") else np.sin(s) * 3.7 + 1e3
+            models = [RDT(task="regression" if kind == "mse" else "classification", criterion=kind, max_depth=depth,
+                          min_samples_leaf=msl, tree_method=tm, max_bin=max_bin).fit(X, y, sample_weight=w)
+                      for tm in ("exact", "hist")]
+        a, b = models
+        Xg = np.column_stack([g[rng.integers(0, len(g), 200)] for g in grids])
+        assert _trees_equal(a, b, X) and _trees_equal(a, b, Xg)
+
+
 def _ens_problem(kind, seed, n=300, p=5):
     rng = np.random.default_rng(seed)
     X = rng.integers(0, 40, (n, p)) / 8.0
@@ -297,7 +332,7 @@ def _bf_best(criterion, xb, y, w, msl):
 def test_hist_tree_equals_bruteforce_on_bins(seed):
     """Guided: at each depth the native feature and each node's split bin must
     be optimal for the restricted tree on the bin indices (within rounding),
-    and the threshold must be the cut after the split bin."""
+    and the threshold must route every row of X as the split bin does."""
     rng = np.random.default_rng(seed)
     n, p = int(rng.integers(40, 200)), int(rng.integers(1, 4))
     X = rng.standard_normal((n, p)) * rng.choice([1.0, 100.0])
@@ -466,6 +501,22 @@ def test_float32_and_layouts_equal_float64_c():
     _same_models(_fit_all(big_c, y[::-1].copy()), _fit_all(X32.astype(np.float64)[::-1], y[::-1].copy()), big_c)
 
 
+def test_unaligned_and_odd_stride_views():
+    # A view of a packed structured array has a row stride that is not a whole number of elements
+    # (and unaligned data); hist fits it as it fits a C copy, as exact does.
+    from numpy.lib import recfunctions as rfn
+    rng = np.random.default_rng(3)
+    n = 300
+    for dt in ("f8", "f4"):
+        st = np.zeros(n, dtype=[("tag", "u1"), ("a", dt), ("b", dt), ("c", dt)])
+        for f in "abc":
+            st[f] = rng.standard_normal(n)
+        X = rfn.structured_to_unstructured(st[["a", "b", "c"]])
+        assert np.shares_memory(X, st) and X.strides[0] % X.itemsize != 0 and not X.flags.aligned
+        y = (X[:, 0] - X[:, 2] > 0).astype(float)
+        _same_models(_fit_all(np.ascontiguousarray(X, dtype=np.float64), y), _fit_all(X, y), X)
+
+
 def test_memmap_input(tmp_path):
     rng = np.random.default_rng(1)
     X = rng.standard_normal((400, 5))
@@ -522,6 +573,42 @@ def test_hist_fit_does_not_copy_X(kind, layout):
     # A float64 copy of X alone would be x_bytes (float64) or 2 * x_bytes (float32); measured
     # growth is the bins plus ~16-20 MiB (cuts / bin extents of 1000 features, search state).
     assert growth < bins + 0.5 * x_bytes, f"fit grew peak RSS by {growth / 2**20:.0f} MiB (X is {x_bytes / 2**20:.0f} MiB)"
+
+
+_TALL_FIT_MEMORY_SCRIPT = textwrap.dedent("""
+    import resource, sys
+    import numpy as np
+    from rdt import RDT
+
+    def peak():
+        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return r if sys.platform == "darwin" else r * 1024
+
+    rng = np.random.default_rng(0)
+    n, p = 500000, 64                       # tall and narrow, float32 C order: 122 MiB
+    X = np.empty((n, p), dtype=np.float32)
+    for i in range(0, n, 20000):
+        X[i:i + 20000] = rng.standard_normal((20000, p))
+    y = (X[:, 0] + X[:, 1] > 0).astype(float)
+    m = RDT(max_depth=3, tree_method="hist", n_jobs=4)
+    m.fit(X[:50], y[:50])
+    before = peak()
+    m.fit(X, y)
+    print(peak() - before, X.nbytes)
+""")
+
+
+def test_hist_binning_buffers_stay_small_on_tall_X():
+    # Binning sorts each column's training values; on tall X the per-thread sort buffers must not
+    # gather many columns at once (a block of 16 float32 columns per thread is 2.6x X at n_jobs=4).
+    pytest.importorskip("resource")
+    out = subprocess.run([sys.executable, "-c", _TALL_FIT_MEMORY_SCRIPT], capture_output=True, text=True,
+                         check=True).stdout.split()
+    growth, x_bytes = int(out[0]), int(out[1])
+    bins = 500000 * 64
+    # measured: bins (31 MiB) + search state (~20 MiB) + sort buffers (4 threads x 8 MiB) = ~80 MiB;
+    # 321 MiB with a 16-column block per thread
+    assert growth < bins + 0.75 * x_bytes, f"fit grew peak RSS by {growth / 2**20:.0f} MiB (X is {x_bytes / 2**20:.0f} MiB)"
 
 
 # --------------------------------------------------------------------------- 6. threads, staged

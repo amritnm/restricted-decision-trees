@@ -519,8 +519,9 @@ def test_hist_fit_does_not_copy_X(kind, layout):
                          capture_output=True, text=True, check=True).stdout.split()
     growth, x_bytes = int(out[0]), int(out[1])
     bins = 20000 * 1000  # uint8 bins: the one per-element allocation hist fit needs
-    # A float64 copy of X alone would be x_bytes (float64) or 2 * x_bytes (float32).
-    assert growth < bins + 0.25 * x_bytes, f"fit grew peak RSS by {growth / 2**20:.0f} MiB (X is {x_bytes / 2**20:.0f} MiB)"
+    # A float64 copy of X alone would be x_bytes (float64) or 2 * x_bytes (float32); measured
+    # growth is the bins plus ~16-20 MiB (cuts / bin extents of 1000 features, search state).
+    assert growth < bins + 0.5 * x_bytes, f"fit grew peak RSS by {growth / 2**20:.0f} MiB (X is {x_bytes / 2**20:.0f} MiB)"
 
 
 # --------------------------------------------------------------------------- 6. threads, staged

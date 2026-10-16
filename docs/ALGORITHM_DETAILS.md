@@ -320,6 +320,11 @@ For `d` depths, `m` candidate features and `n` samples:
   subsample plus `O(d * m * n_subsample)` for the search.
 - **MAE:** the median is recomputed per candidate threshold, `O(n log n)`
   each, i.e. up to `O(d * m * n^2 log n)` per tree.
+- **Gradient boosting with an `eval_set`:** each round routes the `n_val`
+  eval rows through its new tree(s) only (`O(n_val * d)` per tree, in parallel
+  row blocks) and computes the metric in `O(n_val)` (`O(n_val log n_val)`
+  for AUC, which sorts the scores into a reused buffer); the eval state is
+  one raw score per (row, output).
 
 Memory during `fit` (in addition to `X`, `y` and the fitted trees):
 

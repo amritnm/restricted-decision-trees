@@ -98,6 +98,12 @@ gb = GradientBoostingRDT(n_estimators=100, learning_rate=0.1, max_depth=3,
                           validation_fraction=0.15, n_iter_no_change=10)  # early stopping
 gb.fit(X_train, y_train)
 gb.predict(X_test)
+
+# Early stopping on your own validation set (XGBoost's eval_set)
+gb = GradientBoostingRDT(n_estimators=5000, learning_rate=0.1, early_stopping_rounds=50,
+                          eval_metric="auc")
+gb.fit(X_train, y_train, eval_set=(X_val, y_val))
+gb.best_iteration_, gb.best_score_, gb.evals_result_["auc"]  # model truncated to best_iteration_ + 1 rounds
 ```
 
 Parameter names follow scikit-learn where a concept maps directly to a
@@ -214,17 +220,18 @@ negative gradient, then sets each leaf to the loss's one-step Newton estimate
 gradient, a documented simplification). The initial score is the weighted
 prior log-odds / log class priors / weighted mean, median or quantile, and
 `sample_weight` (or `scale_pos_weight`) also weights `train_score_` and the
-early-stopping validation loss. Parameters: `n_estimators`, `task`, `loss` (classification:
+internal early-stopping holdout's loss. Parameters: `n_estimators`, `task`, `loss` (classification:
 `'log_loss'`, `'exponential'`; regression: `'squared_error'`,
 `'absolute_error'`, `'huber'`, `'quantile'`), `learning_rate`, `max_depth`,
 `min_samples_split`, `min_samples_leaf` (alias `min_child_weight`),
 `min_impurity_decrease` (alias `gamma`), `subsample`, `max_features` (alias
 `colsample_bytree`), `validation_fraction`, `n_iter_no_change` (alias
-`early_stopping_rounds`), `tol`, `reg_alpha`, `reg_lambda`,
+`early_stopping_rounds`), `tol`, `eval_metric`, `reg_alpha`, `reg_lambda`,
 `scale_pos_weight` (binary only), `huber_delta`, `quantile_alpha`,
 `random_state`, `n_jobs`, `presort`, `split_criterion`, `max_delta_step`,
 `tree_method`, `max_bin`, `colsample_bylevel`.
 Classification needs at least two classes in `y`.
+`fit(X, y, sample_weight=None, eval_set=None, eval_sample_weight=None)`.
 
 `split_criterion="newton"` grows each round's tree the XGBoost way: per-row
 gradients `g` and hessians `h` (times `sample_weight`/`scale_pos_weight`;
@@ -245,8 +252,9 @@ and the `absolute_error`/`huber`/`quantile` losses (no hessian) are rejected.
 With a single feature this reproduces XGBoost `tree_method="exact"` round by
 round to float32 precision (XGBoost applies `gamma` by pruning after growth
 rather than while growing, which can differ at depth ≥ 2). After fitting: `feature_importances_`,
-`train_score_` (loss per round), `n_estimators_` (rounds actually fitted —
-less than `n_estimators` if early stopping triggered), `depth_features_` (one
+`train_score_` (loss per round), `n_estimators_` (rounds in the model —
+less than `n_estimators` if early stopping triggered), `best_iteration_`,
+`best_score_`, `evals_result_` (with an `eval_set`, see below), `depth_features_` (one
 `{depth: feature}` dict per tree in fitting order, a multiclass round
 contributing one tree per class; features are columns of `X`), `level_features_`
 (each tree's per-depth candidate columns, see `colsample_bylevel`).
@@ -260,6 +268,43 @@ classification, `(n_samples, n_classes)` for multiclass),
 the non-staged method exactly; the stages are accumulated natively, one round
 at a time). `decision_function`, `staged_decision_function` and
 `staged_predict_proba` are classification only.
+
+#### Early stopping
+
+Two ways, both with the patience `n_iter_no_change` (alias `early_stopping_rounds`):
+
+- **Internal holdout** (`fit(X, y)`, scikit-learn's): `validation_fraction`
+  (default 0.1) of the rows are held out of training; fitting stops once
+  their (weighted) loss has not improved by more than `tol` (default 1e-4)
+  for `n_iter_no_change` rounds. Every fitted round is kept.
+- **Your own validation set** (`fit(X, y, eval_set=(X_val, y_val))`,
+  XGBoost's sklearn API): every row of `X` trains and `validation_fraction` is
+  ignored (setting it explicitly warns). `eval_set` is an `(X_val, y_val)`
+  tuple or a list holding exactly one — a list of several raises: early
+  stopping and `evals_result_` use one eval set. `X_val` follows `X`'s rules
+  (finite; with `tree_method="hist"` float32/float64 in any layout, read in
+  place). After each round the eval rows' raw scores are updated with that
+  round's trees only, routed by the raw thresholds exactly as `predict`
+  routes them (hist included), and `eval_metric` is computed natively
+  (GIL released), weighted by `eval_sample_weight` (training weights never
+  apply): classification `"logloss"` (default; `predict_proba`, clipped to
+  `[eps, 1 - eps]` like scikit-learn's `log_loss`), `"auc"` (binary only;
+  weighted ROC AUC of the raw score, ties counted half as in `roc_auc_score`),
+  `"error"` (weighted fraction `predict` misclassifies); regression `"rmse"`
+  (default) or `"mae"`. A round improves when it beats the best score so far
+  by more than `tol` (default 0 here: strictly better — ties do not count;
+  higher is better for AUC). After `early_stopping_rounds` rounds without
+  improvement fitting stops and the model is **truncated to its best round**:
+  `best_iteration_` (0-based, as XGBoost), `best_score_`,
+  `n_estimators_ = best_iteration_ + 1`, and `predict`, `predict_proba`,
+  `staged_*`, `train_score_`, `feature_importances_` and `depth_features_`
+  all describe the truncated model — also when `n_estimators` runs out
+  first. `evals_result_` (`{metric: [score after each round]}`) covers every
+  round run, the discarded patience rounds included. The eval set never
+  influences training, so the result is bit-for-bit the model
+  `fit(X, y)` with `n_estimators=best_iteration_ + 1` gives, for any
+  `n_jobs`. With an `eval_set` but no patience the metric is only recorded
+  (`best_iteration_` stays None).
 
 ### `rdt.visualize`
 
@@ -285,7 +330,8 @@ and `max_bin` (default 256, 2–65536):
   float32 or float64, C or Fortran order, a strided view or an `np.memmap`:
   it is read in place, a block of columns at a time — never copied — and not
   read again after binning (boosting updates its training scores, and the
-  forest its OOB score, through the bins).
+  forest its OOB score, through the bins). A boosting `eval_set` is not
+  binned: its rows are routed by the raw thresholds, as `predict` does.
 - **Search:** at each depth, each feature's histograms for all of the depth's
   nodes are built in one pass over its bin column and swept with the same
   criterion arithmetic as the exact search (Gini, entropy, MSE, and the

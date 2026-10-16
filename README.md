@@ -308,11 +308,15 @@ and `max_bin` (default 256, 2–65536):
   are kept for the features scored at both depths, within
   `max_hist_cache_mb` (default 1024 MiB) for the current and the previous
   depth together (about `nodes * sum(bins) * 20` bytes per depth for
-  `newton`); the other features are built directly. Derived sums are rounded
-  differently, so split scores can differ from `hist_subtraction=False` in
-  the last bits and an exact tie between two splits may go the other way;
-  otherwise the trees are the same. `hist_subtraction=False` builds every
-  histogram directly.
+  `newton`); the other features are built directly. The budget is per tree
+  being fitted: a random forest fits up to `n_jobs` trees at once, a
+  multiclass boosting round up to `min(n_jobs, n_classes)`. Derived sums are
+  rounded differently, so split scores can differ from
+  `hist_subtraction=False` in the last bits and an exact tie between two
+  splits may go the other way; otherwise the trees are the same.
+  `hist_subtraction=False` builds every histogram directly, and so does a
+  depth with nothing kept to subtract from (`max_hist_cache_mb=0` is
+  `hist_subtraction=False` bit for bit).
 - **Thresholds:** a split between a node's adjacent non-empty bins uses the
   exact search's threshold (the midpoint between the node's neighbouring
   values), moved to a bin boundary only if a row outside the training rows
@@ -324,7 +328,7 @@ and `max_bin` (default 256, 2–65536):
 - **Memory:** the bins (1 byte per value up to 256 bins, else 2) plus, per
   feature, 40 bytes per bin; no presorted columns; 32-48 bytes per
   training row of search state; and the subtraction cache (at most
-  `max_hist_cache_mb`).
+  `max_hist_cache_mb` per tree being fitted).
 
 ## Performance notes
 

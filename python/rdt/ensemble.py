@@ -213,8 +213,9 @@ class RandomForestRDT:
         between two splits may be resolved the other way.
     max_hist_cache_mb : float, default=1024
         Memory (MiB) for the histograms kept for ``hist_subtraction`` (the
-        current and the previous depth's together, per tree being fitted);
-        features beyond it are built directly. See ``rdt.RDT``.
+        current and the previous depth's together, per tree being fitted --
+        up to ``n_jobs`` trees are fitted at once); features beyond it are
+        built directly. See ``rdt.RDT``.
 
     Attributes (after fitting)
     ---------------------------
@@ -484,8 +485,9 @@ class GradientBoostingRDT:
         between two splits may be resolved the other way.
     max_hist_cache_mb : float, default=1024
         Memory (MiB) for the histograms kept for ``hist_subtraction`` (the
-        current and the previous depth's together, per tree being fitted);
-        features beyond it are built directly. See ``rdt.RDT``.
+        current and the previous depth's together, per tree being fitted --
+        a multiclass round fits up to ``min(n_jobs, n_classes)`` trees at
+        once); features beyond it are built directly. See ``rdt.RDT``.
     scale_pos_weight : float, optional
         XGBoost-style: multiplies the positive class's (``classes_[1]``)
         sample weight. Binary classification only.

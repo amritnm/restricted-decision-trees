@@ -866,10 +866,16 @@ private:
             ++n_searched_depths_;
             const std::size_t K = scored.size();
             auto scored_size = [&](std::size_t k) { return level_size(scored[k]); };
-            // Subtraction below the root: statistics centred at the parent's
-            // mean (MSE), and computed for unscored siblings as well, which a
-            // group may build to derive its scored child.
-            const bool sub_depth = subtraction && depth > 0;
+            // Subtraction, at a depth below the root where the previous depth
+            // kept some candidate's histograms: statistics centred at the
+            // parent's mean (MSE), and computed for unscored siblings as well,
+            // which a group may build to derive its scored child. A depth with
+            // nothing to subtract (max_hist_cache_bytes = 0, or no candidate
+            // kept, e.g. with colsample_bylevel) is the direct build's, bit for
+            // bit.
+            const bool sub_depth = subtraction && depth > 0 &&
+                                   std::any_of(candidates.begin(), candidates.end(),
+                                               [&](std::uint32_t f) { return prev_cache.slot(f) >= 0; });
 
             // The scored nodes' per-entry statistics (as HistDepth describes
             // them) and per-node totals, both in row order, and each node's

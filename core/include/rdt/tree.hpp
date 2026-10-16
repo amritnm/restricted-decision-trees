@@ -142,12 +142,13 @@ public:
 
     // Fit on binned features (tree_method='hist', hist.hpp): `X` maps the
     // tree's rows / columns to a BinnedMatrix (no copy); y, sample_weight,
-    // classes and hessian as in fit(). Each node's threshold is the cut after
-    // its split bin, so predicting with the raw X routes every row as its
-    // bins did. `pool` (may be nullptr) scores a depth's features in parallel;
-    // the result does not depend on it. Not available for MAE. `arena` (may
-    // be nullptr) holds the subtraction caches; a caller fitting many trees
-    // one after another can pass the same one to reuse its memory.
+    // classes and hessian as in fit(). Each node's threshold routes every
+    // binned row of X as its split bin does (BinnedMatrix::split_point), so
+    // predicting with the raw X routes every row as its bins did. `pool` (may
+    // be nullptr) scores a depth's features in parallel; the result does not
+    // depend on it. Not available for MAE. `arena` (may be nullptr) holds the
+    // subtraction caches; a caller fitting many trees one after another can
+    // pass the same one to reuse its memory.
     void fit_binned(const BinnedView& X, const VectorView& y, const VectorView* sample_weight = nullptr,
                     const std::vector<double>* classes = nullptr, const VectorView* hessian = nullptr,
                     ThreadPool* pool = nullptr, HistArena* arena = nullptr) {

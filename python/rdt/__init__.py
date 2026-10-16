@@ -57,14 +57,16 @@ class RDT:
         from the rows with positive weight: one bin per distinct value when
         there are at most ``max_bin`` of them, else approximately equal-count
         bins) and scores the boundaries between bins, from per-node
-        histograms. A split stores the cut between two bins as its threshold,
-        so predicting on the raw ``X`` routes every row as its bins did.
+        histograms. A split's threshold lies between its two bins (the exact
+        search's midpoint when bins hold one value each), so predicting on
+        the raw ``X`` routes every row as its bins did.
         ``fit`` then accepts float32 or float64 ``X`` in any memory layout
         (C or Fortran order, strided views, ``np.memmap``) without copying it.
         Not implemented for ``criterion='mae'``.
     max_bin : int, default=256
         Maximum number of bins per feature with ``tree_method='hist'``
-        (2 to 65536; bins are stored as uint8 up to 256, else uint16).
+        (2 to 65536; bins are stored as uint8, or every feature's as uint16
+        when any feature has more than 256 bins).
     n_jobs : int, optional
         Threads for the ``tree_method='hist'`` split search (features are
         scored, and each depth's rows partitioned, in parallel; the tree does

@@ -125,7 +125,7 @@ means a parameter can't work exactly like it does elsewhere:
   The draws come from a generator seeded from the tree's own seed (so they do
   not depend on `n_jobs` and leave the other draws unchanged), and are exposed
   as `level_features_` (one `{depth: [columns of X]}` dict per tree, replayed
-  from the seeds).
+  from the seeds each time it is read; `fit` does not store them).
 - **`reg_alpha`/`reg_lambda`** (`GradientBoostingRDT` only) are, by default,
   a real effect (post-hoc leaf-value soft-thresholding/shrinkage) but not
   XGBoost's exact regularised leaf formula — the default engine is Friedman's
@@ -254,9 +254,15 @@ leaf. Each depth's feature maximises the sum over the nodes it splits of
 a hessian sum (default 1, no longer an alias of `min_samples_leaf`),
 `reg_lambda` defaults to 1, `feature_importances_` are normalised total gains,
 and the `absolute_error`/`huber`/`quantile` losses (no hessian) are rejected.
-With a single feature this reproduces XGBoost `tree_method="exact"` round by
-round to float32 precision (XGBoost applies `gamma` by pruning after growth
-rather than while growing, which can differ at depth ≥ 2). After fitting: `feature_importances_`,
+With a single feature this reproduces XGBoost (≥ 3.4) `tree_method="exact"`
+round by round to float32 precision, except that XGBoost applies `gamma` by
+pruning after growth rather than while growing (which can differ at depth ≥ 2),
+keeps zero-weight rows as candidate thresholds (so a split can sit elsewhere
+between the same weighted rows) and breaks exact gain ties towards the
+highest threshold (here the lowest). XGBoost 3.0–3.3 also differ when
+`max_delta_step > 0` and `reg_alpha > 0` (their clipped-weight gain lacks the
+`2·reg_alpha·|w|` term) and give a root leaf whose hessian sum is below
+`min_child_weight` weight 0. After fitting: `feature_importances_`,
 `train_score_` (loss per round), `n_estimators_` (rounds in the model —
 less than `n_estimators` if early stopping triggered), `best_iteration_`,
 `best_score_`, `evals_result_` (with an `eval_set`, see below), `depth_features_` (one
@@ -331,8 +337,8 @@ and `max_bin` (default 256, 2–65536):
   (for gradient boosting, after the early-stopping split): a feature with at
   most `max_bin` distinct values gets one bin per value, otherwise
   approximately equal-count bins. All rows are binned and stored as `uint8`
-  (`uint16` when a feature has more than 256 bins), in row blocks of 16
-  features (a row's bins of a block side by side). `X` may be
+  (every feature as `uint16` when any feature has more than 256 bins), in
+  row blocks of 16 features (a row's bins of a block side by side). `X` may be
   float32 or float64, C or Fortran order, a strided view or an `np.memmap`:
   it is read in place, a block of columns at a time — never copied — and not
   read again after binning (boosting updates its training scores, and the
@@ -363,18 +369,26 @@ and `max_bin` (default 256, 2–65536):
   `hist_subtraction=False` builds every histogram directly, and so does a
   depth with nothing kept to subtract from (`max_hist_cache_mb=0` is
   `hist_subtraction=False` bit for bit).
-- **Thresholds:** a split between a node's adjacent non-empty bins uses the
-  exact search's threshold (the midpoint between the node's neighbouring
-  values), moved to a bin boundary only if a row outside the training rows
-  would otherwise be routed differently from its bin, so for every row of
-  the `X` passed to `fit`, `x <= threshold` exactly when the row's bin is on
-  the left. With at most `max_bin` distinct values per feature a hist model
-  is therefore the exact model (up to how a tie between equally good splits
-  is broken), including with row subsampling and bootstrap.
-- **Memory:** the bins (1 byte per value up to 256 bins, else 2) plus, per
-  feature, 40 bytes per bin; no presorted columns; 32-48 bytes per
+- **Thresholds:** a split between a node's adjacent non-empty bins `lo < hi`
+  uses the midpoint between the largest training value in bin `lo` and the
+  smallest in bin `hi` — the exact search's threshold (the midpoint between
+  the node's neighbouring values) whenever every bin holds a single value —
+  moved to a bin boundary only if a row outside the training rows would
+  otherwise be routed differently from its bin, so for every row of the `X`
+  passed to `fit`, `x <= threshold` exactly when the row's bin is on the
+  left. With at most `max_bin` distinct values per feature a hist model is
+  therefore the exact model, including with row subsampling and bootstrap,
+  up to how a tie between equally good splits is broken (the two searches
+  round their sums differently, so splits whose scores are equal in exact
+  arithmetic may be ranked differently).
+- **Memory** (besides `X`; no presorted columns): the bins, 1 byte per row
+  and feature (2 when any feature has more than 256 bins); 40 bytes per bin
+  and feature for the cuts and bin extents; while binning, one sorted column
+  of training values per thread (8 bytes per training row); 32-48 bytes per
   training row of search state; and the subtraction cache (at most
-  `max_hist_cache_mb` per tree being fitted).
+  `max_hist_cache_mb` per tree being fitted). A forest grows `n_jobs` trees
+  at a time, each with its own search state. Gradient boosting's per-row
+  scores and gradients come on top, as with `"exact"`.
 
 ## Performance notes
 

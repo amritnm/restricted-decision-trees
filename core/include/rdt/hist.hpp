@@ -25,13 +25,15 @@
 // (split_threshold) between the largest training value in bin b and the
 // smallest in bin b + 1, and a value's bin is the number of cuts below it.
 // Every row of X (validation and zero-weight rows included) is binned with
-// these cuts and stored as uint8 (uint16 when a column has more than 256
-// bins) in row blocks: the columns are taken kBinBlock at a time, and a block
-// holds each row's bins of its columns side by side. Each bin also records
-// the extent of its training values and of all of its values. X is read
-// through a typed, strided view (float32 or float64, any order, memory-mapped
-// or not) a block of columns at a time, without copying it, and never read
-// again after binning.
+// these cuts and stored as uint8 (every column as uint16 when any column has
+// more than 256 bins) in row blocks: the columns are taken kBinBlock at a
+// time, and a block holds each row's bins of its columns side by side. Each
+// bin also records the extent of its training values and of all of its
+// values. X is read through a typed, strided view (float32 or float64, any
+// order, memory-mapped or not) a block of columns at a time, without copying
+// it, and never read again after binning; computing the cuts sorts one
+// column's training values at a time per thread (8 bytes per training row; a
+// few adjacent columns at once while they fit in kBinningBufferBytes).
 //
 // Search. The tree keeps its rows partitioned by node (each node's rows
 // contiguous and ascending, see RDTModel::build_tree_hist). Per depth, each
@@ -57,7 +59,11 @@
 // Thresholds. A split between a node's adjacent non-empty bins lo < hi gets
 // the exact search's threshold, the guarded midpoint of the largest training
 // value of bin lo and the smallest of bin hi, so with one bin per value (and
-// no other values in X) a hist tree is the exact tree. If a row outside the
+// no other values in X) a hist tree is the exact tree up to tie-breaking:
+// both searches score the same candidates, but round differently (here a
+// bin's rows are summed first and bins are added in turn; the exact search
+// adds rows one at a time in feature order), so two candidates whose scores
+// are equal in exact arithmetic may be ranked differently. If a row outside the
 // training rows (validation, zero weight) has a value that this threshold
 // would route differently from its bin, the threshold is moved to the nearest
 // bin boundary instead (split_point). Either way every row of X satisfies
@@ -93,6 +99,10 @@ private:
 inline std::size_t column_block(const MatrixView& X) { return X.n_cols() > 1 ? 8 : 1; }
 template <class T>
 std::size_t column_block(const StridedMatrix<T>& X) { return X.column_block(); }
+
+// Binning's sort buffers per task: adjacent columns are gathered together
+// (cache-friendly on row-major X) only while their cut-row values fit here.
+constexpr std::size_t kBinningBufferBytes = std::size_t{8} << 20;
 
 // Runs f(0..n-1) on the pool when there is one with more than one thread.
 template <class F>
@@ -150,49 +160,47 @@ inline void prefetch_read(const void* p) {
 }
 
 // Cuts of one column from its (sorted) values, and each bin's smallest and
-// largest value; see the file comment.
+// largest value; see the file comment. Works on `sorted` in place: the extra
+// memory is O(max_bin), not O(rows).
 inline void column_cuts(const std::vector<double>& sorted, int max_bin, std::vector<double>& cuts,
                         std::vector<double>& bin_lo, std::vector<double>& bin_hi) {
     cuts.clear();
     bin_lo.clear();
     bin_hi.clear();
-    std::vector<double> vals;
-    std::vector<std::size_t> cum; // number of values <= vals[j]
-    for (std::size_t i = 0; i < sorted.size(); ++i) {
-        if (i == 0 || sorted[i] != sorted[i - 1]) {
-            vals.push_back(sorted[i]);
-            cum.push_back(0);
-        }
-        cum.back() = i + 1;
-    }
-    const std::size_t d = vals.size();
-    if (d == 0) {
+    const std::size_t n = sorted.size();
+    if (n == 0) {
         bin_lo.push_back(0.0);
         bin_hi.push_back(0.0);
         return;
     }
-    std::vector<std::size_t> last_of_bin; // index into vals of each bin's largest value
-    if (d <= static_cast<std::size_t>(max_bin)) {
-        for (std::size_t j = 0; j < d; ++j) last_of_bin.push_back(j);
-    } else {
-        const std::uint64_t n = sorted.size();
-        for (std::uint64_t b = 1; b < static_cast<std::uint64_t>(max_bin); ++b) {
-            const std::uint64_t target =
-                (b * n + static_cast<std::uint64_t>(max_bin) - 1) / static_cast<std::uint64_t>(max_bin);
-            const std::size_t j =
-                static_cast<std::size_t>(std::lower_bound(cum.begin(), cum.end(), target) - cum.begin());
-            if (j + 1 >= d || (!last_of_bin.empty() && j <= last_of_bin.back())) continue;
-            last_of_bin.push_back(j);
+    const auto mb = static_cast<std::size_t>(max_bin);
+    std::size_t d = 1; // distinct values, counted up to max_bin + 1
+    for (std::size_t i = 1; i < n && d <= mb; ++i) d += sorted[i] != sorted[i - 1] ? 1 : 0;
+    // ends[b]: one past bin b's last row in `sorted` (the number of values <= its largest value).
+    std::vector<std::size_t> ends;
+    if (d <= mb) {
+        for (std::size_t i = 1; i < n; ++i) {
+            if (sorted[i] != sorted[i - 1]) ends.push_back(i);
         }
-        last_of_bin.push_back(d - 1);
+    } else {
+        for (std::uint64_t b = 1; b < static_cast<std::uint64_t>(mb); ++b) {
+            // Bin b - 1 ends with the smallest value whose count of values <= it reaches
+            // ceil(b * n / max_bin): sorted[target - 1].
+            const std::uint64_t target = (b * n + mb - 1) / mb;
+            const auto end = static_cast<std::size_t>(
+                std::upper_bound(sorted.begin(), sorted.end(), sorted[static_cast<std::size_t>(target) - 1]) -
+                sorted.begin());
+            if (end >= n || (!ends.empty() && end <= ends.back())) continue;
+            ends.push_back(end);
+        }
     }
+    ends.push_back(n);
     std::size_t first = 0;
-    for (std::size_t b = 0; b < last_of_bin.size(); ++b) {
-        const std::size_t last = last_of_bin[b];
-        bin_lo.push_back(vals[first]);
-        bin_hi.push_back(vals[last]);
-        if (b + 1 < last_of_bin.size()) cuts.push_back(split_threshold(vals[last], vals[last + 1]));
-        first = last + 1;
+    for (std::size_t b = 0; b < ends.size(); ++b) {
+        bin_lo.push_back(sorted[first]);
+        bin_hi.push_back(sorted[ends[b] - 1]);
+        if (b + 1 < ends.size()) cuts.push_back(split_threshold(sorted[ends[b] - 1], sorted[ends[b]]));
+        first = ends[b];
     }
 }
 
@@ -212,22 +220,31 @@ public:
         n_rows_ = X.n_rows();
         n_cols_ = X.n_cols();
         const std::size_t block = std::max<std::size_t>(1, column_block(X));
-        const std::size_t n_blocks = (n_cols_ + block - 1) / block;
 
         // Pass 1: each column's cuts (and its bins' training-value extents)
-        // from its sorted cut-row values.
+        // from its sorted cut-row values. Each task (one per thread) owns one
+        // sort buffer of a block of adjacent columns -- as many as fit in
+        // kBinningBufferBytes, at least one (8 bytes per cut row) -- reused
+        // for all of its columns.
         std::vector<std::vector<double>> col_cuts(n_cols_), col_lo(n_cols_), col_hi(n_cols_);
-        run_tasks(pool, n_blocks, [&](std::size_t blk) {
-            const std::size_t c0 = blk * block;
-            const std::size_t nb = std::min(block, n_cols_ - c0);
-            std::vector<std::vector<double>> vals(nb, std::vector<double>(cut_rows.size()));
-            for (std::size_t i = 0; i < cut_rows.size(); ++i) {
-                const std::size_t r = cut_rows[i];
-                for (std::size_t j = 0; j < nb; ++j) vals[j][i] = X(r, c0 + j);
-            }
-            for (std::size_t j = 0; j < nb; ++j) {
-                std::sort(vals[j].begin(), vals[j].end());
-                column_cuts(vals[j], max_bin, col_cuts[c0 + j], col_lo[c0 + j], col_hi[c0 + j]);
+        const std::size_t column_bytes = std::max<std::size_t>(1, cut_rows.size() * sizeof(double));
+        const std::size_t sort_block = std::max<std::size_t>(1, std::min(block, kBinningBufferBytes / column_bytes));
+        const std::size_t n_sort_blocks = (n_cols_ + sort_block - 1) / sort_block;
+        const std::size_t n_tasks = pool ? std::min(n_sort_blocks, pool->size()) : 1;
+        run_tasks(pool, n_tasks, [&](std::size_t task) {
+            std::vector<std::vector<double>> vals(std::min(sort_block, n_cols_));
+            for (auto& v : vals) v.resize(cut_rows.size());
+            for (std::size_t blk = task; blk < n_sort_blocks; blk += n_tasks) { // round robin: balanced
+                const std::size_t c0 = blk * sort_block;
+                const std::size_t nb = std::min(sort_block, n_cols_ - c0);
+                for (std::size_t i = 0; i < cut_rows.size(); ++i) {
+                    const std::size_t r = cut_rows[i];
+                    for (std::size_t j = 0; j < nb; ++j) vals[j][i] = X(r, c0 + j);
+                }
+                for (std::size_t j = 0; j < nb; ++j) {
+                    std::sort(vals[j].begin(), vals[j].end());
+                    column_cuts(vals[j], max_bin, col_cuts[c0 + j], col_lo[c0 + j], col_hi[c0 + j]);
+                }
             }
         });
 

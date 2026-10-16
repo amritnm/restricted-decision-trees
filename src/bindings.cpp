@@ -257,6 +257,24 @@ nb::list int_maps_to_list(const std::vector<std::map<int, int>>& maps) {
     return out;
 }
 
+nb::list level_maps_to_list(const std::vector<std::map<int, std::vector<std::uint32_t>>>& maps) {
+    nb::list out;
+    for (const auto& m : maps) {
+        nb::dict d;
+        for (const auto& kv : m) {
+            nb::list cols;
+            for (auto c : kv.second) cols.append(c);
+            d[nb::int_(kv.first)] = cols;
+        }
+        out.append(d);
+    }
+    return out;
+}
+
+void check_colsample_bylevel(double v) {
+    if (!(v > 0.0 && v <= 1.0)) throw std::invalid_argument("colsample_bylevel must be in (0, 1]");
+}
+
 nb::dict double_map_to_dict(const std::map<int, double>& m) {
     nb::dict d;
     for (const auto& kv : m) d[nb::int_(kv.first)] = kv.second;
@@ -506,8 +524,11 @@ NB_MODULE(_rdt_native, m) {
                           int min_samples_split, int min_samples_leaf, double min_impurity_decrease,
                           int n_estimators, MaxFeaturesSpec max_features, bool bootstrap,
                           double max_samples, bool oob_score, std::uint64_t random_state, int n_jobs,
-                          std::uint32_t max_samples_count, bool presort, std::string tree_method, int max_bin) {
+                          std::uint32_t max_samples_count, bool presort, std::string tree_method, int max_bin,
+                          double colsample_bylevel) {
                  ForestParams p;
+                 check_colsample_bylevel(colsample_bylevel);
+                 p.tree_params.colsample_bylevel = colsample_bylevel;
                  p.tree_params.tree_method = tree_method_from_string(tree_method);
                  check_max_bin(max_bin);
                  p.tree_params.max_bin = max_bin;
@@ -531,7 +552,7 @@ NB_MODULE(_rdt_native, m) {
              "task"_a, "criterion"_a, "max_depth"_a, "min_samples_split"_a, "min_samples_leaf"_a,
              "min_impurity_decrease"_a, "n_estimators"_a, "max_features"_a, "bootstrap"_a,
              "max_samples"_a, "oob_score"_a, "random_state"_a, "n_jobs"_a, "max_samples_count"_a = 0,
-             "presort"_a = true, "tree_method"_a = "exact", "max_bin"_a = 256)
+             "presort"_a = true, "tree_method"_a = "exact", "max_bin"_a = 256, "colsample_bylevel"_a = 1.0)
         .def("fit",
              [](RandomForestModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
                  fit_released(self, X, y, sample_weight);
@@ -561,6 +582,10 @@ NB_MODULE(_rdt_native, m) {
                       [](const RandomForestModel& self) {
                           return read(self, [](auto& m) { return m.feature_subsets(); });
                       })
+        .def_prop_ro("level_features_",
+                      [](const RandomForestModel& self) {
+                          return read(self, [](auto& m) { return level_maps_to_list(m.level_features()); });
+                      })
         .def_prop_ro("depth_features_",
                       [](const RandomForestModel& self) {
                           return read(self, [](auto& m) { return int_maps_to_list(m.depth_features()); });
@@ -589,8 +614,10 @@ NB_MODULE(_rdt_native, m) {
                           double tol, double reg_alpha, double reg_lambda, double huber_delta,
                           double quantile_alpha, std::uint64_t random_state, int n_jobs, bool presort,
                           std::string split_criterion, double min_child_weight, double max_delta_step,
-                          std::string tree_method, int max_bin) {
+                          std::string tree_method, int max_bin, double colsample_bylevel) {
                  GBParams p;
+                 check_colsample_bylevel(colsample_bylevel);
+                 p.tree_params.colsample_bylevel = colsample_bylevel;
                  p.tree_params.tree_method = tree_method_from_string(tree_method);
                  check_max_bin(max_bin);
                  p.tree_params.max_bin = max_bin;
@@ -624,7 +651,7 @@ NB_MODULE(_rdt_native, m) {
              "max_features"_a, "validation_fraction"_a, "n_iter_no_change"_a, "tol"_a,
              "reg_alpha"_a, "reg_lambda"_a, "huber_delta"_a, "quantile_alpha"_a, "random_state"_a, "n_jobs"_a,
              "presort"_a = true, "split_criterion"_a = "friedman_mse", "min_child_weight"_a = 1.0,
-             "max_delta_step"_a = 0.0, "tree_method"_a = "exact", "max_bin"_a = 256)
+             "max_delta_step"_a = 0.0, "tree_method"_a = "exact", "max_bin"_a = 256, "colsample_bylevel"_a = 1.0)
         .def("fit",
              [](GradientBoostingModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
                  fit_released(self, X, y, sample_weight);
@@ -668,6 +695,10 @@ NB_MODULE(_rdt_native, m) {
         .def_prop_ro("n_outputs_",
                       [](const GradientBoostingModel& self) {
                           return read(self, [](auto& m) { return m.n_outputs(); });
+                      })
+        .def_prop_ro("level_features_",
+                      [](const GradientBoostingModel& self) {
+                          return read(self, [](auto& m) { return level_maps_to_list(m.level_features()); });
                       })
         .def_prop_ro("depth_features_",
                       [](const GradientBoostingModel& self) {

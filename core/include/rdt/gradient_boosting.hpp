@@ -320,6 +320,9 @@ private:
                     tp.newton.max_delta_step = params_.max_delta_step;
                 }
                 tp.retain_indices = false; // see TreeParams::retain_indices
+                // colsample_bylevel: the tree's own generator, seeded from the
+                // (round, output) seed before any thread starts.
+                tp.bylevel_seed = derive_seed(derive_seed(params_.random_state, round * 1000 + k + 1), kBylevelSeedIndex);
                 round_trees.emplace_back(tp);
             }
             std::vector<std::vector<std::uint32_t>> round_fit_rows(n_outputs);
@@ -555,6 +558,12 @@ public:
     const std::vector<double>& init_scores() const { return init_scores_; }
     // Incremented by every fit(); lets a staged iterator detect a refit.
     std::uint64_t fit_generation() const { return fit_generation_; }
+
+    // Per tree (round-major), the candidate columns of each searched depth
+    // (colsample_bylevel) as columns of X, replayed from each tree's seed.
+    std::vector<std::map<int, std::vector<std::uint32_t>>> level_features() const {
+        return map_level_features(trees_, feature_subsets_);
+    }
 
     // Per tree (round-major, as trees are fitted), the feature chosen at
     // each depth as a column of the X passed to fit (each tree's own column

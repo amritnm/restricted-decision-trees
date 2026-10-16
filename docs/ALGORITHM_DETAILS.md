@@ -275,6 +275,15 @@ Tree growth stops at a node when:
 5. **Insufficient improvement**: the depth's total weighted impurity decrease
    is below `min_impurity_decrease` (every node at that depth becomes a leaf).
 
+### Per-depth column sampling (`colsample_bylevel`)
+
+In the ensembles, `colsample_bylevel < 1` restricts `candidate_features` at
+each searched depth to a fresh random subset of `max(1, floor(f * m))` of the
+tree's `m` columns (without replacement, ascending), drawn from a generator
+seeded with `derive_seed(tree_seed, 0xB7)` before any thread starts; every
+search (presorted, per-node, Newton, histogram) scores only those columns.
+`level_features_` replays the draws from the seeds.
+
 ### Histogram search (`tree_method="hist"`)
 
 Each feature is binned once per fit from the training rows with positive

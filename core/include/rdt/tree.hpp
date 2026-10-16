@@ -17,6 +17,7 @@
 #include "rdt/node.hpp"
 #include "rdt/params.hpp"
 #include "rdt/presort.hpp"
+#include "rdt/rng.hpp"
 
 // Port of rdt_optimal_cython/optimal_rdt_cython.py's OptimalRDTCython.
 //
@@ -233,6 +234,17 @@ public:
     const std::map<int, double>& depth_improvements() const { return depth_improvements_; }
     const Node* root() const { return root_.get(); }
     const TreeParams& params() const { return params_; }
+    // Number of depths at which the last fit searched for a split (the
+    // depths in depth_features(), plus a final one that found none).
+    std::size_t n_searched_depths() const { return n_searched_depths_; }
+    // The candidate columns (this tree's indices) of each searched depth,
+    // replayed from TreeParams::bylevel_seed: the same draws the fit made.
+    std::vector<std::vector<std::uint32_t>> level_candidates() const {
+        std::vector<std::vector<std::uint32_t>> out;
+        LevelSampler sampler(params_, n_features_);
+        for (std::size_t d = 0; d < n_searched_depths_; ++d) out.push_back(sampler.next());
+        return out;
+    }
     std::size_t n_features() const { return n_features_; }
 
 private:
@@ -243,6 +255,30 @@ private:
     std::map<int, double> depth_improvements_;
     std::size_t n_features_ = 0;
     const VectorView* hessian_ = nullptr; // Newton: the hessians, during fit only
+    std::size_t n_searched_depths_ = 0;
+
+    // Draws each searched depth's candidate columns (colsample_bylevel); with
+    // colsample_bylevel == 1 every column, without an Rng.
+    class LevelSampler {
+    public:
+        LevelSampler(const TreeParams& p, std::size_t n_features) : n_(static_cast<std::uint32_t>(n_features)) {
+            if (p.colsample_bylevel < 1.0) {
+                k_ = static_cast<std::uint32_t>(std::max(1.0, std::floor(p.colsample_bylevel * static_cast<double>(n_))));
+                rng_ = std::make_unique<Rng>(p.bylevel_seed);
+            }
+        }
+        std::vector<std::uint32_t> next() {
+            if (rng_ && k_ < n_) return rng_->sample_without_replacement(n_, k_);
+            std::vector<std::uint32_t> all(n_);
+            for (std::uint32_t f = 0; f < n_; ++f) all[f] = f;
+            return all;
+        }
+
+    private:
+        std::uint32_t n_;
+        std::uint32_t k_ = 0;
+        std::unique_ptr<Rng> rng_;
+    };
 
     bool newton() const { return params_.criterion == Criterion::Newton; }
 
@@ -261,6 +297,7 @@ private:
         }
         hessian_ = params_.criterion == Criterion::Newton ? hessian : nullptr;
         n_features_ = n_cols;
+        n_searched_depths_ = 0;
         depth_features_.clear();
         depth_improvements_.clear();
         classes_.clear();
@@ -414,13 +451,15 @@ private:
     DepthChoice find_optimal_feature_for_depth(
         const IndexedMatrixView& X, const VectorView& y, const VectorView* sample_weight,
         const std::vector<Node*>& nodes, const std::vector<double>& node_share,
-        const std::vector<double>& node_g, const std::vector<double>& node_h) const {
+        const std::vector<double>& node_g, const std::vector<double>& node_h,
+        const std::vector<std::uint32_t>& candidates) const {
 
         DepthChoice best;
         std::vector<char> found(nodes.size());
         std::vector<double> thresholds(nodes.size());
 
-        for (int feature_idx = 0; feature_idx < static_cast<int>(n_features_); ++feature_idx) {
+        for (std::uint32_t candidate : candidates) {
+            const int feature_idx = static_cast<int>(candidate);
             double total_improvement = 0.0, gain_sum = 0.0;
             bool valid_split_found = false;
 
@@ -453,7 +492,8 @@ private:
     DepthChoice find_optimal_feature_presorted(
         const IndexedMatrixView& X, const std::vector<Node*>& nodes, const std::vector<double>& node_share,
         const std::vector<double>& node_g, const std::vector<double>& node_h,
-        const PresortedView& presorted, const std::vector<ScanRow>& scan_rows, DepthScanner& scanner) const {
+        const PresortedView& presorted, const std::vector<ScanRow>& scan_rows, DepthScanner& scanner,
+        const std::vector<std::uint32_t>& candidates) const {
 
         std::vector<std::size_t> node_sizes(nodes.size());
         for (std::size_t k = 0; k < nodes.size(); ++k) node_sizes[k] = nodes[k]->indices.size();
@@ -461,7 +501,8 @@ private:
 
         DepthChoice best;
         std::vector<NodeSplit> splits, best_splits;
-        for (int feature_idx = 0; feature_idx < static_cast<int>(n_features_); ++feature_idx) {
+        for (std::uint32_t candidate : candidates) {
+            const int feature_idx = static_cast<int>(candidate);
             scanner.score_feature(presorted.columns[static_cast<std::size_t>(feature_idx)], presorted.n_entries,
                                   scan_rows.data(), splits);
             double total_improvement = 0.0, gain_sum = 0.0;
@@ -500,25 +541,28 @@ private:
         const BinnedView& X, const VectorView& y, const VectorView* sample_weight,
         const std::vector<Node*>& nodes, const std::vector<double>& node_share,
         const std::vector<double>& node_g, const std::vector<double>& node_h,
-        const std::vector<std::int32_t>& cls, HistScanner& scanner, ThreadPool* pool) const {
+        const std::vector<std::int32_t>& cls, HistScanner& scanner, ThreadPool* pool,
+        const std::vector<std::uint32_t>& candidates) const {
 
         std::vector<const std::vector<std::uint32_t>*> node_rows(nodes.size());
         for (std::size_t k = 0; k < nodes.size(); ++k) node_rows[k] = &nodes[k]->indices;
         scanner.begin_depth(X, node_rows, y, newton() ? nullptr : sample_weight, hessian_, cls.data(), &node_g, &node_h);
 
-        const std::size_t n_feat = n_features_;
-        std::vector<std::vector<HistSplit>> results(n_feat);
-        const std::size_t n_chunks = pool ? std::min(n_feat, 4 * pool->size()) : 1;
+        // results[i]: candidate i's per-node splits.
+        const std::size_t n_cand = candidates.size();
+        std::vector<std::vector<HistSplit>> results(n_cand);
+        const std::size_t n_chunks = pool ? std::min(n_cand, 4 * pool->size()) : 1;
         run_tasks(pool, n_chunks, [&](std::size_t c) {
             HistScanner::Scratch scratch;
-            const std::size_t f0 = n_feat * c / n_chunks, f1 = n_feat * (c + 1) / n_chunks;
-            for (std::size_t f = f0; f < f1; ++f) scanner.score_feature(X, f, results[f], scratch);
+            const std::size_t i0 = n_cand * c / n_chunks, i1 = n_cand * (c + 1) / n_chunks;
+            for (std::size_t i = i0; i < i1; ++i) scanner.score_feature(X, candidates[i], results[i], scratch);
         });
 
         DepthChoice best;
-        std::size_t best_f = 0;
-        for (std::size_t f = 0; f < n_feat; ++f) {
-            std::vector<HistSplit>& splits = results[f];
+        std::size_t best_i = 0;
+        for (std::size_t i = 0; i < n_cand; ++i) {
+            const std::size_t f = candidates[i];
+            std::vector<HistSplit>& splits = results[i];
             double total_improvement = 0.0, gain_sum = 0.0;
             bool valid_split_found = false;
             for (std::size_t k = 0; k < splits.size(); ++k) {
@@ -530,15 +574,16 @@ private:
                 best.total_improvement = total_improvement;
                 best.gain_sum = gain_sum;
                 best.feature = static_cast<int>(f);
-                best_f = f;
+                best_i = i;
             }
         }
+        const std::size_t best_f = static_cast<std::size_t>(std::max(best.feature, 0));
         if (best.feature >= 0) {
             best.found.assign(nodes.size(), 0);
             best.threshold.assign(nodes.size(), 0.0);
             best.split_bin.assign(nodes.size(), 0);
             for (std::size_t k = 0; k < nodes.size(); ++k) {
-                const HistSplit& sp = results[best_f][k];
+                const HistSplit& sp = results[best_i][k];
                 if (!sp.found) continue;
                 best.found[k] = 1;
                 const auto point = X.m->split_point(X.col(best_f), sp.lo_bin, sp.hi_bin);
@@ -639,6 +684,8 @@ private:
         }
 
         std::vector<Node*> current_level = {root.get()};
+        // Each searched depth's candidate columns (colsample_bylevel).
+        LevelSampler level_sampler(params_, n_features_);
 
         for (int depth = 0; depth < params_.max_depth; ++depth) {
             if (current_level.empty()) break;
@@ -653,6 +700,8 @@ private:
             }
 
             if (nodes_to_split.empty()) break;
+            const std::vector<std::uint32_t> candidates = level_sampler.next();
+            ++n_searched_depths_;
 
             // Each node's share of the total training weight (both searches
             // weight a node's improvement by it).
@@ -671,18 +720,19 @@ private:
             DepthChoice choice;
             if (binned) {
                 choice = find_optimal_feature_hist(*binned, y, sample_weight, nodes_to_split, node_share, node_g, node_h,
-                                                   row_class, *hist_scanner, pool);
+                                                   row_class, *hist_scanner, pool, candidates);
             } else if (presorted) {
                 for (std::size_t k = 0; k < nodes_to_split.size(); ++k) {
                     for (auto idx : nodes_to_split[k]->indices) scan_rows[idx].node = static_cast<std::int32_t>(k);
                 }
                 choice = find_optimal_feature_presorted(X, nodes_to_split, node_share, node_g, node_h, *presorted,
-                                                        scan_rows, scanner);
+                                                        scan_rows, scanner, candidates);
                 for (Node* node : nodes_to_split) {
                     for (auto idx : node->indices) scan_rows[idx].node = -1;
                 }
             } else {
-                choice = find_optimal_feature_for_depth(X, y, sample_weight, nodes_to_split, node_share, node_g, node_h);
+                choice = find_optimal_feature_for_depth(X, y, sample_weight, nodes_to_split, node_share, node_g, node_h,
+                                                        candidates);
             }
             const int best_feature = choice.feature;
 

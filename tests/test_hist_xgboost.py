@@ -17,7 +17,8 @@ import itertools
 import numpy as np
 import pytest
 
-xgb = pytest.importorskip("xgboost")
+# Parity with the newton criterion holds for XGBoost >= 3.4 (see tests/test_newton_xgboost.py).
+xgb = pytest.importorskip("xgboost", minversion="3.4.0")
 
 from rdt import _rdt_native  # noqa: E402
 from rdt.ensemble import GradientBoostingRDT  # noqa: E402

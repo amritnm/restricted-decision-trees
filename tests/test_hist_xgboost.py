@@ -22,7 +22,9 @@ xgb = pytest.importorskip("xgboost")
 from rdt import _rdt_native  # noqa: E402
 from rdt.ensemble import GradientBoostingRDT  # noqa: E402
 
-ULPS = 4
+# XGBoost adds each round's float32 leaf value to a float32 margin, so the
+# difference grows by up to ~1 ulp per round; observed max 3.79 over 4 rounds.
+ULPS = 6
 
 
 def _T(G, a):

@@ -220,7 +220,8 @@ gain        = score(G_L, H_L) + score(G_R, H_R) - score(G, H)
 ```
 
 (when `max_delta_step > 0`, `score` is evaluated at the clipped weight
-`w`: `-(2 G w + (H + lambda) w^2 + 2 alpha |w|)`). A node's best threshold is
+`w`: `-(2 G w + (H + lambda) w^2 + 2 alpha |w|)`, as XGBoost ≥ 3.4 does;
+3.0–3.3 leave out the `2 alpha |w|` term). A node's best threshold is
 the valid boundary (both children `H >= min_child_weight` and `> 0`, and the
 `min_samples_leaf` count rule) with the highest gain; the node splits only if
 that gain is `>= gamma` and `> 1e-6`. The depth's feature is the one that

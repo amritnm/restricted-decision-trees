@@ -670,7 +670,13 @@ class GradientBoostingRDT:
         return self._staged(X, "predict")
 
     def _staged(self, X: np.ndarray, kind: str):
-        # The native iterator adds one round per step (GIL released) and
-        # returns a fresh array each time; it holds the native model it was
-        # created from, so a later fit() of this estimator does not affect it.
-        yield from self._model._staged(X, kind)
+        # The native iterator is created here, at the staged_* call (not at
+        # the first next()), and holds the native model current now, so a
+        # later fit() of this estimator does not change what it yields. It
+        # adds one round per step (GIL released) and returns a fresh array
+        # each time; the generator around it refuses concurrent re-entry.
+        return _iterate(self._model._staged(X, kind))
+
+
+def _iterate(iterator):
+    yield from iterator

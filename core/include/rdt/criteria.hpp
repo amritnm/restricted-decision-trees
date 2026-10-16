@@ -177,6 +177,7 @@ inline double impurity(Criterion c, const VectorView& y, const std::vector<std::
         case Criterion::Entropy: return entropy(y, indices, weights);
         case Criterion::MSE: return mse(y, indices, weights);
         case Criterion::MAE: return mae(y, indices, weights);
+        case Criterion::Newton: break; // not an impurity of y
     }
     return 0.0;
 }
@@ -384,6 +385,124 @@ ThresholdResult find_best_threshold(
     result.found = true;
     result.threshold = best_threshold;
     result.improvement = best_improvement;
+    return result;
+}
+
+// ---------------------------------------------------------------- Newton gain
+// XGBoost's second-order split scoring (src/tree/param.h, split_evaluator.h),
+// on per-row gradients g = dL/dF and hessians h (already multiplied by the
+// sample weight). G and H are a node's (or child's) sums.
+
+// XGBoost's floor on a split's gain (kRtEps): a node splits only if its gain
+// is > this (and >= gamma).
+constexpr double kNewtonMinGain = 1e-6;
+
+// T_alpha(G) = sign(G) * max(|G| - alpha, 0) (XGBoost's ThresholdL1).
+inline double newton_threshold_l1(double G, double alpha) {
+    if (G > alpha) return G - alpha;
+    if (G < -alpha) return G + alpha;
+    return 0.0;
+}
+
+// Leaf weight -T(G) / (H + lambda), clipped to +-max_delta_step when that is
+// > 0; 0 when H <= 0 (XGBoost's CalcWeight). Not yet multiplied by the
+// learning rate.
+inline double newton_leaf_weight(double G, double H, const NewtonParams& p) {
+    if (H <= 0.0) return 0.0;
+    double w = -newton_threshold_l1(G, p.reg_alpha) / (H + p.reg_lambda);
+    if (p.max_delta_step != 0.0 && std::abs(w) > p.max_delta_step) w = std::copysign(p.max_delta_step, w);
+    return w;
+}
+
+// score(G, H) = T(G)^2 / (H + lambda) -- the loss reduction of the node's
+// optimal weight. With max_delta_step > 0 the weight may be clipped, so (as
+// XGBoost's CalcGain does) the score is evaluated at the clipped weight w:
+// -(2 G w + (H + lambda) w^2 + 2 alpha |w|), which equals T(G)^2 / (H + lambda)
+// when w is not clipped. 0 when H <= 0.
+inline double newton_score(double G, double H, const NewtonParams& p) {
+    if (H <= 0.0) return 0.0;
+    if (p.max_delta_step == 0.0) {
+        const double t = newton_threshold_l1(G, p.reg_alpha);
+        return t * t / (H + p.reg_lambda);
+    }
+    const double w = newton_leaf_weight(G, H, p);
+    return -(2.0 * G * w + (H + p.reg_lambda) * w * w + 2.0 * p.reg_alpha * std::abs(w));
+}
+
+// Both children need a positive hessian sum of at least min_child_weight
+// (XGBoost's IsValidSplit).
+inline bool newton_children_valid(double left_h, double right_h, const NewtonParams& p) {
+    return left_h > 0.0 && right_h > 0.0 && left_h >= p.min_child_weight && right_h >= p.min_child_weight;
+}
+
+// Gain of splitting a node with totals (G, H) into left (left_g, left_h) and
+// the rest: score(left) + score(right) - parent_score. The one expression both
+// searches (find_best_threshold_newton and the presorted DepthScanner) use.
+inline double newton_split_gain(double left_g, double left_h, double G, double H, double parent_score,
+                                const NewtonParams& p) {
+    return newton_score(left_g, left_h, p) + newton_score(G - left_g, H - left_h, p) - parent_score;
+}
+
+// Best threshold of one node on one feature by Newton gain: the candidate
+// boundaries, guarded midpoint, tie order and min_samples_split/leaf counts of
+// find_best_threshold, plus the hessian constraint; `improvement` is the best
+// gain. Whether that gain is large enough to split (>= gamma, > kNewtonMinGain)
+// is decided by the caller. `g`/`h` are indexed like `X`'s rows; G/H are the
+// node's totals (summed in row order by the caller, so they do not depend on
+// the feature). Candidates whose gain is not finite are skipped.
+template <class Matrix>
+ThresholdResult find_best_threshold_newton(
+    const Matrix& X,
+    const VectorView& g,
+    const VectorView& h,
+    const std::vector<std::uint32_t>& indices,
+    int feature_idx,
+    double G,
+    double H,
+    int min_samples_split,
+    int min_samples_leaf,
+    const NewtonParams& p) {
+
+    ThresholdResult result;
+    const std::size_t n = indices.size();
+    if (static_cast<int>(n) < min_samples_split) return result;
+
+    struct SamplePoint { double x, g, h; std::uint32_t idx; };
+    std::vector<SamplePoint> pts;
+    pts.reserve(n);
+    for (auto idx : indices) pts.push_back({X(idx, feature_idx), g[idx], h[idx], idx});
+    std::sort(pts.begin(), pts.end(), [](const auto& a, const auto& b) {
+        return a.x < b.x || (a.x == b.x && a.idx < b.idx);
+    });
+    if (pts.front().x == pts.back().x) return result;
+
+    const double parent_score = newton_score(G, H, p);
+    double best_gain = -std::numeric_limits<double>::infinity();
+    double best_threshold = 0.0;
+    bool any_valid = false;
+    double left_g = 0.0, left_h = 0.0;
+    for (std::size_t i = 0; i + 1 < n; ++i) {
+        left_g += pts[i].g;
+        left_h += pts[i].h;
+        if (pts[i].x == pts[i + 1].x) continue;
+
+        std::size_t n_left = i + 1;
+        std::size_t n_right = n - n_left;
+        if (static_cast<int>(n_left) < min_samples_leaf ||
+            static_cast<int>(n_right) < min_samples_leaf) continue;
+        if (!newton_children_valid(left_h, H - left_h, p)) continue;
+
+        const double gain = newton_split_gain(left_g, left_h, G, H, parent_score, p);
+        if (std::isfinite(gain) && gain > best_gain) {
+            best_gain = gain;
+            best_threshold = split_threshold(pts[i].x, pts[i + 1].x);
+            any_valid = true;
+        }
+    }
+    if (!any_valid) return result;
+    result.found = true;
+    result.threshold = best_threshold;
+    result.improvement = best_gain;
     return result;
 }
 

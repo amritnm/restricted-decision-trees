@@ -37,6 +37,16 @@
 // The per-depth feature scoring normally runs on presorted columns (see
 // presort.hpp and TreeParams::presort); the per-(node, feature) sort in
 // find_best_threshold remains for MAE and as the reference implementation.
+//
+// Criterion::Newton (gradient boosting's split_criterion='newton') grows the
+// tree XGBoost's way on per-row gradients `y` and hessians `hessian`: a node's
+// best split maximises the gain score(L) + score(R) - score(node) (see
+// NewtonParams), and is kept only if the gain is >= gamma and > 1e-6 with both
+// children's hessian sums >= min_child_weight (nodes without such a split
+// become leaves as the tree grows). A depth's feature maximises the sum over
+// its splitting nodes of (gain - gamma); depth_improvements() holds the sum of
+// the gains (XGBoost's total_gain). Leaves hold -T(G) / (H + lambda), clipped
+// by max_delta_step. The node purity test does not apply.
 namespace rdt {
 
 class RDTModel {
@@ -49,8 +59,8 @@ public:
     RDTModel& operator=(RDTModel&&) = default;
 
     void fit(const MatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr,
-             const std::vector<double>* classes = nullptr) {
-        fit(IndexedMatrixView(X), y, sample_weight, nullptr, classes);
+             const std::vector<double>* classes = nullptr, const VectorView* hessian = nullptr) {
+        fit(IndexedMatrixView(X), y, sample_weight, nullptr, classes, hessian);
     }
 
     // Fit on a row/column-mapped view of a matrix (e.g. a bootstrap sample
@@ -68,8 +78,22 @@ public:
     // produces probability rows in the ensemble's column order. It must be
     // sorted, unique, and contain every label in y (std::invalid_argument
     // otherwise).
+    //
+    // Criterion::Newton: y holds the per-row gradients and `hessian` (required)
+    // the hessians, both already multiplied by the sample weight; rows whose
+    // sample_weight is 0 are still left out.
     void fit(const IndexedMatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr,
-             const PresortedView* presorted = nullptr, const std::vector<double>* classes = nullptr) {
+             const PresortedView* presorted = nullptr, const std::vector<double>* classes = nullptr,
+             const VectorView* hessian = nullptr) {
+        if (params_.criterion == Criterion::Newton) {
+            if (params_.task != Task::Regression) {
+                throw std::invalid_argument("RDTModel::fit: criterion 'newton' needs task='regression'");
+            }
+            if (!hessian || hessian->size() != y.size()) {
+                throw std::invalid_argument("RDTModel::fit: criterion 'newton' needs a hessian per row");
+            }
+        }
+        hessian_ = params_.criterion == Criterion::Newton ? hessian : nullptr;
         n_features_ = X.n_cols();
         depth_features_.clear();
         depth_improvements_.clear();
@@ -131,6 +155,7 @@ public:
             presorted = &own_view;
         }
         root_ = build_tree(X, y, sample_weight, std::move(root_indices), presort ? presorted : nullptr);
+        hessian_ = nullptr;
     }
 
     std::vector<double> predict(const MatrixView& X) const {
@@ -201,6 +226,9 @@ private:
     std::map<int, int> depth_features_;
     std::map<int, double> depth_improvements_;
     std::size_t n_features_ = 0;
+    const VectorView* hessian_ = nullptr; // Newton: the hessians, during fit only
+
+    bool newton() const { return params_.criterion == Criterion::Newton; }
 
     static bool all_same_label(const VectorView& y, const std::vector<std::uint32_t>& indices) {
         if (indices.empty()) return true;
@@ -219,6 +247,12 @@ private:
 
     void make_leaf(Node& node, const VectorView& y, const VectorView* sample_weight) const {
         node.has_value = true;
+        if (newton()) {
+            double G = 0.0, H = 0.0;
+            node_sums(node, y, G, H);
+            node.value = newton_leaf_weight(G, H, params_.newton);
+            return;
+        }
         if (params_.task == Task::Classification) {
             std::vector<double> seen_labels;
             std::unordered_map<double, std::size_t> label_to_pos;
@@ -267,9 +301,37 @@ private:
     struct DepthChoice {
         int feature = -1;
         double total_improvement = -std::numeric_limits<double>::infinity();
+        double gain_sum = 0.0; // Newton: sum of the splitting nodes' gains
         std::vector<char> found;
         std::vector<double> threshold;
     };
+
+    // Newton: a node's gradient / hessian totals, summed over its rows in
+    // row order (independent of the feature being scored).
+    void node_sums(const Node& node, const VectorView& g, double& G, double& H) const {
+        for (auto idx : node.indices) {
+            G += g[idx];
+            H += (*hessian_)[idx];
+        }
+    }
+
+    // Adds node k's best split on a feature (`found`, `improvement`) to the
+    // feature's score for the depth; returns whether node k splits on it.
+    // Impurity criteria: the node's improvement weighted by its share of the
+    // training weight. Newton: the node splits only if its gain is >= gamma
+    // and > kNewtonMinGain, and adds gain - gamma.
+    bool add_node_score(bool found, double improvement, double share, double& total, double& gain_sum) const {
+        if (!found) return false;
+        if (newton()) {
+            const double gamma = params_.newton.gamma;
+            if (!(improvement >= gamma && improvement > kNewtonMinGain)) return false;
+            total += improvement - gamma;
+            gain_sum += improvement;
+            return true;
+        }
+        total += share * improvement;
+        return true;
+    }
 
     // Reference search: sort each (node, feature) pair (find_best_threshold).
     // A node's improvement is weighted by its share of the total training
@@ -279,30 +341,32 @@ private:
     // nodes otherwise.
     DepthChoice find_optimal_feature_for_depth(
         const IndexedMatrixView& X, const VectorView& y, const VectorView* sample_weight,
-        const std::vector<Node*>& nodes, const std::vector<double>& node_share) const {
+        const std::vector<Node*>& nodes, const std::vector<double>& node_share,
+        const std::vector<double>& node_g, const std::vector<double>& node_h) const {
 
         DepthChoice best;
         std::vector<char> found(nodes.size());
         std::vector<double> thresholds(nodes.size());
 
         for (int feature_idx = 0; feature_idx < static_cast<int>(n_features_); ++feature_idx) {
-            double total_improvement = 0.0;
+            double total_improvement = 0.0, gain_sum = 0.0;
             bool valid_split_found = false;
 
             for (std::size_t k = 0; k < nodes.size(); ++k) {
-                ThresholdResult r = find_best_threshold(
-                    X, y, nodes[k]->indices, feature_idx, params_.criterion,
-                    params_.min_samples_split, params_.min_samples_leaf, sample_weight);
-                found[k] = r.found;
+                ThresholdResult r = newton()
+                    ? find_best_threshold_newton(X, y, *hessian_, nodes[k]->indices, feature_idx, node_g[k],
+                                                 node_h[k], params_.min_samples_split, params_.min_samples_leaf,
+                                                 params_.newton)
+                    : find_best_threshold(X, y, nodes[k]->indices, feature_idx, params_.criterion,
+                                          params_.min_samples_split, params_.min_samples_leaf, sample_weight);
+                found[k] = add_node_score(r.found, r.improvement, node_share[k], total_improvement, gain_sum);
                 thresholds[k] = r.threshold;
-                if (r.found) {
-                    total_improvement += node_share[k] * r.improvement;
-                    valid_split_found = true;
-                }
+                if (found[k]) valid_split_found = true;
             }
 
             if (valid_split_found && total_improvement > best.total_improvement) {
                 best.total_improvement = total_improvement;
+                best.gain_sum = gain_sum;
                 best.feature = feature_idx;
                 best.found = found;
                 best.threshold = thresholds;
@@ -316,27 +380,28 @@ private:
     // for every row i of nodes[k] and -1 for every other row.
     DepthChoice find_optimal_feature_presorted(
         const IndexedMatrixView& X, const std::vector<Node*>& nodes, const std::vector<double>& node_share,
+        const std::vector<double>& node_g, const std::vector<double>& node_h,
         const PresortedView& presorted, const std::vector<ScanRow>& scan_rows, DepthScanner& scanner) const {
 
         std::vector<std::size_t> node_sizes(nodes.size());
         for (std::size_t k = 0; k < nodes.size(); ++k) node_sizes[k] = nodes[k]->indices.size();
-        scanner.begin_depth(node_sizes);
+        scanner.begin_depth(node_sizes, &node_g, &node_h);
 
         DepthChoice best;
         std::vector<NodeSplit> splits, best_splits;
         for (int feature_idx = 0; feature_idx < static_cast<int>(n_features_); ++feature_idx) {
             scanner.score_feature(presorted.columns[static_cast<std::size_t>(feature_idx)], presorted.n_entries,
                                   scan_rows.data(), splits);
-            double total_improvement = 0.0;
+            double total_improvement = 0.0, gain_sum = 0.0;
             bool valid_split_found = false;
             for (std::size_t k = 0; k < splits.size(); ++k) {
-                if (splits[k].found) {
-                    total_improvement += node_share[k] * splits[k].improvement;
-                    valid_split_found = true;
-                }
+                splits[k].found = add_node_score(splits[k].found, splits[k].improvement, node_share[k],
+                                                 total_improvement, gain_sum);
+                if (splits[k].found) valid_split_found = true;
             }
             if (valid_split_found && total_improvement > best.total_improvement) {
                 best.total_improvement = total_improvement;
+                best.gain_sum = gain_sum;
                 best.feature = feature_idx;
                 best_splits = splits;
             }
@@ -396,13 +461,13 @@ private:
         // Presorted search state: per-row target/weight/class and the index
         // of the node being split that the row currently belongs to.
         std::vector<ScanRow> scan_rows;
-        DepthScanner scanner(params_.criterion, params_.min_samples_leaf, classes_.size());
+        DepthScanner scanner(params_.criterion, params_.min_samples_leaf, classes_.size(), params_.newton);
         if (presorted) {
             scan_rows.resize(X.n_rows());
             for (auto idx : root->indices) {
                 ScanRow& r = scan_rows[idx];
                 r.y = y[idx];
-                r.w = sample_weight ? (*sample_weight)[idx] : 1.0;
+                r.w = newton() ? (*hessian_)[idx] : sample_weight ? (*sample_weight)[idx] : 1.0;
                 if (params_.task == Task::Classification) {
                     r.cls = static_cast<std::int32_t>(
                         std::lower_bound(classes_.begin(), classes_.end(), y[idx]) - classes_.begin());
@@ -417,7 +482,7 @@ private:
 
             std::vector<Node*> nodes_to_split;
             for (Node* node : current_level) {
-                if (should_split(*node, depth) && !all_same_label(y, node->indices)) {
+                if (should_split(*node, depth) && (newton() || !all_same_label(y, node->indices))) {
                     nodes_to_split.push_back(node);
                 } else {
                     finish_leaf(*node, y, sample_weight);
@@ -432,30 +497,40 @@ private:
             for (std::size_t k = 0; k < nodes_to_split.size(); ++k) {
                 node_share[k] = root_weight > 0.0 ? total_weight(*nodes_to_split[k], sample_weight) / root_weight : 0.0;
             }
+            // Newton: each node's gradient / hessian totals.
+            std::vector<double> node_g, node_h;
+            if (newton()) {
+                node_g.assign(nodes_to_split.size(), 0.0);
+                node_h.assign(nodes_to_split.size(), 0.0);
+                for (std::size_t k = 0; k < nodes_to_split.size(); ++k) node_sums(*nodes_to_split[k], y, node_g[k], node_h[k]);
+            }
 
             DepthChoice choice;
             if (presorted) {
                 for (std::size_t k = 0; k < nodes_to_split.size(); ++k) {
                     for (auto idx : nodes_to_split[k]->indices) scan_rows[idx].node = static_cast<std::int32_t>(k);
                 }
-                choice = find_optimal_feature_presorted(X, nodes_to_split, node_share, *presorted, scan_rows, scanner);
+                choice = find_optimal_feature_presorted(X, nodes_to_split, node_share, node_g, node_h, *presorted,
+                                                        scan_rows, scanner);
                 for (Node* node : nodes_to_split) {
                     for (auto idx : node->indices) scan_rows[idx].node = -1;
                 }
             } else {
-                choice = find_optimal_feature_for_depth(X, y, sample_weight, nodes_to_split, node_share);
+                choice = find_optimal_feature_for_depth(X, y, sample_weight, nodes_to_split, node_share, node_g, node_h);
             }
             const int best_feature = choice.feature;
 
             // scikit-learn's rule: split unless improvement + EPSILON < min_impurity_decrease.
+            // (Newton: gamma has already gated each node.)
             if (best_feature < 0 ||
-                choice.total_improvement + std::numeric_limits<double>::epsilon() < params_.min_impurity_decrease) {
+                (!newton() && choice.total_improvement + std::numeric_limits<double>::epsilon() <
+                                  params_.min_impurity_decrease)) {
                 for (Node* node : nodes_to_split) finish_leaf(*node, y, sample_weight);
                 break;
             }
 
             depth_features_[depth] = best_feature;
-            depth_improvements_[depth] = choice.total_improvement;
+            depth_improvements_[depth] = newton() ? choice.gain_sum : choice.total_improvement;
 
             std::vector<Node*> next_level;
             for (std::size_t k = 0; k < nodes_to_split.size(); ++k) {

@@ -112,12 +112,14 @@ means a parameter can't work exactly like it does elsewhere:
 - **`max_features`/`colsample_bytree`** can't be resampled *per node* the
   way scikit-learn/XGBoost do it — each tree gets one random column subset
   chosen once, before that tree is fit.
-- **`reg_alpha`/`reg_lambda`** (`GradientBoostingRDT` only) are a real
-  effect (post-hoc leaf-value soft-thresholding/shrinkage) but not XGBoost's
-  exact regularised leaf formula — this engine is Friedman's gradient
-  boosting as in scikit-learn (trees grown on the gradient with a
+- **`reg_alpha`/`reg_lambda`** (`GradientBoostingRDT` only) are, by default,
+  a real effect (post-hoc leaf-value soft-thresholding/shrinkage) but not
+  XGBoost's exact regularised leaf formula — the default engine is Friedman's
+  gradient boosting as in scikit-learn (trees grown on the gradient with a
   squared-error criterion, then a per-leaf Newton step for `log_loss` and
-  `exponential`), not XGBoost's hessian-weighted tree growth.
+  `exponential`). `split_criterion="newton"` switches to XGBoost's
+  hessian-weighted tree growth, where `reg_lambda`, `reg_alpha`, `gamma`,
+  `min_child_weight` and `max_delta_step` have XGBoost's meaning (see below).
 
 See `examples/ensemble_usage.py` for a fuller, runnable example.
 
@@ -203,8 +205,28 @@ early-stopping validation loss. Parameters: `n_estimators`, `task`, `loss` (clas
 `colsample_bytree`), `validation_fraction`, `n_iter_no_change` (alias
 `early_stopping_rounds`), `tol`, `reg_alpha`, `reg_lambda`,
 `scale_pos_weight` (binary only), `huber_delta`, `quantile_alpha`,
-`random_state`, `n_jobs`, `presort`. Classification needs at least two classes in
-`y`. After fitting: `feature_importances_`,
+`random_state`, `n_jobs`, `presort`, `split_criterion`, `max_delta_step`.
+Classification needs at least two classes in `y`.
+
+`split_criterion="newton"` grows each round's tree the XGBoost way: per-row
+gradients `g` and hessians `h` (times `sample_weight`/`scale_pos_weight`;
+`log_loss`: `h = max(p(1-p), 1e-16)`, multiclass `max(2p(1-p)w, 1e-16)` per
+class as XGBoost's softmax; `exponential`; `squared_error`: `h = 1`), each
+node's best split maximising the gain
+`score(G_L, H_L) + score(G_R, H_R) - score(G, H)` with
+`score(G, H) = T(G)^2 / (H + reg_lambda)`, `T(G) = sign(G)·max(|G| - reg_alpha, 0)`
+(XGBoost's scale, no ½; evaluated at the clipped weight when
+`max_delta_step > 0`). A node splits only if its gain is `>= gamma` and `> 1e-6`
+with each child's hessian sum `>= min_child_weight`; otherwise it becomes a
+leaf. Each depth's feature maximises the sum over the nodes it splits of
+`gain - gamma`, and leaves are `-T(G) / (H + reg_lambda)` (clipped to
+`±max_delta_step`) times `learning_rate`. In this mode `min_child_weight` is
+a hessian sum (default 1, no longer an alias of `min_samples_leaf`),
+`reg_lambda` defaults to 1, `feature_importances_` are normalised total gains,
+and the `absolute_error`/`huber`/`quantile` losses (no hessian) are rejected.
+With a single feature this reproduces XGBoost `tree_method="exact"` round by
+round to float32 precision (XGBoost applies `gamma` by pruning after growth
+rather than while growing, which can differ at depth ≥ 2). After fitting: `feature_importances_`,
 `train_score_` (loss per round), `n_estimators_` (rounds actually fitted —
 less than `n_estimators` if early stopping triggered), `depth_features_` (one
 `{depth: feature}` dict per tree in fitting order, a multiclass round

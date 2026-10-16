@@ -219,7 +219,8 @@ private:
     std::vector<std::vector<std::uint32_t>> cols_;
 };
 
-// What the presorted search needs per row, indexed by row id.
+// What the presorted search needs per row, indexed by row id. Newton:
+// y = gradient, w = hessian.
 struct ScanRow {
     double y = 0.0;
     double w = 1.0;
@@ -241,16 +242,23 @@ struct NodeSplit {
 // feature's presorted rows gathers each node's rows into a contiguous
 // segment (in sorted order); each segment is then swept twice -- totals,
 // then candidate boundaries -- with the running aggregates in registers.
-// Gini, Entropy and MSE only (MAE keeps the per-node path).
+// Gini, Entropy, MSE and Newton (MAE keeps the per-node path).
 class DepthScanner {
 public:
-    DepthScanner(Criterion criterion, int min_samples_leaf, std::size_t n_classes)
-        : criterion_(criterion), min_samples_leaf_(min_samples_leaf), n_classes_(n_classes) {}
+    DepthScanner(Criterion criterion, int min_samples_leaf, std::size_t n_classes,
+                 const NewtonParams& newton = NewtonParams())
+        : criterion_(criterion), min_samples_leaf_(min_samples_leaf), n_classes_(n_classes), newton_(newton) {}
 
     static bool supports(Criterion c) { return c != Criterion::MAE; }
 
     // node_sizes[k] = number of rows routed to node k (ScanRow::node == k).
-    void begin_depth(const std::vector<std::size_t>& node_sizes) {
+    // Newton: node_g[k] / node_h[k] are node k's gradient / hessian totals.
+    void begin_depth(const std::vector<std::size_t>& node_sizes, const std::vector<double>* node_g = nullptr,
+                     const std::vector<double>* node_h = nullptr) {
+        if (criterion_ == Criterion::Newton) {
+            node_g_ = node_g;
+            node_h_ = node_h;
+        }
         node_begin_.assign(node_sizes.size() + 1, 0);
         for (std::size_t k = 0; k < node_sizes.size(); ++k) node_begin_[k + 1] = node_begin_[k] + node_sizes[k];
         items_.resize(node_begin_.back());
@@ -278,6 +286,8 @@ public:
             const Item* e = items_.data() + node_begin_[k + 1];
             if (criterion_ == Criterion::MSE) {
                 score_mse(b, e, raw_sum_[k], weight_sum_[k], out[k]);
+            } else if (criterion_ == Criterion::Newton) {
+                score_newton(b, e, (*node_g_)[k], (*node_h_)[k], out[k]);
             } else {
                 score_classification(b, e, out[k]);
             }
@@ -287,10 +297,10 @@ public:
 private:
     struct Item {
         union {
-            double y;          // regression (MSE)
+            double y;          // regression (MSE); Newton: gradient
             std::int64_t cls;  // classification: index into the classes
         };
-        double w;
+        double w;              // Newton: hessian
         std::uint32_t row;
         std::uint32_t run; // index of the row's run of equal values in the sorted column
     };
@@ -298,6 +308,9 @@ private:
     Criterion criterion_;
     int min_samples_leaf_;
     std::size_t n_classes_;
+    NewtonParams newton_;
+    const std::vector<double>* node_g_ = nullptr;
+    const std::vector<double>* node_h_ = nullptr;
     std::vector<std::size_t> node_begin_; // node k's items are [node_begin_[k], node_begin_[k + 1])
     std::vector<std::size_t> cursor_;
     std::vector<Item> items_;
@@ -315,6 +328,7 @@ private:
 
     void gather(const std::uint32_t* sorted, std::size_t n_entries, const ScanRow* rows) {
         const bool mse = criterion_ == Criterion::MSE;
+        const bool newton = criterion_ == Criterion::Newton;
         for (std::size_t k = 0; k < cursor_.size(); ++k) cursor_[k] = node_begin_[k];
         if (mse) {
             std::fill(raw_sum_.begin(), raw_sum_.end(), 0.0);
@@ -333,6 +347,8 @@ private:
                 item.y = r.y;
                 raw_sum_[k] += r.w * r.y;
                 weight_sum_[k] += r.w;
+            } else if (newton) {
+                item.y = r.y;
             } else {
                 item.cls = r.cls;
             }
@@ -392,6 +408,33 @@ private:
             left_sum += p->w * d;
             left_sum_sq += p->w * d * d;
             left_weight += p->w;
+            ++n_left;
+        }
+    }
+
+    // One node's items in sorted order, by Newton gain: the arithmetic of
+    // find_best_threshold_newton (left sums accumulated in the same sorted
+    // order, the same validity tests and gain expression).
+    void score_newton(const Item* begin, const Item* end, double G, double H, NodeSplit& out) const {
+        const std::size_t n = static_cast<std::size_t>(end - begin);
+        const double parent_score = newton_score(G, H, newton_);
+        double best_gain = -std::numeric_limits<double>::infinity();
+        double left_g = 0.0, left_h = 0.0;
+        std::size_t n_left = 0;
+        for (const Item* p = begin; p != end; ++p) {
+            if (n_left > 0 && p[-1].run != p->run && leaf_sizes_ok(n_left, n) &&
+                newton_children_valid(left_h, H - left_h, newton_)) {
+                const double gain = newton_split_gain(left_g, left_h, G, H, parent_score, newton_);
+                if (std::isfinite(gain) && gain > best_gain) {
+                    best_gain = gain;
+                    out.found = true;
+                    out.improvement = gain;
+                    out.lo_row = p[-1].row;
+                    out.hi_row = p->row;
+                }
+            }
+            left_g += p->y;
+            left_h += p->w;
             ++n_left;
         }
     }

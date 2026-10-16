@@ -11,18 +11,27 @@ version:
   scikit-learn's usual way -- a fresh random subset *per node*. Instead each
   tree gets ONE random column subset chosen before its own fit(), matching
   this project's earlier Python ``ensemble/random_forest_rdt.py``.
-- ``min_samples_leaf`` / ``min_child_weight``: aliases. Trees are grown on
-  the gradient alone (hessians only enter the per-leaf Newton step), so
-  ``min_child_weight`` (normally hessian-based in XGBoost) is treated as a
-  plain sample-count constraint.
+- ``min_samples_leaf`` / ``min_child_weight``: aliases (RandomForestRDT, and
+  GradientBoostingRDT with the default ``split_criterion='friedman_mse'``).
+  Those trees are grown on the gradient alone (hessians only enter the
+  per-leaf Newton step), so ``min_child_weight`` (normally hessian-based in
+  XGBoost) is treated as a plain sample-count constraint.
 - ``min_impurity_decrease`` / ``gamma``: real, aliases of the same pruning
   threshold.
-- ``reg_alpha`` / ``reg_lambda`` (GradientBoostingRDT only): a real effect
-  (post-hoc leaf-value soft-thresholding / ridge-style shrinkage) but not
-  XGBoost's exact regularised leaf formula -- this engine is Friedman's
-  gradient boosting as in scikit-learn (squared-error trees on the gradient,
-  then one Newton step per leaf for log_loss/exponential), not XGBoost's
-  hessian-weighted tree growth.
+- ``reg_alpha`` / ``reg_lambda`` (GradientBoostingRDT only): with
+  ``split_criterion='friedman_mse'`` a real effect (post-hoc leaf-value
+  soft-thresholding / ridge-style shrinkage) but not XGBoost's exact
+  regularised leaf formula -- that engine is Friedman's gradient boosting as
+  in scikit-learn (squared-error trees on the gradient, then one Newton step
+  per leaf for log_loss/exponential).
+- ``GradientBoostingRDT(split_criterion='newton')`` grows the trees XGBoost's
+  way instead: per-row gradients and hessians, split gain
+  ``T(G_L)^2/(H_L+lambda) + T(G_R)^2/(H_R+lambda) - T(G)^2/(H+lambda)`` with
+  ``T(G) = sign(G) max(|G| - alpha, 0)``, leaves ``-T(G)/(H+lambda)``, and
+  ``reg_lambda``, ``reg_alpha``, ``gamma`` (alias ``min_impurity_decrease``),
+  ``min_child_weight`` (a hessian sum, no longer an alias of
+  ``min_samples_leaf``) and ``max_delta_step`` with XGBoost's meanings and
+  defaults (1, 0, 0, 1, 0).
 - ``n_iter_no_change`` / ``early_stopping_rounds``: aliases.
 """
 
@@ -327,16 +336,22 @@ class GradientBoostingRDT:
     max_depth : int, default=3
     min_samples_split : int, default=2
     min_samples_leaf : int, default=1
-    min_child_weight : int, optional
-        XGBoost-style alias of ``min_samples_leaf``.
+    min_child_weight : float, optional
+        ``split_criterion='friedman_mse'``: XGBoost-style alias of
+        ``min_samples_leaf``. ``split_criterion='newton'``: XGBoost's meaning,
+        the minimum hessian sum in each child of a split (default 1.0);
+        ``min_samples_leaf`` then stays a separate sample-count constraint.
     min_impurity_decrease : float, default=0.0
-        Each round's tree splits a depth only if the depth's total weighted
-        decrease in squared error of the gradient -- the sum over its nodes of
-        ``N_t / N * (node improvement)``, scikit-learn's scale (see
-        ``rdt.RDT``) -- reaches this value.
+        ``split_criterion='friedman_mse'``: each round's tree splits a depth
+        only if the depth's total weighted decrease in squared error of the
+        gradient -- the sum over its nodes of ``N_t / N * (node improvement)``,
+        scikit-learn's scale (see ``rdt.RDT``) -- reaches this value.
+        ``split_criterion='newton'``: XGBoost's ``gamma`` (min_split_loss) on
+        XGBoost's gain scale -- each node splits only if its gain reaches it.
     gamma : float, optional
-        XGBoost-style alias of ``min_impurity_decrease`` (same scale, not
-        XGBoost's gain scale).
+        XGBoost-style alias of ``min_impurity_decrease`` (with
+        ``split_criterion='friedman_mse'`` on the same scale, not XGBoost's
+        gain scale).
     subsample : float, default=1.0
         Row fraction per round (without replacement) -- stochastic GB.
     max_features : {'sqrt', 'log2', None} or int or float, default=None (all)
@@ -350,7 +365,32 @@ class GradientBoostingRDT:
         XGBoost-style alias of ``n_iter_no_change``.
     tol : float, default=1e-4
     reg_alpha : float, default=0.0
-    reg_lambda : float, default=0.0
+    reg_lambda : float, optional
+        Default 0.0 with ``split_criterion='friedman_mse'`` (post-hoc shrink,
+        see the module docstring), 1.0 with ``'newton'`` (XGBoost's lambda).
+    split_criterion : {'friedman_mse', 'newton'}, default='friedman_mse'
+        'friedman_mse': trees grown on the negative gradient with a
+        squared-error criterion (scikit-learn's gradient boosting).
+        'newton': XGBoost's second-order tree growth -- per-row gradients g
+        and hessians h (multiplied by ``sample_weight`` /
+        ``scale_pos_weight``; log_loss: h = max(p(1-p), 1e-16), multiclass
+        h = max(2p(1-p) w, 1e-16) per class as XGBoost's softmax;
+        exponential: h = exp(-y F); squared_error: h = 1), each node's best
+        split maximising the gain
+        ``score(G_L, H_L) + score(G_R, H_R) - score(G, H)`` with
+        ``score(G, H) = T(G)^2 / (H + reg_lambda)``,
+        ``T(G) = sign(G) max(|G| - reg_alpha, 0)`` (XGBoost's scale, no 1/2;
+        evaluated at the clipped weight when ``max_delta_step > 0``). A node
+        splits only if its gain is >= ``gamma`` and > 1e-6 and each child's
+        hessian sum is >= ``min_child_weight``; other nodes become leaves.
+        Each depth's feature maximises the sum of (gain - gamma) over the
+        nodes it splits. Leaves are ``-T(G) / (H + reg_lambda)`` (clipped to
+        +-``max_delta_step`` if > 0) times ``learning_rate``;
+        ``feature_importances_`` are normalised total gains. Needs a loss
+        with a hessian: 'log_loss', 'exponential' or 'squared_error'.
+    max_delta_step : float, default=0.0
+        ``split_criterion='newton'`` only: if > 0, leaf weights (before
+        ``learning_rate``) are clipped to +-max_delta_step, as in XGBoost.
     scale_pos_weight : float, optional
         XGBoost-style: multiplies the positive class's (``classes_[1]``)
         sample weight. Binary classification only.
@@ -402,7 +442,7 @@ class GradientBoostingRDT:
         max_depth: int = 3,
         min_samples_split: int = 2,
         min_samples_leaf: int = 1,
-        min_child_weight: Optional[int] = None,
+        min_child_weight: Optional[float] = None,
         min_impurity_decrease: float = 0.0,
         gamma: Optional[float] = None,
         subsample: float = 1.0,
@@ -413,13 +453,15 @@ class GradientBoostingRDT:
         early_stopping_rounds: Optional[int] = None,
         tol: float = 1e-4,
         reg_alpha: float = 0.0,
-        reg_lambda: float = 0.0,
+        reg_lambda: Optional[float] = None,
         scale_pos_weight: Optional[float] = None,
         huber_delta: float = 1.0,
         quantile_alpha: float = 0.5,
         random_state: Optional[int] = None,
         n_jobs: Optional[int] = None,
         presort: bool = True,
+        split_criterion: str = "friedman_mse",
+        max_delta_step: float = 0.0,
     ):
         self.task = task.lower()
         if self.task not in ("classification", "regression"):
@@ -436,12 +478,28 @@ class GradientBoostingRDT:
         if self.task == "regression" and self.loss not in regression_losses:
             raise ValueError(f"For regression, loss must be one of {regression_losses}")
 
+        self.split_criterion = str(split_criterion).lower()
+        if self.split_criterion not in ("friedman_mse", "newton"):
+            raise ValueError("split_criterion must be 'friedman_mse' or 'newton'")
+        newton = self.split_criterion == "newton"
+        if newton and self.loss not in ("log_loss", "exponential", "squared_error"):
+            raise ValueError(
+                f"split_criterion='newton' needs a loss with a hessian ('log_loss', 'exponential', "
+                f"'squared_error'); loss={self.loss!r} has none")
+
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
-        self.min_samples_leaf = _resolve_alias(
-            min_samples_leaf, 1, min_child_weight, "min_samples_leaf", "min_child_weight")
+        if newton:
+            # XGBoost's min_child_weight: a hessian sum, separate from the
+            # min_samples_leaf count.
+            self.min_samples_leaf = min_samples_leaf
+            self.min_child_weight = 1.0 if min_child_weight is None else min_child_weight
+        else:
+            self.min_samples_leaf = _resolve_alias(
+                min_samples_leaf, 1, min_child_weight, "min_samples_leaf", "min_child_weight")
+            self.min_child_weight = min_child_weight
         self.min_impurity_decrease = _resolve_alias(
             min_impurity_decrease, 0.0, gamma, "min_impurity_decrease", "gamma")
         self.subsample = subsample
@@ -452,7 +510,18 @@ class GradientBoostingRDT:
             n_iter_no_change, None, early_stopping_rounds, "n_iter_no_change", "early_stopping_rounds")
         self.tol = tol
         self.reg_alpha = reg_alpha
-        self.reg_lambda = reg_lambda
+        self.reg_lambda = (1.0 if newton else 0.0) if reg_lambda is None else reg_lambda
+        self.max_delta_step = max_delta_step
+        if not (np.isfinite(self.max_delta_step) and self.max_delta_step >= 0):
+            raise ValueError(f"max_delta_step must be a finite number >= 0, got {max_delta_step!r}")
+        if newton:
+            for name in ("reg_lambda", "reg_alpha", "min_impurity_decrease", "min_child_weight"):
+                value = getattr(self, name)
+                if not (np.isfinite(value) and value >= 0):
+                    shown = "gamma/min_impurity_decrease" if name == "min_impurity_decrease" else name
+                    raise ValueError(f"{shown} must be a finite number >= 0, got {value!r}")
+        elif self.max_delta_step != 0:
+            raise ValueError("max_delta_step only applies to split_criterion='newton'")
         self.scale_pos_weight = scale_pos_weight
         self.huber_delta = huber_delta
         self.quantile_alpha = quantile_alpha
@@ -504,6 +573,9 @@ class GradientBoostingRDT:
             self.n_iter_no_change if self.n_iter_no_change is not None else 0, self.tol,
             self.reg_alpha, self.reg_lambda, self.huber_delta, self.quantile_alpha,
             _resolve_random_state(self.random_state), _resolve_n_jobs(self.n_jobs), presort=self.presort,
+            split_criterion=self.split_criterion,
+            min_child_weight=float(self.min_child_weight) if self.split_criterion == "newton" else 1.0,
+            max_delta_step=float(self.max_delta_step),
         )
         model.fit(X, y, sample_weight)
         self._model = model

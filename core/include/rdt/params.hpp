@@ -35,6 +35,20 @@ inline std::string to_string(Criterion c) {
     return "";
 }
 
+// Split search: Exact scores every boundary between distinct feature values;
+// Hist bins every feature once per fit (at most max_bin bins, see hist.hpp)
+// and scores the boundaries between bins.
+enum class TreeMethod { Exact, Hist };
+
+inline TreeMethod tree_method_from_string(const std::string& name) {
+    if (name == "exact") return TreeMethod::Exact;
+    if (name == "hist") return TreeMethod::Hist;
+    throw std::invalid_argument("Unknown tree_method: " + name);
+}
+
+constexpr int kMinMaxBin = 2;
+constexpr int kMaxMaxBin = 65536;
+
 // XGBoost's split / leaf parameters for Criterion::Newton, with XGBoost's
 // meaning and defaults. A node's score is score(G, H) = T(G)^2 / (H + lambda),
 // T(G) = sign(G) * max(|G| - alpha, 0) (XGBoost's code scale: no 1/2); a split's
@@ -65,6 +79,13 @@ struct TreeParams {
     // Criterion::Newton only (min_impurity_decrease is not used then: gamma
     // gates each node's split instead).
     NewtonParams newton;
+    // Hist: the model bins X once per fit (hist.hpp) and its trees are fitted
+    // on the bins (RDTModel::fit_binned). Not available for MAE.
+    TreeMethod tree_method = TreeMethod::Exact;
+    int max_bin = 256;
+    // Threads for a standalone tree's hist search (RDTModel::fit_hist); the
+    // ensembles pass their own pool instead.
+    int n_jobs = 1;
 
     // Implementation choices that do not change which splits are chosen.
     //

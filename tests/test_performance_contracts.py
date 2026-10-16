@@ -80,19 +80,21 @@ def _ticks_during(fn):
     return during, elapsed
 
 
+@pytest.mark.parametrize("tree_method", ["exact", "hist"])
 @pytest.mark.parametrize("model", ["rdt", "rf", "gb"])
-def test_fit_releases_the_gil(model):
+def test_fit_releases_the_gil(model, tree_method):
     rng = np.random.default_rng(0)
     X = rng.normal(size=(20000, 40))
     y = (X[:, 0] + rng.normal(size=20000) > 0).astype(float)
     rounds = 10
     while True:
         if model == "rdt":
-            est = RDT(max_depth=4 + rounds // 10)
+            est = RDT(max_depth=4 + rounds // 10, tree_method=tree_method)
         elif model == "rf":
-            est = RandomForestRDT(n_estimators=rounds, max_depth=6, max_features=None, random_state=0)
+            est = RandomForestRDT(n_estimators=rounds, max_depth=6, max_features=None, random_state=0,
+                                  tree_method=tree_method)
         else:
-            est = GradientBoostingRDT(n_estimators=rounds, max_depth=6, random_state=0)
+            est = GradientBoostingRDT(n_estimators=rounds, max_depth=6, random_state=0, tree_method=tree_method)
         ticks, elapsed = _ticks_during(lambda: est.fit(X, y))
         if elapsed >= 0.25 or rounds >= 640:
             break

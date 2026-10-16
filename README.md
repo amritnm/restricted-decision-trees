@@ -125,7 +125,7 @@ See `examples/ensemble_usage.py` for a fuller, runnable example.
 
 ## API reference
 
-### `rdt.RDT(task="classification", criterion=None, max_depth=5, min_samples_split=2, min_samples_leaf=1, min_impurity_decrease=0.0)`
+### `rdt.RDT(task="classification", criterion=None, max_depth=5, min_samples_split=2, min_samples_leaf=1, min_impurity_decrease=0.0, presort=True, tree_method="exact", max_bin=256, n_jobs=None)`
 
 **Parameters**
 
@@ -142,6 +142,12 @@ See `examples/ensemble_usage.py` for a fuller, runnable example.
   definition and comparison, up to machine epsilon) is at least this value.
 - `presort` — `True` (default): presorted split search; `False`: the original
   per-node sort (see [Performance notes](#performance-notes)).
+- `tree_method` — `"exact"` (default) or `"hist"`: histogram split search on
+  features binned once per fit (see [Histogram split search](#histogram-split-search-tree_methodhist)).
+  Not implemented for `criterion="mae"` (raises `NotImplementedError`).
+- `max_bin` — maximum bins per feature for `tree_method="hist"` (2–65536,
+  default 256).
+- `n_jobs` — threads for the `tree_method="hist"` search (None = 1).
 
 **Methods**
 
@@ -178,7 +184,8 @@ Bagging ensemble: `n_estimators`, `task`, `criterion`, `max_depth`,
 `min_samples_split`, `min_samples_leaf` (alias `min_child_weight`),
 `min_impurity_decrease` (alias `gamma`), `max_features` (alias
 `colsample_bytree`), `bootstrap`, `max_samples`, `oob_score`, `class_weight`
-(`'balanced'` or dict), `random_state`, `n_jobs`, `presort`. `max_samples` follows
+(`'balanced'` or dict), `random_state`, `n_jobs`, `presort`, `tree_method`,
+`max_bin`. `max_samples` follows
 scikit-learn: an int is the number of rows drawn per tree, a float is a
 fraction of `n_samples`, `None` means `n_samples`. After fitting:
 `estimators_` (list of `RDT`, individually introspectable),
@@ -205,7 +212,8 @@ early-stopping validation loss. Parameters: `n_estimators`, `task`, `loss` (clas
 `colsample_bytree`), `validation_fraction`, `n_iter_no_change` (alias
 `early_stopping_rounds`), `tol`, `reg_alpha`, `reg_lambda`,
 `scale_pos_weight` (binary only), `huber_delta`, `quantile_alpha`,
-`random_state`, `n_jobs`, `presort`, `split_criterion`, `max_delta_step`.
+`random_state`, `n_jobs`, `presort`, `split_criterion`, `max_delta_step`,
+`tree_method`, `max_bin`.
 Classification needs at least two classes in `y`.
 
 `split_criterion="newton"` grows each round's tree the XGBoost way: per-row
@@ -252,6 +260,37 @@ at a time). `decision_function`, `staged_decision_function` and
 - `visualize_d3_observable(model, y, feature_names=None, class_names=None, filename="rdt_tree_d3.html", width=1200, height=800) -> str` —
   render an interactive, collapsible D3.js tree to an HTML file (and return
   the HTML string).
+
+## Histogram split search (`tree_method="hist"`)
+
+`RDT`, `RandomForestRDT` and `GradientBoostingRDT` accept `tree_method="hist"`
+and `max_bin` (default 256, 2–65536):
+
+- **Binning**, once per `fit`, from the training rows with positive weight
+  (for gradient boosting, after the early-stopping split): a feature with at
+  most `max_bin` distinct values gets one bin per value, otherwise
+  approximately equal-count bins. All rows are binned and stored column-major
+  as `uint8` (`uint16` when a feature has more than 256 bins). `X` may be
+  float32 or float64, C or Fortran order, a strided view or an `np.memmap`:
+  it is read in place, a block of columns at a time — never copied — and not
+  read again after binning (boosting updates its training scores, and the
+  forest its OOB score, through the bins).
+- **Search:** at each depth, each feature's histograms for all of the depth's
+  nodes are built in one pass over its bin column and swept with the same
+  criterion arithmetic as the exact search (Gini, entropy, MSE, and the
+  gradient boosting criteria `friedman_mse` and `newton`); features are
+  scored in parallel when `n_jobs > 1` (a single tree, or a boosting round
+  with one tree), and the result does not depend on `n_jobs`.
+- **Thresholds:** a split between a node's adjacent non-empty bins uses the
+  exact search's threshold (the midpoint between the node's neighbouring
+  values), moved to a bin boundary only if a row outside the training rows
+  would otherwise be routed differently from its bin, so for every row of
+  the `X` passed to `fit`, `x <= threshold` exactly when the row's bin is on
+  the left. With at most `max_bin` distinct values per feature a hist model
+  is therefore the exact model (up to how a tie between equally good splits
+  is broken), including with row subsampling and bootstrap.
+- **Memory:** the bins (1 byte per value up to 256 bins, else 2) plus, per
+  feature, 40 bytes per bin; no presorted columns.
 
 ## Performance notes
 

@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <new>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -478,15 +477,15 @@ public:
         if (capacity_ < p + n) {
             const std::size_t a = HistCache::kAlign;
             const std::size_t cap = (std::max(p + n, capacity_ + capacity_ / 2) + a - 1) / a * a;
-            Buffer grown(static_cast<unsigned char*>(::operator new(cap, std::align_val_t{HistCache::kAlign})));
+            Buffer grown(cap);
             if (p > 0) {
-                std::copy(prev.base(), prev.base() + p, grown.get());
-                prev.bind(grown.get());
+                std::copy(prev.base(), prev.base() + p, grown.data());
+                prev.bind(grown.data());
             }
             buffer_ = std::move(grown);
             capacity_ = cap;
         }
-        unsigned char* start = buffer_.get();
+        unsigned char* start = buffer_.data();
         // Ends are kAlign-aligned: capacities and cache sizes are multiples of kAlign.
         if (p > 0 && prev.base() == start) {
             next.bind(start + capacity_ - n);
@@ -501,17 +500,29 @@ public:
         const std::size_t a = HistCache::kAlign;
         bytes = (bytes + a - 1) / a * a;
         if (capacity_ >= bytes) return;
-        buffer_.reset();
-        buffer_.reset(static_cast<unsigned char*>(::operator new(bytes, std::align_val_t{a})));
+        buffer_ = Buffer();
+        buffer_ = Buffer(bytes);
         capacity_ = bytes;
     }
     std::size_t capacity() const { return capacity_; }
 
 private:
-    struct AlignedFree {
-        void operator()(unsigned char* q) const { ::operator delete(q, std::align_val_t{HistCache::kAlign}); }
+    // `bytes` of uninitialized memory starting at a kAlign boundary
+    // (over-allocated rather than aligned operator new, which older macOS
+    // deployment targets lack).
+    class Buffer {
+    public:
+        Buffer() = default;
+        explicit Buffer(std::size_t bytes) : raw_(new unsigned char[bytes + HistCache::kAlign]) {
+            const auto addr = reinterpret_cast<std::uintptr_t>(raw_.get());
+            data_ = raw_.get() + (HistCache::kAlign - addr % HistCache::kAlign) % HistCache::kAlign;
+        }
+        unsigned char* data() const { return data_; }
+
+    private:
+        std::unique_ptr<unsigned char[]> raw_;
+        unsigned char* data_ = nullptr;
     };
-    using Buffer = std::unique_ptr<unsigned char, AlignedFree>;
     Buffer buffer_;
     std::size_t capacity_ = 0;
 };

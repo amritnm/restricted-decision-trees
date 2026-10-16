@@ -295,3 +295,26 @@ def test_feature_importances_are_normalised_total_gain():
         expected[f] += t.depth_improvements_[d]
     assert m.depth_features_[0] == t.depth_features_
     np.testing.assert_allclose(m.feature_importances_, expected / expected.sum(), rtol=1e-13)
+
+
+def test_version_dependent_corners_follow_xgboost_3_4():
+    # Two hand-computed cases where XGBoost 3.0-3.3 and >= 3.4 differ; the
+    # newton mode follows 3.4 (see test_newton_xgboost.py).
+    X = np.array([[0.0], [1.0]])
+    # max_delta_step > 0 with reg_alpha > 0. Parent G=-1, H=2: |G| <= alpha, w=0,
+    # score 0. Left G=-3, H=1: w = 2/2 = 1, clipped to 0.5, score
+    # -(2*-3*0.5 + 2*0.25 + 2*1*0.5) = 1.5. Right G=2, H=1: w = -0.5 (unclipped),
+    # score 0.5 = T(G)^2/(H+lambda). Gain 2.0 (3.0-3.3, without 2*alpha*|w|: 2.5 + 1.5 = 4.0).
+    p = dict(lam=1.0, alpha=1.0, gamma=0.0, mcw=0.0, mds=0.5)
+    t = _newton_tree(p, 1)
+    t.fit(X, np.array([-3.0, 2.0]), hessian=np.array([1.0, 1.0]))
+    assert t.depth_features_ == {0: 0}
+    assert t.depth_improvements_[0] == pytest.approx(2.0, rel=1e-15)
+    assert sorted(t.predict(X)) == pytest.approx([-0.5, 0.5], rel=1e-15)
+    # A root that cannot split (no child can reach min_child_weight) with
+    # H < min_child_weight keeps -T(G)/(H+lambda) (3.0-3.3: weight 0).
+    p = dict(lam=1.0, alpha=0.0, gamma=0.0, mcw=1.0, mds=0.0)
+    t = _newton_tree(p, 2)
+    t.fit(X, np.array([1.0, 0.5]), hessian=np.array([0.2, 0.2]))
+    assert t.depth_features_ == {} and t.root.is_leaf
+    assert t.root.value == pytest.approx(-1.5 / 1.4, rel=1e-15)

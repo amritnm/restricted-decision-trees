@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -258,6 +259,17 @@ public:
     const std::vector<RDTModel>& estimators() const { return trees_; }
     const std::vector<std::vector<std::uint32_t>>& feature_subsets() const { return feature_subsets_; }
     const std::vector<double>& feature_importances() const { return feature_importances_; }
+    // Per tree, the feature chosen at each depth as a column of the X passed
+    // to fit (each tree's own column indices mapped through its column subset).
+    std::vector<std::map<int, int>> depth_features() const {
+        std::vector<std::map<int, int>> out(trees_.size());
+        for (std::size_t t = 0; t < trees_.size(); ++t) {
+            for (const auto& kv : trees_[t].depth_features()) {
+                out[t][kv.first] = static_cast<int>(feature_subsets_[t][static_cast<std::size_t>(kv.second)]);
+            }
+        }
+        return out;
+    }
     double oob_score() const { return oob_score_; }
     bool has_oob_score() const { return params_.oob_score; }
     std::size_t n_features() const { return n_features_; }

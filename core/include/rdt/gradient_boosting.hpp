@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -89,6 +90,7 @@ public:
     GradientBoostingModel& operator=(GradientBoostingModel&&) = default;
 
     void fit(const MatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr) {
+        ++fit_generation_;
         n_features_ = X.n_cols();
         const std::size_t n = X.n_rows();
         classes_.clear();
@@ -292,25 +294,8 @@ public:
     }
 
     std::vector<double> predict(const MatrixView& X) const {
-        auto F = accumulate_scores(X);
-        if (params_.tree_params.task == Task::Regression) return F[0];
-
         std::vector<double> out(X.n_rows());
-        if (n_outputs_ == 1) { // binary
-            for (std::size_t i = 0; i < X.n_rows(); ++i) {
-                double p = positive_proba(F[0][i]);
-                out[i] = p >= 0.5 ? classes_[1] : classes_[0];
-            }
-        } else {
-            for (std::size_t i = 0; i < X.n_rows(); ++i) {
-                std::size_t best = 0;
-                double best_val = F[0][i];
-                for (std::size_t k = 1; k < n_outputs_; ++k) {
-                    if (F[k][i] > best_val) { best_val = F[k][i]; best = k; }
-                }
-                out[i] = classes_[best];
-            }
-        }
+        scores_to_labels(accumulate_scores(X), X.n_rows(), out.data());
         return out;
     }
 
@@ -328,12 +313,111 @@ public:
         scores_to_proba(accumulate_scores(X), X.n_rows(), out);
     }
 
+    // Raw scores (the init plus every round), row-major n_samples x
+    // n_outputs() -- scikit-learn's decision_function.
+    void decision_function_into(const MatrixView& X, double* out) const {
+        scores_to_decision(accumulate_scores(X), X.n_rows(), out);
+    }
+
+    // Staged prediction, one round at a time: F starts at
+    // init_score_matrix(n) and add_round(X, r, F) adds round r's trees for
+    // r = 0, 1, ..., n_estimators_fitted() - 1. Each F[k][i] receives exactly
+    // the operations accumulate_scores() performs, in the same order, so the
+    // last stage equals predict()/predict_proba() bit for bit.
+    std::vector<std::vector<double>> init_score_matrix(std::size_t n) const {
+        std::vector<std::vector<double>> F(n_outputs_, std::vector<double>(n));
+        for (std::size_t k = 0; k < n_outputs_; ++k) std::fill(F[k].begin(), F[k].end(), init_scores_[k]);
+        return F;
+    }
+
+    void add_round(const MatrixView& X, std::size_t round, std::vector<std::vector<double>>& F) const {
+        if (round >= rounds_fitted_) throw std::out_of_range("add_round: round out of range");
+        for (std::size_t k = 0; k < n_outputs_; ++k) {
+            const std::size_t t = round * n_outputs_ + k;
+            for (std::size_t i = 0; i < X.n_rows(); ++i) add_tree_score(t, X, i, F[k][i]);
+        }
+    }
+
+    // Raw scores F (n_outputs x n) -> row-major n x n_classes probabilities.
+    void scores_to_proba(const std::vector<std::vector<double>>& F, std::size_t n, double* out) const {
+        const std::size_t n_cls = classes_.size();
+        if (n_outputs_ == 1) {
+            for (std::size_t i = 0; i < n; ++i) {
+                double p1 = positive_proba(F[0][i]);
+                // v0.2.0 also wrote out[i][1] for single-class y, past the end of the row
+                // (fit now refuses fewer than 2 classes; the guards stay as cheap insurance).
+                if (n_cls > 0) out[i * n_cls + 0] = 1.0 - p1;
+                if (n_cls > 1) out[i * n_cls + 1] = p1;
+            }
+        } else {
+            std::vector<double> exp_vals(n_outputs_);
+            for (std::size_t i = 0; i < n; ++i) {
+                double max_f = F[0][i];
+                for (std::size_t k = 1; k < n_outputs_; ++k) max_f = std::max(max_f, F[k][i]);
+                double sum = 0.0;
+                for (std::size_t k = 0; k < n_outputs_; ++k) {
+                    exp_vals[k] = std::exp(F[k][i] - max_f);
+                    sum += exp_vals[k];
+                }
+                for (std::size_t k = 0; k < n_outputs_; ++k) out[i * n_cls + k] = exp_vals[k] / sum;
+            }
+        }
+    }
+
+    // Raw scores F -> predict()'s labels (classification) or values (regression), out[0..n).
+    void scores_to_labels(const std::vector<std::vector<double>>& F, std::size_t n, double* out) const {
+        if (params_.tree_params.task == Task::Regression) {
+            std::copy(F[0].begin(), F[0].begin() + static_cast<std::ptrdiff_t>(n), out);
+            return;
+        }
+        if (n_outputs_ == 1) { // binary
+            for (std::size_t i = 0; i < n; ++i) {
+                double p = positive_proba(F[0][i]);
+                out[i] = p >= 0.5 ? classes_[1] : classes_[0];
+            }
+        } else {
+            for (std::size_t i = 0; i < n; ++i) {
+                std::size_t best = 0;
+                double best_val = F[0][i];
+                for (std::size_t k = 1; k < n_outputs_; ++k) {
+                    if (F[k][i] > best_val) { best_val = F[k][i]; best = k; }
+                }
+                out[i] = classes_[best];
+            }
+        }
+    }
+
+    // Raw scores F (n_outputs x n) -> row-major n x n_outputs.
+    void scores_to_decision(const std::vector<std::vector<double>>& F, std::size_t n, double* out) const {
+        for (std::size_t i = 0; i < n; ++i) {
+            for (std::size_t k = 0; k < n_outputs_; ++k) out[i * n_outputs_ + k] = F[k][i];
+        }
+    }
+
     const std::vector<double>& classes() const { return classes_; }
     std::size_t n_classes() const { return classes_.size(); }
     const std::vector<double>& feature_importances() const { return feature_importances_; }
     const std::vector<double>& train_score() const { return train_score_; }
     std::size_t n_estimators_fitted() const { return rounds_fitted_; }
     std::size_t n_features() const { return n_features_; }
+    // Trees per round: 1 (binary, regression) or the number of classes.
+    std::size_t n_outputs() const { return n_outputs_; }
+    const std::vector<double>& init_scores() const { return init_scores_; }
+    // Incremented by every fit(); lets a staged iterator detect a refit.
+    std::uint64_t fit_generation() const { return fit_generation_; }
+
+    // Per tree (round-major, as trees are fitted), the feature chosen at
+    // each depth as a column of the X passed to fit (each tree's own column
+    // indices mapped through its column subset).
+    std::vector<std::map<int, int>> depth_features() const {
+        std::vector<std::map<int, int>> out(trees_.size());
+        for (std::size_t t = 0; t < trees_.size(); ++t) {
+            for (const auto& kv : trees_[t].depth_features()) {
+                out[t][kv.first] = static_cast<int>(feature_subsets_[t][static_cast<std::size_t>(kv.second)]);
+            }
+        }
+        return out;
+    }
 
 private:
     GBParams params_;
@@ -346,6 +430,7 @@ private:
     std::vector<double> feature_importances_;
     std::vector<double> train_score_;
     std::size_t rounds_fitted_ = 0;
+    std::uint64_t fit_generation_ = 0;
 
     std::vector<std::vector<double>> encode_targets(const VectorView& y, std::size_t n,
                                                       bool is_classification, std::size_t n_outputs) const {
@@ -559,32 +644,6 @@ private:
         for (double& v : values) v = shrink_leaf_value(v);
     }
 
-    // Raw scores F (n_outputs x n) -> row-major n x n_classes probabilities.
-    void scores_to_proba(const std::vector<std::vector<double>>& F, std::size_t n, double* out) const {
-        const std::size_t n_cls = classes_.size();
-        if (n_outputs_ == 1) {
-            for (std::size_t i = 0; i < n; ++i) {
-                double p1 = positive_proba(F[0][i]);
-                // v0.2.0 also wrote out[i][1] for single-class y, past the end of the row
-                // (fit now refuses fewer than 2 classes; the guards stay as cheap insurance).
-                if (n_cls > 0) out[i * n_cls + 0] = 1.0 - p1;
-                if (n_cls > 1) out[i * n_cls + 1] = p1;
-            }
-        } else {
-            std::vector<double> exp_vals(n_outputs_);
-            for (std::size_t i = 0; i < n; ++i) {
-                double max_f = F[0][i];
-                for (std::size_t k = 1; k < n_outputs_; ++k) max_f = std::max(max_f, F[k][i]);
-                double sum = 0.0;
-                for (std::size_t k = 0; k < n_outputs_; ++k) {
-                    exp_vals[k] = std::exp(F[k][i] - max_f);
-                    sum += exp_vals[k];
-                }
-                for (std::size_t k = 0; k < n_outputs_; ++k) out[i * n_cls + k] = exp_vals[k] / sum;
-            }
-        }
-    }
-
     static double sigmoid_like(double f) { return 1.0 / (1.0 + std::exp(-f)); }
 
     // P(positive class) from a binary raw score. The exponential loss's raw
@@ -648,24 +707,24 @@ private:
         return total_weight > 0.0 ? weighted_total / total_weight : 0.0;
     }
 
-    // Raw scores of every fitted tree, predicting through each tree's column
-    // subset (no copy of X). Rows are processed in blocks across all trees;
-    // each F[k][i] still accumulates trees in round order.
+    // F += learning_rate * (tree t's raw score for row i of X), predicting
+    // through the tree's column subset (no copy of X). The one place a tree's
+    // contribution is added, shared by predict and the staged predictions.
+    void add_tree_score(std::size_t t, const MatrixView& X, std::size_t i, double& F) const {
+        double raw = shrink_leaf_value(trees_[t].find_leaf(X, i, feature_subsets_[t].data())->value);
+        F += params_.learning_rate * raw;
+    }
+
+    // Raw scores of every fitted tree. Rows are processed in blocks across
+    // all trees; each F[k][i] still accumulates trees in round order.
     std::vector<std::vector<double>> accumulate_scores(const MatrixView& X) const {
         const std::size_t n = X.n_rows();
-        std::vector<std::vector<double>> F(n_outputs_, std::vector<double>(n));
-        for (std::size_t k = 0; k < n_outputs_; ++k) {
-            std::fill(F[k].begin(), F[k].end(), init_scores_[k]);
-        }
+        std::vector<std::vector<double>> F = init_score_matrix(n);
         for (std::size_t b = 0; b < n; b += kPredictRowBlock) {
             const std::size_t e = std::min(n, b + kPredictRowBlock);
             for (std::size_t t = 0; t < trees_.size(); ++t) {
                 std::size_t k = t % n_outputs_;
-                const std::uint32_t* cols = feature_subsets_[t].data();
-                for (std::size_t i = b; i < e; ++i) {
-                    double raw = shrink_leaf_value(trees_[t].find_leaf(X, i, cols)->value);
-                    F[k][i] += params_.learning_rate * raw;
-                }
+                for (std::size_t i = b; i < e; ++i) add_tree_score(t, X, i, F[k][i]);
             }
         }
         return F;

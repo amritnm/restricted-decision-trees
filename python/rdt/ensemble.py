@@ -176,6 +176,11 @@ class RandomForestRDT:
         compatible with rdt.visualize) and independently usable for
         prediction on data pre-restricted to that tree's own feature subset.
     feature_importances_ : ndarray of shape (n_features,)
+    depth_features_ : list of dict
+        One dict per tree, ``{depth: feature}``, the feature chosen at each
+        depth as a column index of the ``X`` passed to ``fit`` (each tree's
+        own column indices, as in ``estimators_[i].depth_features_``, mapped
+        through its column subset).
     oob_score_ : float
         Only set if oob_score=True.
     """
@@ -233,6 +238,7 @@ class RandomForestRDT:
 
         self.estimators_: List[RDT] = []
         self.feature_importances_ = None
+        self.depth_features_ = None
         self.oob_score_ = None
         self.n_features_ = None
         self.n_classes_ = None
@@ -265,6 +271,7 @@ class RandomForestRDT:
         self._model = model
 
         self.feature_importances_ = np.array(self._model.feature_importances_)
+        self.depth_features_ = [dict(d) for d in self._model.depth_features_]
         if self.oob_score:
             self.oob_score_ = self._model.oob_score_
 
@@ -374,6 +381,16 @@ class GradientBoostingRDT:
     n_estimators_ : int
         Rounds actually fitted -- less than ``n_estimators`` if early
         stopping triggered.
+    depth_features_ : list of dict
+        One dict per tree, ``{depth: feature}``, in the order the trees were
+        fitted (round by round; a multiclass round fits one tree per class, in
+        ``classes_`` order). Features are column indices of the ``X`` passed
+        to ``fit`` (mapped through each tree's column subset).
+
+    Staged predictions (``staged_decision_function``,
+    ``staged_predict_proba``, ``staged_predict``) yield one array per fitted
+    round (``n_estimators_`` of them), each a new array; the last equals
+    ``decision_function`` / ``predict_proba`` / ``predict`` exactly.
     """
 
     def __init__(
@@ -446,6 +463,7 @@ class GradientBoostingRDT:
         self.feature_importances_ = None
         self.train_score_ = None
         self.n_estimators_ = None
+        self.depth_features_ = None
         self.n_features_ = None
         self.n_classes_ = None
         self.classes_ = None
@@ -493,18 +511,61 @@ class GradientBoostingRDT:
         self.feature_importances_ = np.array(self._model.feature_importances_)
         self.train_score_ = np.array(self._model.train_score_)
         self.n_estimators_ = self._model.n_estimators_fitted_
+        self.depth_features_ = [dict(d) for d in self._model.depth_features_]
         return self
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def _check_predict_X(self, X, classification_only: bool = False, what: str = "") -> np.ndarray:
+        if classification_only and self.task != "classification":
+            raise ValueError(f"{what} only available for classification")
         if self._model is None:
             raise ValueError("Model not fitted yet. Call fit() first.")
-        X = check_X(X, self.n_features_)
+        return check_X(X, self.n_features_)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        X = self._check_predict_X(X)
         return np.array(self._model.predict(X))
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        if self.task != "classification":
-            raise ValueError("predict_proba only available for classification")
-        if self._model is None:
-            raise ValueError("Model not fitted yet. Call fit() first.")
-        X = check_X(X, self.n_features_)
+        X = self._check_predict_X(X, True, "predict_proba")
         return np.array(self._model.predict_proba(X))
+
+    def decision_function(self, X: np.ndarray) -> np.ndarray:
+        """Raw scores (the initial score plus every round's trees, before the
+        link function), as scikit-learn's ``decision_function``: shape
+        ``(n_samples,)`` for binary classification (the positive class's
+        log-odds; half of it for ``loss='exponential'``),
+        ``(n_samples, n_classes)`` for multiclass. Classification only."""
+        X = self._check_predict_X(X, True, "decision_function")
+        return np.asarray(self._model.decision_function(X))
+
+    def staged_decision_function(self, X: np.ndarray):
+        """Yield ``decision_function(X)`` after each fitted round (one array
+        per round, ``n_estimators_`` in total, each a new array; the last
+        equals ``decision_function(X)``). Classification only. ``X`` is
+        validated before the first stage is computed."""
+        X = self._check_predict_X(X, True, "staged_decision_function")
+        return self._staged(X, "decision")
+
+    def staged_predict_proba(self, X: np.ndarray):
+        """Yield ``predict_proba(X)`` after each fitted round (see
+        ``staged_decision_function``)."""
+        X = self._check_predict_X(X, True, "staged_predict_proba")
+        return self._staged(X, "proba")
+
+    def staged_predict(self, X: np.ndarray):
+        """Yield ``predict(X)`` after each fitted round (see
+        ``staged_decision_function``); also available for regression."""
+        X = self._check_predict_X(X)
+        return self._staged(X, "predict")
+
+    def _staged(self, X: np.ndarray, kind: str):
+        # The native iterator is created here, at the staged_* call (not at
+        # the first next()), and holds the native model current now, so a
+        # later fit() of this estimator does not change what it yields. It
+        # adds one round per step (GIL released) and returns a fresh array
+        # each time; the generator around it refuses concurrent re-entry.
+        return _iterate(self._model._staged(X, kind))
+
+
+def _iterate(iterator):
+    yield from iterator

@@ -180,7 +180,10 @@ Bagging ensemble: `n_estimators`, `task`, `criterion`, `max_depth`,
 scikit-learn: an int is the number of rows drawn per tree, a float is a
 fraction of `n_samples`, `None` means `n_samples`. After fitting:
 `estimators_` (list of `RDT`, individually introspectable),
-`feature_importances_`, `oob_score_` (if requested).
+`feature_importances_`, `oob_score_` (if requested), `depth_features_` (one
+`{depth: feature}` dict per tree, with features as column indices of the `X`
+passed to `fit` -- each tree's own indices, as in
+`estimators_[i].depth_features_`, mapped through its column subset).
 
 ### `rdt.ensemble.GradientBoostingRDT`
 
@@ -203,7 +206,19 @@ early-stopping validation loss. Parameters: `n_estimators`, `task`, `loss` (clas
 `random_state`, `n_jobs`, `presort`. Classification needs at least two classes in
 `y`. After fitting: `feature_importances_`,
 `train_score_` (loss per round), `n_estimators_` (rounds actually fitted —
-less than `n_estimators` if early stopping triggered).
+less than `n_estimators` if early stopping triggered), `depth_features_` (one
+`{depth: feature}` dict per tree in fitting order, a multiclass round
+contributing one tree per class; features are columns of `X`).
+
+Methods: `predict`, `predict_proba` and, as in scikit-learn,
+`decision_function(X)` (raw scores: shape `(n_samples,)` for binary
+classification, `(n_samples, n_classes)` for multiclass),
+`staged_decision_function(X)`, `staged_predict_proba(X)` and
+`staged_predict(X)` (generators yielding one new array per fitted round —
+`n_estimators_` of them, respecting early stopping — whose last stage equals
+the non-staged method exactly; the stages are accumulated natively, one round
+at a time). `decision_function`, `staged_decision_function` and
+`staged_predict_proba` are classification only.
 
 ### `rdt.visualize`
 

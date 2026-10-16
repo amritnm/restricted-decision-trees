@@ -291,12 +291,35 @@ weight: one bin per distinct value when there are at most `max_bin` of them,
 otherwise approximately equal-count bins (boundaries only between distinct
 values). Bin `b`'s upper cut is the guarded midpoint between the largest
 training value in bin `b` and the smallest in bin `b + 1`; every row's bin is
-the number of cuts below its value. At each depth, for each feature, one pass
-over the bin column accumulates every node's per-bin statistics (class
-weights; centred `w·d`, `w·d²`, `w` for MSE; `G`, `H` for Newton), and each
-node's bins are swept left to right with the same candidate rule (between
-non-empty bins), `min_samples_leaf` test, impurity / gain expressions and
-tie order as the exact search. A split between a node's adjacent non-empty
+the number of cuts below its value; the bins are stored in row blocks of 16
+features (a row's bins of a block side by side). The tree keeps its rows
+partitioned by node — each node's rows contiguous and in row order, a split
+node's range divided between its children by a stable partition — so at each
+depth a node's per-bin statistics (class weights; centred `w·d`, `w·d²`, `w`
+for MSE; `G`, `H` for Newton) are accumulated over its own rows, for the 16
+features of a block in one pass, and each node's bins are swept left to right
+with the same candidate rule (between non-empty bins), `min_samples_leaf`
+test, impurity / gain expressions and tie order as the exact search. Every
+(node, bin) sums its rows in row order, as the one-pass-per-feature build of
+earlier versions did, so the result is the same bit for bit.
+
+With histogram subtraction (`hist_subtraction`, the default), at each depth
+below the root a feature's histograms are built only for the smaller child of
+each split node (by row count; the left child on a tie) and the other child's
+are the parent's minus that child's, bin by bin — for the features whose
+parent histograms were kept: those scored at both depths (with
+`colsample_bylevel < 1` the next depth's candidates are drawn one depth early,
+from the same sequence of draws), in candidate order while the kept histograms
+of the current and the previous depth fit in `max_hist_cache_mb`. A child that
+is not split itself (a leaf) may still be built when it is the smaller one.
+MSE statistics are centred at the node's own weighted mean, which differs
+between a parent and its children: below the root they are accumulated
+centred at the parent's mean and re-centred to the node's before the sweep
+(`Σw(y−c')² = Σw(y−c)² − 2δΣw(y−c) + δ²Σw`, `δ = c' − c`). Derived sums are
+rounded differently from directly built ones (class weights excepted when
+every weight is 1: counts subtract exactly), so a split score can change in
+its last bits and an exact tie between two splits may be decided the other
+way; `hist_subtraction=False` builds every histogram directly. A split between a node's adjacent non-empty
 bins `lo < hi` gets the threshold `split_threshold(max training value of bin
 lo, min training value of bin hi)` — the exact search's threshold whenever
 every bin holds one value — moved to the nearest bin boundary when a row
@@ -305,8 +328,14 @@ threshold would cut, so that for every row of `X`, `x <= threshold` exactly
 when its bin is `<= split_bin`. Training scores (and the forest's OOB votes)
 are routed through the bins; `X` is not read after binning.
 
-Cost per depth: `O(m * n)` to build the histograms plus `O(m * nodes * max_bin)`
-to sweep them; binning costs one sort per feature over the training rows.
+Cost per depth: `O(m * n)` to build the histograms (`O(m * n_smaller)` with
+subtraction, where `n_smaller` sums the smaller child of each split, typically
+a third of `n`) plus `O(m * nodes * max_bin)` to sweep (and subtract) them;
+binning costs one sort per feature over the training rows. Memory for the
+subtraction cache: `nodes * sum over kept features of bins * (8 * stats + 4)`
+bytes per depth (`stats` = 2 for Newton, 3 for MSE, the number of classes for
+Gini / entropy), the current and the previous depth's together at most
+`max_hist_cache_mb`.
 
 ## Complexity
 

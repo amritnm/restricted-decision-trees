@@ -5,6 +5,8 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include <cmath>
+#include <limits>
 #include <map>
 
 #include <mutex>
@@ -271,6 +273,13 @@ nb::list level_maps_to_list(const std::vector<std::map<int, std::vector<std::uin
     return out;
 }
 
+// max_hist_cache_mb (MiB) as TreeParams::max_hist_cache_bytes.
+std::size_t hist_cache_bytes(double mb) {
+    if (!(mb >= 0.0) || !std::isfinite(mb)) throw std::invalid_argument("max_hist_cache_mb must be a finite number >= 0");
+    const double bytes = mb * 1048576.0;
+    return bytes >= 9.0e18 ? std::numeric_limits<std::size_t>::max() : static_cast<std::size_t>(bytes);
+}
+
 void check_colsample_bylevel(double v) {
     if (!(v > 0.0 && v <= 1.0)) throw std::invalid_argument("colsample_bylevel must be in (0, 1]");
 }
@@ -388,8 +397,10 @@ NB_MODULE(_rdt_native, m) {
                           int min_samples_split, int min_samples_leaf, double min_impurity_decrease,
                           bool presort, double reg_lambda, double reg_alpha, double gamma,
                           double min_child_weight, double max_delta_step, std::string tree_method, int max_bin,
-                          int n_jobs) {
+                          int n_jobs, bool hist_subtraction, double max_hist_cache_mb) {
                  TreeParams p;
+                 p.hist_subtraction = hist_subtraction;
+                 p.max_hist_cache_bytes = hist_cache_bytes(max_hist_cache_mb);
                  p.tree_method = tree_method_from_string(tree_method);
                  check_max_bin(max_bin);
                  p.max_bin = max_bin;
@@ -411,7 +422,7 @@ NB_MODULE(_rdt_native, m) {
              "task"_a, "criterion"_a, "max_depth"_a, "min_samples_split"_a, "min_samples_leaf"_a,
              "min_impurity_decrease"_a = 0.0, "presort"_a = true, "reg_lambda"_a = 1.0, "reg_alpha"_a = 0.0,
              "gamma"_a = 0.0, "min_child_weight"_a = 1.0, "max_delta_step"_a = 0.0, "tree_method"_a = "exact",
-             "max_bin"_a = 256, "n_jobs"_a = 1)
+             "max_bin"_a = 256, "n_jobs"_a = 1, "hist_subtraction"_a = true, "max_hist_cache_mb"_a = 1024.0)
         .def("fit",
              [](RDTModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight,
                 std::optional<InputVector> hessian) { fit_tree_released(self, X, y, sample_weight, hessian); },
@@ -525,8 +536,10 @@ NB_MODULE(_rdt_native, m) {
                           int n_estimators, MaxFeaturesSpec max_features, bool bootstrap,
                           double max_samples, bool oob_score, std::uint64_t random_state, int n_jobs,
                           std::uint32_t max_samples_count, bool presort, std::string tree_method, int max_bin,
-                          double colsample_bylevel) {
+                          double colsample_bylevel, bool hist_subtraction, double max_hist_cache_mb) {
                  ForestParams p;
+                 p.tree_params.hist_subtraction = hist_subtraction;
+                 p.tree_params.max_hist_cache_bytes = hist_cache_bytes(max_hist_cache_mb);
                  check_colsample_bylevel(colsample_bylevel);
                  p.tree_params.colsample_bylevel = colsample_bylevel;
                  p.tree_params.tree_method = tree_method_from_string(tree_method);
@@ -552,7 +565,8 @@ NB_MODULE(_rdt_native, m) {
              "task"_a, "criterion"_a, "max_depth"_a, "min_samples_split"_a, "min_samples_leaf"_a,
              "min_impurity_decrease"_a, "n_estimators"_a, "max_features"_a, "bootstrap"_a,
              "max_samples"_a, "oob_score"_a, "random_state"_a, "n_jobs"_a, "max_samples_count"_a = 0,
-             "presort"_a = true, "tree_method"_a = "exact", "max_bin"_a = 256, "colsample_bylevel"_a = 1.0)
+             "presort"_a = true, "tree_method"_a = "exact", "max_bin"_a = 256, "colsample_bylevel"_a = 1.0,
+             "hist_subtraction"_a = true, "max_hist_cache_mb"_a = 1024.0)
         .def("fit",
              [](RandomForestModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
                  fit_released(self, X, y, sample_weight);
@@ -614,8 +628,11 @@ NB_MODULE(_rdt_native, m) {
                           double tol, double reg_alpha, double reg_lambda, double huber_delta,
                           double quantile_alpha, std::uint64_t random_state, int n_jobs, bool presort,
                           std::string split_criterion, double min_child_weight, double max_delta_step,
-                          std::string tree_method, int max_bin, double colsample_bylevel) {
+                          std::string tree_method, int max_bin, double colsample_bylevel, bool hist_subtraction,
+                          double max_hist_cache_mb) {
                  GBParams p;
+                 p.tree_params.hist_subtraction = hist_subtraction;
+                 p.tree_params.max_hist_cache_bytes = hist_cache_bytes(max_hist_cache_mb);
                  check_colsample_bylevel(colsample_bylevel);
                  p.tree_params.colsample_bylevel = colsample_bylevel;
                  p.tree_params.tree_method = tree_method_from_string(tree_method);
@@ -651,7 +668,8 @@ NB_MODULE(_rdt_native, m) {
              "max_features"_a, "validation_fraction"_a, "n_iter_no_change"_a, "tol"_a,
              "reg_alpha"_a, "reg_lambda"_a, "huber_delta"_a, "quantile_alpha"_a, "random_state"_a, "n_jobs"_a,
              "presort"_a = true, "split_criterion"_a = "friedman_mse", "min_child_weight"_a = 1.0,
-             "max_delta_step"_a = 0.0, "tree_method"_a = "exact", "max_bin"_a = 256, "colsample_bylevel"_a = 1.0)
+             "max_delta_step"_a = 0.0, "tree_method"_a = "exact", "max_bin"_a = 256, "colsample_bylevel"_a = 1.0,
+             "hist_subtraction"_a = true, "max_hist_cache_mb"_a = 1024.0)
         .def("fit",
              [](GradientBoostingModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
                  fit_released(self, X, y, sample_weight);
@@ -703,6 +721,25 @@ NB_MODULE(_rdt_native, m) {
         .def_prop_ro("depth_features_",
                       [](const GradientBoostingModel& self) {
                           return read(self, [](auto& m) { return int_maps_to_list(m.depth_features()); });
+                      })
+        // Test / introspection helper: fitted tree t (round-major), its
+        // features indexing the tree's column subset.
+        .def(
+            "_tree",
+            [](const GradientBoostingModel& self, std::size_t t) -> const RDTModel* {
+                return read(self, [&](auto& m) -> const RDTModel* {
+                    if (t >= m.trees().size()) throw nb::index_error("tree index out of range");
+                    return &m.trees()[t];
+                });
+            },
+            "t"_a, nb::rv_policy::reference_internal)
+        .def_prop_ro("depth_improvements_",
+                      [](const GradientBoostingModel& self) {
+                          return read(self, [](auto& m) {
+                              nb::list out;
+                              for (const auto& d : m.depth_improvements()) out.append(double_map_to_dict(d));
+                              return out;
+                          });
                       })
         .def_prop_ro("classes_",
                       [](const GradientBoostingModel& self) {

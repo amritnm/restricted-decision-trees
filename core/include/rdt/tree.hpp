@@ -754,6 +754,7 @@ private:
         const double root_weight = total_weight(root_indices.data(), m, sample_weight);
         const bool classification = params_.task == Task::Classification;
         const bool mse = params_.criterion == Criterion::MSE;
+        const bool subtraction = params_.hist_subtraction;
 
         // Each row's class index (classification).
         std::vector<std::int32_t> row_class;
@@ -786,19 +787,26 @@ private:
             Node* node;
             std::size_t begin, end; // entries of the row arrays
             std::int32_t parent;    // index of its parent among the previous depth's scored nodes
+            double parent_center;   // MSE: the parent's weighted mean
         };
         auto keep_indices = [&](Node& node, const std::uint32_t* rows, std::size_t n) {
             node.has_indices = params_.retain_indices;
             if (params_.retain_indices) node.indices.assign(rows, rows + n);
         };
         keep_indices(*root, vrow[0].data(), m);
-        std::vector<LevelNode> level = {{root.get(), 0, m, -1}};
+        std::vector<LevelNode> level = {{root.get(), 0, m, -1, 0.0}};
         auto level_size = [&](std::size_t l) { return level[l].end - level[l].begin; };
         auto leaf = [&](const LevelNode& ln) {
             make_leaf(*ln.node, vrow[cur].data() + ln.begin, ln.end - ln.begin, y, sample_weight);
         };
 
         LevelSampler level_sampler(params_, n_features_);
+        // Histogram subtraction: the next depth's candidates (drawn one depth
+        // early, from the same sequence of draws) and the cached histograms of
+        // the previous depth's scored nodes.
+        std::vector<std::uint32_t> next_candidates;
+        bool have_next = false;
+        HistCache prev_cache;
         std::vector<std::vector<HistSplit>> results;
         for (int depth = 0; depth < params_.max_depth; ++depth) {
             if (level.empty()) break;
@@ -825,10 +833,15 @@ private:
                 scored.push_back(l);
             }
             if (scored.empty()) break;
-            const std::vector<std::uint32_t> candidates = level_sampler.next();
+            const std::vector<std::uint32_t> candidates = have_next ? std::move(next_candidates) : level_sampler.next();
+            have_next = false;
             ++n_searched_depths_;
             const std::size_t K = scored.size();
             auto scored_size = [&](std::size_t k) { return level_size(scored[k]); };
+            // Subtraction below the root: statistics centred at the parent's
+            // mean (MSE), and computed for unscored siblings as well, which a
+            // group may build to derive its scored child.
+            const bool sub_depth = subtraction && depth > 0;
 
             // The scored nodes' per-entry statistics (as HistDepth describes
             // them) and per-node totals, both in row order, and each node's
@@ -848,8 +861,19 @@ private:
                     center[k] = wsum > 0.0 ? raw / wsum : 0.0;
                 });
             }
-            const std::vector<RowBlock> stat_blocks = row_blocks(K, [&](std::size_t k) {
-                return std::make_pair(level[scored[k]].begin, level[scored[k]].end);
+            // The level nodes whose entries get statistics: the scored ones,
+            // and with subtraction every node (siblings of scored ones).
+            std::vector<std::size_t> stat_nodes;
+            for (std::size_t l = 0; l < level.size(); ++l) {
+                if (scored_index[l] >= 0 || sub_depth) stat_nodes.push_back(l);
+            }
+            // MSE: the centre of each level node's statistics.
+            std::vector<double> stat_center(mse ? level.size() : 0, 0.0);
+            for (std::size_t l = 0; mse && l < level.size(); ++l) {
+                stat_center[l] = sub_depth ? level[l].parent_center : scored_index[l] >= 0 ? center[scored_index[l]] : 0.0;
+            }
+            const std::vector<RowBlock> stat_blocks = row_blocks(stat_nodes.size(), [&](std::size_t i) {
+                return std::make_pair(level[stat_nodes[i]].begin, level[stat_nodes[i]].end);
             });
             run_balanced(pool, stat_blocks.size(), [&](std::size_t b) { return stat_blocks[b].end - stat_blocks[b].begin; },
                          [&](std::size_t b) {
@@ -861,7 +885,7 @@ private:
                         stat[2 * e + 1] = (*hessian_)[i];
                     } else if (mse) {
                         const double wi = sample_weight ? (*sample_weight)[i] : 1.0;
-                        const double d = y[i] - center[rb.item];
+                        const double d = y[i] - stat_center[stat_nodes[rb.item]];
                         stat[3 * e] = wi * d;
                         stat[3 * e + 1] = wi * d * d;
                         stat[3 * e + 2] = wi;
@@ -878,6 +902,15 @@ private:
                 double* t = totals.data() + k * S;
                 if (classification) {
                     for (std::size_t e = ln.begin; e < ln.end; ++e) t[static_cast<std::size_t>(cls[e])] += stat[e];
+                } else if (mse && sub_depth) {
+                    // The statistics are centred at the parent's mean; the
+                    // totals at the node's own, as without subtraction.
+                    for (std::size_t e = ln.begin; e < ln.end; ++e) {
+                        const double wi = sample_weight ? (*sample_weight)[V[e]] : 1.0;
+                        const double d = y[V[e]] - center[k];
+                        const double s[3] = {wi * d, wi * d * d, wi};
+                        for (std::size_t si = 0; si < 3; ++si) t[si] += s[si];
+                    }
                 } else {
                     for (std::size_t e = ln.begin; e < ln.end; ++e) {
                         for (std::size_t s = 0; s < S; ++s) t[s] += stat[e * S + s];
@@ -904,8 +937,36 @@ private:
                 }
                 if (g.node[0] >= 0 || g.node[1] >= 0) hd.groups.push_back(g);
             }
+            if (mse && sub_depth) {
+                hd.recenter.resize(K);
+                for (std::size_t k = 0; k < K; ++k) hd.recenter[k] = center[k] - level[scored[k]].parent_center;
+            }
+            // The histograms to keep for the next depth: candidates that are
+            // also candidates there, in candidate order, while the two depths'
+            // caches together fit in the budget.
+            HistCache next_cache;
+            const bool keep = subtraction && depth + 1 < params_.max_depth;
+            if (keep) {
+                next_candidates = level_sampler.next();
+                have_next = true;
+                next_cache = HistCache(n_features_, K, S);
+                std::vector<char> is_next(n_features_, 0);
+                for (std::uint32_t f : next_candidates) is_next[f] = 1;
+                const std::size_t budget = params_.max_hist_cache_bytes;
+                std::size_t used = prev_cache.bytes();
+                for (std::uint32_t f : candidates) {
+                    const std::size_t nb = X.m->n_bins(X.col(f));
+                    const std::size_t b = HistCache::bytes_for(K, nb, S);
+                    if (!is_next[f] || nb < 2 || used > budget || b > budget - used) continue;
+                    next_cache.add(f, nb);
+                    used += b;
+                }
+                next_cache.allocate();
+            }
             scanner.begin_depth(std::move(sizes), std::move(totals));
-            scanner.score(X, hd, candidates, results, pool);
+            scanner.score(X, hd, candidates, sub_depth ? &prev_cache : nullptr, keep ? &next_cache : nullptr, results,
+                          pool);
+            prev_cache = std::move(next_cache);
 
             // The depth's choice, reduced in candidate order.
             DepthChoice best;
@@ -1015,8 +1076,9 @@ private:
                 node->left->n_samples = n_left;
                 node->right = std::make_unique<Node>();
                 node->right->n_samples = n - n_left;
-                next_level.push_back({node->left.get(), ln.begin, ln.begin + n_left, static_cast<std::int32_t>(k)});
-                next_level.push_back({node->right.get(), ln.begin + n_left, ln.end, static_cast<std::int32_t>(k)});
+                const double c = mse ? center[k] : 0.0;
+                next_level.push_back({node->left.get(), ln.begin, ln.begin + n_left, static_cast<std::int32_t>(k), c});
+                next_level.push_back({node->right.get(), ln.begin + n_left, ln.end, static_cast<std::int32_t>(k), c});
             }
             run_balanced(pool, leaves.size(), [&](std::size_t i) { return scored_size(leaves[i]); },
                          [&](std::size_t i) { leaf(level[scored[leaves[i]]]); });

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -46,6 +47,13 @@
 // summed in row order. Features are scored in parallel; each (feature, node)
 // result is computed by one thread and the depth's choice is reduced in
 // feature order, so results do not depend on the number of threads.
+//
+// Subtraction (TreeParams::hist_subtraction). Below the root, a feature whose
+// histograms of the previous depth were kept (HistCache) is built only for
+// the smaller child of each split, and the sibling's histogram is the
+// parent's minus that child's. Derived sums are rounded differently from
+// directly built ones, so split scores may differ in their last bits from the
+// direct build (exactly equal for unit-weight class counts).
 //
 // Thresholds. A split between a node's adjacent non-empty bins lo < hi gets
 // the exact search's threshold, the guarded midpoint of the largest training
@@ -379,14 +387,78 @@ struct HistGroup {
 
 // One depth's rows as the tree prepares them (RDTModel::build_tree_hist):
 // entry e is bin-matrix row mrow[e] with statistics stat[e * row_stats() ..]
-// (Newton: g, h; MSE: w*d, w*d^2, w centred at the node's mean;
-// classification: the weight, and the class in cls[e]).
+// (Newton: g, h; MSE: w*d, w*d^2, w with d = y - c; classification: the
+// weight, and the class in cls[e]). MSE centres c at the node's own weighted
+// mean, or -- with histogram subtraction, below the root -- at its parent's,
+// and recenter[k] (when not empty) is node k's mean minus its parent's.
 struct HistDepth {
     const std::uint32_t* mrow = nullptr;
     const double* stat = nullptr;
     const std::int32_t* cls = nullptr;
     std::vector<HistGroup> groups;
     std::size_t n_nodes = 0;
+    std::vector<double> recenter;
+};
+
+// Histogram subtraction (TreeParams::hist_subtraction): one depth's scored
+// nodes' histograms of some features, kept so the next depth can derive a
+// child's histogram as parent - sibling. The features are added first, then
+// allocate() makes one buffer for all of them (so freeing it returns the
+// memory); each feature's histograms are filled by the task that scores it.
+class HistCache {
+public:
+    HistCache() = default;
+    HistCache(std::size_t n_features, std::size_t n_nodes, std::size_t n_stats)
+        : slot_(n_features, -1), n_nodes_(n_nodes), n_stats_(n_stats) {}
+
+    // Bytes the histograms of n_nodes nodes of a feature with n_bins bins take.
+    static std::size_t bytes_for(std::size_t n_nodes, std::size_t n_bins, std::size_t n_stats) {
+        return n_nodes * n_bins * (n_stats * sizeof(double) + sizeof(std::uint32_t));
+    }
+    void add(std::size_t feature, std::size_t n_bins) {
+        slot_[feature] = static_cast<std::int32_t>(entries_.size());
+        // Each feature's histograms start on their own cache line: the
+        // scoring threads write different features concurrently.
+        const std::size_t bytes = (bytes_for(n_nodes_, n_bins, n_stats_) + kAlign - 1) / kAlign * kAlign;
+        entries_.push_back(Entry{n_bins, bytes_, nullptr, nullptr});
+        bytes_ += bytes;
+    }
+    void allocate() {
+        if (bytes_ == 0) return;
+        buffer_.reset(static_cast<unsigned char*>(::operator new(bytes_, std::align_val_t{kAlign})));
+        for (Entry& e : entries_) {
+            e.hist = reinterpret_cast<double*>(buffer_.get() + e.offset);
+            e.count = reinterpret_cast<std::uint32_t*>(buffer_.get() + e.offset +
+                                                       n_nodes_ * e.n_bins * n_stats_ * sizeof(double));
+        }
+    }
+    // The feature's slot, or -1 when it is not kept.
+    std::int32_t slot(std::size_t feature) const { return slot_.empty() ? -1 : slot_[feature]; }
+    std::size_t bytes() const { return bytes_; }
+    double* hist(std::int32_t slot, std::size_t node) const {
+        const Entry& e = entries_[static_cast<std::size_t>(slot)];
+        return e.hist + node * e.n_bins * n_stats_;
+    }
+    std::uint32_t* count(std::int32_t slot, std::size_t node) const {
+        const Entry& e = entries_[static_cast<std::size_t>(slot)];
+        return e.count + node * e.n_bins;
+    }
+
+private:
+    static constexpr std::size_t kAlign = 128; // a cache line (two on x86)
+    struct AlignedFree {
+        void operator()(unsigned char* p) const { ::operator delete(p, std::align_val_t{kAlign}); }
+    };
+    struct Entry {
+        std::size_t n_bins;
+        std::size_t offset;
+        double* hist;
+        std::uint32_t* count;
+    };
+    std::vector<std::int32_t> slot_; // per feature of the tree's view
+    std::vector<Entry> entries_;
+    std::unique_ptr<unsigned char, AlignedFree> buffer_;
+    std::size_t n_nodes_ = 0, n_stats_ = 0, bytes_ = 0;
 };
 
 class HistScanner {
@@ -420,8 +492,12 @@ public:
 
     // Every candidate's best split for every scored node of the depth:
     // results[i][k] for candidates[i] (a column of X's view) and node k.
+    // `prev` (may be nullptr): the previous depth's cache -- a feature it
+    // keeps gets each group's smaller child built and the sibling derived;
+    // `next` (may be nullptr): the features to keep for the next depth.
     void score(const BinnedView& X, const HistDepth& depth, const std::vector<std::uint32_t>& candidates,
-               std::vector<std::vector<HistSplit>>& results, ThreadPool* pool) const {
+               const HistCache* prev, HistCache* next, std::vector<std::vector<HistSplit>>& results,
+               ThreadPool* pool) const {
         const std::size_t n_cand = candidates.size();
         results.resize(n_cand);
         // Candidates grouped by bin block, in candidate order within a block
@@ -453,9 +529,9 @@ public:
         }
         run_tasks(pool, tasks.size(), [&](std::size_t t) {
             if (X.m->wide()) {
-                score_block<std::uint16_t>(X, depth, candidates, tasks[t], results);
+                score_block<std::uint16_t>(X, depth, candidates, tasks[t], prev, next, results);
             } else {
-                score_block<std::uint8_t>(X, depth, candidates, tasks[t], results);
+                score_block<std::uint8_t>(X, depth, candidates, tasks[t], prev, next, results);
             }
         });
     }
@@ -482,12 +558,28 @@ private:
         std::size_t cand;      // index into candidates / results
         std::uint32_t j;       // position in the bin block
         std::size_t n_bins;
-        std::size_t scratch;   // offset of its histogram in the task's scratch
+        std::size_t scratch;   // offset of its two histograms in the task's scratch
+        std::int32_t prev;     // slot in the previous depth's cache, or -1
+        std::int32_t next;     // slot in the next depth's cache, or -1
     };
 
     struct SweepScratch {
         std::vector<double> left, right;
+        std::vector<std::uint32_t> bins; // a node's non-empty bins, ascending
     };
+
+    // The non-empty bins of a histogram, ascending, into sc.bins; returns
+    // their number. (Branch-free: which bins are empty is unpredictable.)
+    static std::size_t non_empty_bins(const std::uint32_t* cnt, std::size_t n_bins, SweepScratch& sc) {
+        if (sc.bins.size() < n_bins) sc.bins.resize(n_bins);
+        std::uint32_t* out = sc.bins.data();
+        std::size_t n = 0;
+        for (std::size_t b = 0; b < n_bins; ++b) {
+            out[n] = static_cast<std::uint32_t>(b);
+            n += cnt[b] != 0 ? 1 : 0;
+        }
+        return n;
+    }
 
     template <class Bin>
     static const Bin* block_data(const BinnedMatrix& m, std::size_t blk);
@@ -549,19 +641,40 @@ private:
 
     void sweep(const HistRef& hr, std::size_t n_bins, std::size_t k, HistSplit& out, SweepScratch& sc) const {
         if (criterion_ == Criterion::MSE) {
-            sweep_mse(hr.h, hr.c, n_bins, k, out);
+            sweep_mse(hr.h, hr.c, n_bins, k, out, sc);
         } else if (criterion_ == Criterion::Newton) {
-            sweep_newton(hr.h, hr.c, n_bins, k, out);
+            sweep_newton(hr.h, hr.c, n_bins, k, out, sc);
         } else {
             sweep_classification(hr.h, hr.c, n_bins, k, out, sc);
         }
     }
 
+    // dst = parent - built, bin by bin (histogram subtraction).
+    void subtract(const HistRef& parent, const HistRef& built, const HistRef& dst, std::size_t n_bins) const {
+        const std::size_t n = n_bins * n_stats_;
+        for (std::size_t i = 0; i < n; ++i) dst.h[i] = parent.h[i] - built.h[i];
+        for (std::size_t b = 0; b < n_bins; ++b) dst.c[b] = parent.c[b] - built.c[b];
+    }
+
+    // MSE statistics centred at c, re-centred at c + delta.
+    static void recenter(const HistRef& hr, std::size_t n_bins, double delta) {
+        for (std::size_t b = 0; b < n_bins; ++b) {
+            double* h = hr.h + 3 * b;
+            const double s = h[0], w = h[2];
+            h[0] = s - delta * w;
+            h[1] = h[1] - 2.0 * delta * s + delta * delta * w;
+        }
+    }
+
     // One task: the candidates `cand_idx` (all in one bin block), for every
-    // scored node of the depth.
+    // scored node of the depth, a group of siblings at a time. A candidate
+    // kept in `prev` builds the group's smaller child (or the only scored
+    // one, when it is the smaller) and derives the other from the parent; any
+    // other candidate builds each scored child.
     template <class Bin>
     void score_block(const BinnedView& X, const HistDepth& depth, const std::vector<std::uint32_t>& candidates,
-                     const std::vector<std::size_t>& cand_idx, std::vector<std::vector<HistSplit>>& results) const {
+                     const std::vector<std::size_t>& cand_idx, const HistCache* prev, HistCache* next,
+                     std::vector<std::vector<HistSplit>>& results) const {
         const std::size_t S = n_stats_;
         const std::size_t blk = X.col(candidates[cand_idx[0]]) / kBinBlock;
         const std::size_t width = X.m->block_width(blk);
@@ -569,31 +682,83 @@ private:
         const std::size_t m = cand_idx.size();
 
         std::vector<BlockFeature> feats(m);
-        std::vector<std::uint32_t> js(m);
         std::size_t scratch_size = 0;
+        bool any_prev = false;
         for (std::size_t q = 0; q < m; ++q) {
-            const std::size_t col = X.col(candidates[cand_idx[q]]);
-            feats[q] = {cand_idx[q], static_cast<std::uint32_t>(col - blk * kBinBlock), X.m->n_bins(col), scratch_size};
-            js[q] = feats[q].j;
-            scratch_size += feats[q].n_bins;
+            const std::size_t f = candidates[cand_idx[q]];
+            const std::size_t col = X.col(f);
+            feats[q] = {cand_idx[q], static_cast<std::uint32_t>(col - blk * kBinBlock), X.m->n_bins(col), scratch_size,
+                        prev ? prev->slot(f) : -1, next ? next->slot(f) : -1};
+            any_prev = any_prev || feats[q].prev >= 0;
+            scratch_size += 2 * feats[q].n_bins;
             results[cand_idx[q]].assign(depth.n_nodes, HistSplit{});
         }
         std::vector<double> hist(scratch_size * S);
         std::vector<std::uint32_t> count(scratch_size);
+        auto scratch = [&](std::size_t q, int side) {
+            const std::size_t off = feats[q].scratch + static_cast<std::size_t>(side) * feats[q].n_bins;
+            return HistRef{hist.data() + off * S, count.data() + off};
+        };
+        std::vector<HistRef> dest[2] = {std::vector<HistRef>(m), std::vector<HistRef>(m)};
+        std::vector<std::uint32_t> js(m);
         std::vector<HistRef> refs(m);
-        for (std::size_t q = 0; q < m; ++q) refs[q] = {hist.data() + feats[q].scratch * S, count.data() + feats[q].scratch};
         SweepScratch sc;
 
         for (const HistGroup& g : depth.groups) {
+            const std::size_t n_side[2] = {g.end[0] - g.begin[0], g.end[1] - g.begin[1]};
+            // The child the subtracted candidates build (-1: none).
+            int build = -1;
+            if (any_prev && g.parent >= 0) {
+                if (g.node[0] >= 0 && g.node[1] >= 0) {
+                    build = n_side[1] < n_side[0] ? 1 : 0;
+                } else {
+                    const int s = g.node[0] >= 0 ? 0 : 1;
+                    build = n_side[1 - s] < n_side[s] ? 1 - s : s;
+                }
+            }
+            for (int side = 0; side < 2; ++side) {
+                for (std::size_t q = 0; q < m; ++q) {
+                    dest[side][q] = g.node[side] >= 0 && feats[q].next >= 0
+                                        ? HistRef{next->hist(feats[q].next, static_cast<std::size_t>(g.node[side])),
+                                                  next->count(feats[q].next, static_cast<std::size_t>(g.node[side]))}
+                                        : scratch(q, side);
+                }
+            }
+            // Build: a scored child for the direct candidates, the chosen
+            // child for the subtracted ones.
+            for (int side = 0; side < 2; ++side) {
+                std::size_t n_build = 0;
+                for (std::size_t q = 0; q < m; ++q) {
+                    const bool subtracted = build >= 0 && feats[q].prev >= 0;
+                    if (subtracted ? side == build : g.node[side] >= 0) {
+                        js[n_build] = feats[q].j;
+                        refs[n_build] = dest[side][q];
+                        std::fill(refs[n_build].h, refs[n_build].h + feats[q].n_bins * S, 0.0);
+                        std::fill(refs[n_build].c, refs[n_build].c + feats[q].n_bins, 0u);
+                        ++n_build;
+                    }
+                }
+                if (n_build > 0 && n_side[side] > 0) {
+                    accumulate<Bin>(block, width, depth, g.begin[side], g.end[side], js.data(), refs.data(), n_build);
+                }
+            }
+            // Derive the other child, if it is scored.
+            if (build >= 0 && g.node[1 - build] >= 0) {
+                for (std::size_t q = 0; q < m; ++q) {
+                    if (feats[q].prev < 0) continue;
+                    const HistRef parent{prev->hist(feats[q].prev, static_cast<std::size_t>(g.parent)),
+                                         prev->count(feats[q].prev, static_cast<std::size_t>(g.parent))};
+                    subtract(parent, dest[build][q], dest[1 - build][q], feats[q].n_bins);
+                }
+            }
+            // Sweep the scored children.
             for (int side = 0; side < 2; ++side) {
                 const std::int32_t k = g.node[side];
                 if (k < 0) continue;
-                std::fill(hist.begin(), hist.end(), 0.0);
-                std::fill(count.begin(), count.end(), 0u);
-                accumulate<Bin>(block, width, depth, g.begin[side], g.end[side], js.data(), refs.data(), m);
+                const std::size_t ku = static_cast<std::size_t>(k);
                 for (std::size_t q = 0; q < m; ++q) {
-                    sweep(refs[q], feats[q].n_bins, static_cast<std::size_t>(k),
-                          results[feats[q].cand][static_cast<std::size_t>(k)], sc);
+                    if (!depth.recenter.empty()) recenter(dest[side][q], feats[q].n_bins, depth.recenter[ku]);
+                    sweep(dest[side][q], feats[q].n_bins, ku, results[feats[q].cand][ku], sc);
                 }
             }
         }
@@ -604,15 +769,20 @@ private:
         return !(static_cast<int>(n_left) < min_samples_leaf_ || static_cast<int>(n_right) < min_samples_leaf_);
     }
 
-    void sweep_mse(const double* h, const std::uint32_t* cnt, std::size_t n_bins, std::size_t k, HistSplit& out) const {
+    // The sweeps visit a node's non-empty bins left to right; each boundary
+    // between consecutive ones is a candidate split.
+    void sweep_mse(const double* h, const std::uint32_t* cnt, std::size_t n_bins, std::size_t k, HistSplit& out,
+                   SweepScratch& sc) const {
+        const std::size_t n_used = non_empty_bins(cnt, n_bins, sc);
+        const std::uint32_t* used = sc.bins.data();
         const std::size_t n = node_size_[k];
         const double total_sum = total_[k * 3], total_sum_sq = total_[k * 3 + 1], total_weight = total_[k * 3 + 2];
         const double parent_impurity = mse_from_sums(total_sum, total_sum_sq, total_weight);
         double best_improvement = -std::numeric_limits<double>::infinity();
         double left_sum = 0.0, left_sum_sq = 0.0, left_weight = 0.0;
         std::size_t n_left = 0, prev = 0;
-        for (std::size_t b = 0; b < n_bins; ++b) {
-            if (cnt[b] == 0) continue;
+        for (std::size_t u = 0; u < n_used; ++u) {
+            const std::size_t b = used[u];
             if (n_left > 0 && leaf_sizes_ok(n_left, n)) {
                 double right_sum = total_sum - left_sum;
                 double right_sum_sq = total_sum_sq - left_sum_sq;
@@ -637,16 +807,18 @@ private:
         }
     }
 
-    void sweep_newton(const double* h, const std::uint32_t* cnt, std::size_t n_bins, std::size_t k,
-                      HistSplit& out) const {
+    void sweep_newton(const double* h, const std::uint32_t* cnt, std::size_t n_bins, std::size_t k, HistSplit& out,
+                      SweepScratch& sc) const {
+        const std::size_t n_used = non_empty_bins(cnt, n_bins, sc);
+        const std::uint32_t* used = sc.bins.data();
         const std::size_t n = node_size_[k];
         const double G = total_[k * 2], H = total_[k * 2 + 1];
         const double parent_score = newton_score(G, H, newton_);
         double best_gain = -std::numeric_limits<double>::infinity();
         double left_g = 0.0, left_h = 0.0;
         std::size_t n_left = 0, prev = 0;
-        for (std::size_t b = 0; b < n_bins; ++b) {
-            if (cnt[b] == 0) continue;
+        for (std::size_t u = 0; u < n_used; ++u) {
+            const std::size_t b = used[u];
             if (n_left > 0 && leaf_sizes_ok(n_left, n) && newton_children_valid(left_h, H - left_h, newton_)) {
                 const double gain = newton_split_gain(left_g, left_h, G, H, parent_score, newton_);
                 if (std::isfinite(gain) && gain > best_gain) {
@@ -678,11 +850,13 @@ private:
         const double parent_impurity = class_impurity(total, total_weight);
         sc.left.assign(K, 0.0);
         sc.right.resize(K);
+        const std::size_t n_used = non_empty_bins(cnt, n_bins, sc);
+        const std::uint32_t* used = sc.bins.data();
         double best_improvement = -std::numeric_limits<double>::infinity();
         double left_weight = 0.0;
         std::size_t n_left = 0, prev = 0;
-        for (std::size_t b = 0; b < n_bins; ++b) {
-            if (cnt[b] == 0) continue;
+        for (std::size_t u = 0; u < n_used; ++u) {
+            const std::size_t b = used[u];
             if (n_left > 0 && leaf_sizes_ok(n_left, n)) {
                 for (std::size_t c = 0; c < K; ++c) sc.right[c] = total[c] - sc.left[c];
                 const double right_weight = total_weight - left_weight;

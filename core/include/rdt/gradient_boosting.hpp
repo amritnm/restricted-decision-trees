@@ -568,6 +568,19 @@ public:
     // Per tree (round-major, as trees are fitted), the feature chosen at
     // each depth as a column of the X passed to fit (each tree's own column
     // indices mapped through its column subset).
+    // The fitted trees, round-major (trees()[round * n_outputs() + k]); a
+    // tree's features are indices into its column subset.
+    const std::vector<RDTModel>& trees() const { return trees_; }
+
+    // Each tree's depth_improvements() (Newton: the depth's total gain), in
+    // the order of depth_features().
+    std::vector<std::map<int, double>> depth_improvements() const {
+        std::vector<std::map<int, double>> out;
+        out.reserve(trees_.size());
+        for (const auto& tree : trees_) out.push_back(tree.depth_improvements());
+        return out;
+    }
+
     std::vector<std::map<int, int>> depth_features() const {
         std::vector<std::map<int, int>> out(trees_.size());
         for (std::size_t t = 0; t < trees_.size(); ++t) {

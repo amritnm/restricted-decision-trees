@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -93,6 +94,18 @@ struct TreeParams {
     // seeded with bylevel_seed. 1.0: every column, nothing is drawn.
     double colsample_bylevel = 1.0;
     std::uint64_t bylevel_seed = 0;
+    // Hist: histogram subtraction. Below the root, a candidate's histograms
+    // are built only for the smaller child of each split, and the sibling's
+    // are derived as parent - child from the previous depth's histograms.
+    // Those are kept for the candidates of a depth that are also candidates
+    // of the next one, while the histograms kept for the current and the
+    // previous depth together fit in max_hist_cache_bytes (in candidate order;
+    // the others are built directly). Derived sums round differently from
+    // directly built ones, so split scores can differ from
+    // hist_subtraction=false in the last bits and an exact tie between two
+    // splits may resolve the other way.
+    bool hist_subtraction = true;
+    std::size_t max_hist_cache_bytes = std::size_t{1} << 30;
 
     // Implementation choices that do not change which splits are chosen.
     //

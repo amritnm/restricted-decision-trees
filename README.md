@@ -281,27 +281,37 @@ and `max_bin` (default 256, 2–65536):
   (for gradient boosting, after the early-stopping split): a feature with at
   most `max_bin` distinct values gets one bin per value, otherwise
   approximately equal-count bins. All rows are binned and stored column-major
-  as `uint8` (`uint16` when a feature has more than 256 bins). `X` may be
-  float32 or float64, C or Fortran order, a strided view or an `np.memmap`:
-  it is read in place, a block of columns at a time — never copied — and not
-  read again after binning (boosting updates its training scores, and the
-  forest its OOB score, through the bins).
+  as `uint8` (every feature as `uint16` when any feature has more than 256
+  bins). `X` may be float32 or float64, C or Fortran order, a strided view or
+  an `np.memmap`: it is read in place, a block of columns at a time — never
+  copied — and not read again after binning (boosting updates its training
+  scores, and the forest its OOB score, through the bins).
 - **Search:** at each depth, each feature's histograms for all of the depth's
   nodes are built in one pass over its bin column and swept with the same
   criterion arithmetic as the exact search (Gini, entropy, MSE, and the
   gradient boosting criteria `friedman_mse` and `newton`); features are
   scored in parallel when `n_jobs > 1` (a single tree, or a boosting round
   with one tree), and the result does not depend on `n_jobs`.
-- **Thresholds:** a split between a node's adjacent non-empty bins uses the
-  exact search's threshold (the midpoint between the node's neighbouring
-  values), moved to a bin boundary only if a row outside the training rows
-  would otherwise be routed differently from its bin, so for every row of
-  the `X` passed to `fit`, `x <= threshold` exactly when the row's bin is on
-  the left. With at most `max_bin` distinct values per feature a hist model
-  is therefore the exact model (up to how a tie between equally good splits
-  is broken), including with row subsampling and bootstrap.
-- **Memory:** the bins (1 byte per value up to 256 bins, else 2) plus, per
-  feature, 40 bytes per bin; no presorted columns.
+- **Thresholds:** a split between a node's adjacent non-empty bins `lo < hi`
+  uses the midpoint between the largest training value in bin `lo` and the
+  smallest in bin `hi` — the exact search's threshold (the midpoint between
+  the node's neighbouring values) whenever every bin holds a single value —
+  moved to a bin boundary only if a row outside the training rows would
+  otherwise be routed differently from its bin, so for every row of the `X`
+  passed to `fit`, `x <= threshold` exactly when the row's bin is on the
+  left. With at most `max_bin` distinct values per feature a hist model is
+  therefore the exact model, including with row subsampling and bootstrap,
+  up to how a tie between equally good splits is broken (the two searches
+  round their sums differently, so splits whose scores are equal in exact
+  arithmetic may be ranked differently).
+- **Memory** (besides `X`; no presorted columns): the bins, 1 byte per row
+  and feature (2 when any feature has more than 256 bins); 40 bytes per bin
+  and feature for the cuts and bin extents; while binning, one sorted column
+  of training values per thread (8 bytes per training row); and, per depth,
+  36 bytes per row of the tree for MSE / `friedman_mse` (28 for `newton`, 24
+  for Gini / entropy) plus each thread's histograms (nodes × bins × (4 + 8·s)
+  bytes, `s` = 3, 2 or the number of classes). Gradient boosting's per-row
+  scores and gradients come on top, as with `"exact"`.
 
 ## Performance notes
 

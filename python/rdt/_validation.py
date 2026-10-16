@@ -35,7 +35,9 @@ def check_X(X, n_features: Optional[int] = None, any_float_layout: bool = False)
     ``any_float_layout`` (tree_method='hist' fits): a float32 / float64
     array in native byte order is returned as is -- any memory order or
     strides, a memory-mapped file included -- instead of being copied; the
-    native binning reads it in place. Other inputs are converted to float64.
+    native binning reads it in place (only unaligned data, or strides that
+    are not a whole number of elements, are copied). Other inputs are
+    converted to float64.
     """
     if any_float_layout and isinstance(X, np.ndarray) and X.dtype in (np.float32, np.float64) \
             and X.dtype.isnative:
@@ -44,7 +46,11 @@ def check_X(X, n_features: Optional[int] = None, any_float_layout: bool = False)
         X = np.asarray(X)
         if not (X.dtype in (np.float32, np.float64) and X.dtype.isnative):
             X = np.asarray(X, dtype=np.float64)
-    else:
+    if any_float_layout and (not X.flags.aligned or any(s % X.itemsize for s in X.strides)):
+        # e.g. a view of a packed structured array: the native code reads typed elements, so
+        # unaligned data or strides that are not a whole number of elements are copied first.
+        X = np.ascontiguousarray(X)
+    if not any_float_layout:
         X = np.asarray(X, dtype=np.float64, order="C")
     if X.ndim != 2:
         raise ValueError(f"Expected a 2D array for X, got an array of shape {X.shape}.")

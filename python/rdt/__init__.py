@@ -67,8 +67,8 @@ class RDT:
         (2 to 65536; bins are stored as uint8 up to 256, else uint16).
     n_jobs : int, optional
         Threads for the ``tree_method='hist'`` split search (features are
-        scored in parallel; the tree does not depend on it). None = 1,
-        -1 = all hardware threads.
+        scored, and each depth's rows partitioned, in parallel; the tree does
+        not depend on it). None = 1, -1 = all hardware threads.
     hist_subtraction : bool, default=True
         With ``tree_method='hist'``: below the root, each candidate feature's
         histograms are built only for the smaller child of every split, and

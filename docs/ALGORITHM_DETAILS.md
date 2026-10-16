@@ -361,7 +361,14 @@ Memory during `fit` (in addition to `X`, `y` and the fitted trees):
   each depth's rows gathered per node), plus the nodes' row indices (4 bytes
   per row per level), as before;
 - sorting: a transient 16 bytes per row per column sorted together, at most 8
-  columns and at most `n_features / 4`.
+  columns and at most `n_features / 4`;
+- `tree_method="hist"` instead: the bins (1 or 2 bytes per value), two row
+  arrays of 8 bytes per row each (view and bin-matrix row ids, double
+  buffered for the partition), each depth's statistics (16 bytes per row for
+  Newton, 24 for MSE, 12 for Gini / entropy), no per-node row indices (unless
+  kept for `rdt.visualize`), and the subtraction caches: at most
+  `max_hist_cache_mb` per tree being fitted, reused from round to round by
+  gradient boosting.
 
 No copy of `X` is made by the ensembles at fit or predict time — each tree
 reads its bootstrap rows / column subset through an index mapping (v0.2.0

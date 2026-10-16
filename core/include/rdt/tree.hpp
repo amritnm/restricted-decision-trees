@@ -824,7 +824,7 @@ private:
             std::size_t need = 0;
             for (int d = 0; d + 1 < params_.max_depth; ++d) {
                 need = std::max(need, (nodes_at(d) + (d > 0 ? nodes_at(d - 1) : 0)) * row_bytes + 2 * pad);
-                if (nodes_at(d) == max_nodes) break;
+                if (d > 0 && nodes_at(d - 1) == max_nodes) break; // deeper depths need no more
             }
             arena.reserve(std::min(need, params_.max_hist_cache_bytes));
         }

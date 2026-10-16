@@ -8,6 +8,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <memory>
 
 #include <mutex>
 #include <optional>
@@ -169,6 +170,114 @@ void fit_hist_released(Model& self, const AnyMatrix& X, const InputVector& y,
     UseGuard guard(&self, /*exclusive=*/true);
     nb::gil_scoped_release release;
     with_strided(X, [&](const auto& xs) { self.fit_hist(xs, yv, wv ? &*wv : nullptr); });
+}
+
+// ---- GradientBoostingModel fits with an optional eval set (X_val, y_val,
+// sample_weight_val): the eval features are read in place (exact: C-contiguous
+// float64 like X; hist: float32 / float64, any strides) and type-erased, so
+// the boosting loop is instantiated once per training matrix type only.
+void check_eval_args(std::size_t n_features, bool has_X_val, std::size_t val_rows, std::size_t val_cols,
+                     const std::optional<InputVector>& y_val, const std::optional<InputVector>& w_val) {
+    if (has_X_val != y_val.has_value()) throw std::invalid_argument("X_val and y_val must be given together");
+    if (w_val && !has_X_val) throw std::invalid_argument("sample_weight_val needs X_val and y_val");
+    if (!has_X_val) return;
+    if (val_cols != n_features) throw std::invalid_argument("X_val has a different number of features than X");
+    if (y_val->shape(0) != val_rows) throw std::invalid_argument("X_val and y_val have different numbers of rows");
+    if (w_val && w_val->shape(0) != val_rows) {
+        throw std::invalid_argument("X_val and sample_weight_val have different numbers of rows");
+    }
+}
+
+std::unique_ptr<EvalFeatures> eval_features_any(const AnyMatrix& X) {
+    const std::size_t n = X.shape(0), p = X.shape(1);
+    const auto rs = static_cast<std::ptrdiff_t>(X.stride(0)), cs = static_cast<std::ptrdiff_t>(X.stride(1));
+    if (X.dtype() == nb::dtype<double>()) {
+        return std::make_unique<EvalFeaturesOf<StridedMatrix<double>>>(
+            StridedMatrix<double>(static_cast<const double*>(X.data()), n, p, rs, cs));
+    }
+    if (X.dtype() == nb::dtype<float>()) {
+        return std::make_unique<EvalFeaturesOf<StridedMatrix<float>>>(
+            StridedMatrix<float>(static_cast<const float*>(X.data()), n, p, rs, cs));
+    }
+    throw std::invalid_argument("X_val must be a float32 or float64 array");
+}
+
+// Builds the EvalSet (pointing into `features` / the arrays) when an eval set is given.
+struct EvalArgs {
+    std::unique_ptr<EvalFeatures> features;
+    std::optional<VectorView> weight;
+    EvalSet set;
+
+    const EvalSet* get() const { return features ? &set : nullptr; }
+
+    EvalArgs(std::unique_ptr<EvalFeatures> f, const std::optional<InputVector>& y_val,
+             const std::optional<InputVector>& w_val)
+        : features(std::move(f)) {
+        if (!features) return;
+        set.X = features.get();
+        set.y = to_vector_view(*y_val);
+        if (w_val) {
+            weight = to_vector_view(*w_val);
+            set.sample_weight = &*weight;
+        }
+    }
+    EvalArgs(const EvalArgs&) = delete;
+    EvalArgs& operator=(const EvalArgs&) = delete;
+};
+
+void gb_fit_released(GradientBoostingModel& self, const InputMatrix& X, const InputVector& y,
+                     const std::optional<InputVector>& sample_weight, const std::optional<InputMatrix>& X_val,
+                     const std::optional<InputVector>& y_val, const std::optional<InputVector>& w_val) {
+    check_fit_shapes(X, y, sample_weight);
+    check_eval_args(X.shape(1), X_val.has_value(), X_val ? X_val->shape(0) : 0, X_val ? X_val->shape(1) : 0, y_val,
+                    w_val);
+    const MatrixView xv = to_matrix_view(X);
+    const VectorView yv = to_vector_view(y);
+    std::optional<VectorView> wv;
+    if (sample_weight) wv = to_vector_view(*sample_weight);
+    std::unique_ptr<EvalFeatures> features;
+    if (X_val) features = std::make_unique<EvalFeaturesOf<MatrixView>>(to_matrix_view(*X_val));
+    const EvalArgs eval(std::move(features), y_val, w_val);
+    UseGuard guard(&self, /*exclusive=*/true);
+    nb::gil_scoped_release release;
+    self.fit(xv, yv, wv ? &*wv : nullptr, eval.get());
+}
+
+void gb_fit_hist_released(GradientBoostingModel& self, const AnyMatrix& X, const InputVector& y,
+                          const std::optional<InputVector>& sample_weight, const std::optional<AnyMatrix>& X_val,
+                          const std::optional<InputVector>& y_val, const std::optional<InputVector>& w_val) {
+    check_fit_shapes_any(X, y, sample_weight);
+    check_eval_args(X.shape(1), X_val.has_value(), X_val ? X_val->shape(0) : 0, X_val ? X_val->shape(1) : 0, y_val,
+                    w_val);
+    const VectorView yv = to_vector_view(y);
+    std::optional<VectorView> wv;
+    if (sample_weight) wv = to_vector_view(*sample_weight);
+    const EvalArgs eval(X_val ? eval_features_any(*X_val) : nullptr, y_val, w_val);
+    UseGuard guard(&self, /*exclusive=*/true);
+    nb::gil_scoped_release release;
+    with_strided(X, [&](const auto& xs) { self.fit_hist(xs, yv, wv ? &*wv : nullptr, eval.get()); });
+}
+
+EvalMetric eval_metric_from_string(const std::string& name) {
+    if (name.empty()) return EvalMetric::Default;
+    if (name == "logloss") return EvalMetric::LogLoss;
+    if (name == "auc") return EvalMetric::AUC;
+    if (name == "error") return EvalMetric::Error;
+    if (name == "rmse") return EvalMetric::RMSE;
+    if (name == "mae") return EvalMetric::MAE;
+    throw std::invalid_argument("Unknown eval_metric: " + name);
+}
+
+std::string eval_metric_name(EvalMetric metric) {
+    switch (metric) {
+        case EvalMetric::LogLoss: return "logloss";
+        case EvalMetric::AUC: return "auc";
+        case EvalMetric::Error: return "error";
+        case EvalMetric::RMSE: return "rmse";
+        case EvalMetric::MAE: return "mae";
+        case EvalMetric::Default: break;
+    }
+    return "";
 }
 
 // RDTModel::fit, with the per-row hessians a criterion='newton' tree needs.
@@ -629,10 +738,11 @@ NB_MODULE(_rdt_native, m) {
                           double quantile_alpha, std::uint64_t random_state, int n_jobs, bool presort,
                           std::string split_criterion, double min_child_weight, double max_delta_step,
                           std::string tree_method, int max_bin, double colsample_bylevel, bool hist_subtraction,
-                          double max_hist_cache_mb) {
+                          double max_hist_cache_mb, std::string eval_metric) {
                  GBParams p;
                  p.tree_params.hist_subtraction = hist_subtraction;
                  p.tree_params.max_hist_cache_bytes = hist_cache_bytes(max_hist_cache_mb);
+                 p.eval_metric = eval_metric_from_string(eval_metric);
                  check_colsample_bylevel(colsample_bylevel);
                  p.tree_params.colsample_bylevel = colsample_bylevel;
                  p.tree_params.tree_method = tree_method_from_string(tree_method);
@@ -669,17 +779,41 @@ NB_MODULE(_rdt_native, m) {
              "reg_alpha"_a, "reg_lambda"_a, "huber_delta"_a, "quantile_alpha"_a, "random_state"_a, "n_jobs"_a,
              "presort"_a = true, "split_criterion"_a = "friedman_mse", "min_child_weight"_a = 1.0,
              "max_delta_step"_a = 0.0, "tree_method"_a = "exact", "max_bin"_a = 256, "colsample_bylevel"_a = 1.0,
-             "hist_subtraction"_a = true, "max_hist_cache_mb"_a = 1024.0)
+             "hist_subtraction"_a = true, "max_hist_cache_mb"_a = 1024.0, "eval_metric"_a = "")
+        // X_val / y_val / sample_weight_val: an eval set scored after every
+        // round (evals_result_; early stopping on it when n_iter_no_change > 0).
         .def("fit",
-             [](GradientBoostingModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
-                 fit_released(self, X, y, sample_weight);
+             [](GradientBoostingModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight,
+                std::optional<InputMatrix> X_val, std::optional<InputVector> y_val,
+                std::optional<InputVector> sample_weight_val) {
+                 gb_fit_released(self, X, y, sample_weight, X_val, y_val, sample_weight_val);
              },
-             "X"_a, "y"_a, "sample_weight"_a = nb::none())
+             "X"_a, "y"_a, "sample_weight"_a = nb::none(), "X_val"_a = nb::none(), "y_val"_a = nb::none(),
+             "sample_weight_val"_a = nb::none())
         .def("fit_hist",
-             [](GradientBoostingModel& self, AnyMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
-                 fit_hist_released(self, X, y, sample_weight);
+             [](GradientBoostingModel& self, AnyMatrix X, InputVector y, std::optional<InputVector> sample_weight,
+                std::optional<AnyMatrix> X_val, std::optional<InputVector> y_val,
+                std::optional<InputVector> sample_weight_val) {
+                 gb_fit_hist_released(self, X, y, sample_weight, X_val, y_val, sample_weight_val);
              },
-             "X"_a, "y"_a, "sample_weight"_a = nb::none())
+             "X"_a, "y"_a, "sample_weight"_a = nb::none(), "X_val"_a = nb::none(), "y_val"_a = nb::none(),
+             "sample_weight_val"_a = nb::none())
+        .def_prop_ro("evals_result_",
+                      [](const GradientBoostingModel& self) {
+                          return read(self, [](auto& m) { return m.evals_result(); });
+                      })
+        .def_prop_ro("best_iteration_",
+                      [](const GradientBoostingModel& self) {
+                          return read(self, [](auto& m) { return m.best_iteration(); });
+                      })
+        .def_prop_ro("best_score_",
+                      [](const GradientBoostingModel& self) {
+                          return read(self, [](auto& m) { return m.best_score(); });
+                      })
+        .def_prop_ro("eval_metric_",
+                      [](const GradientBoostingModel& self) {
+                          return read(self, [](auto& m) { return eval_metric_name(m.eval_metric()); });
+                      })
         .def("predict",
              [](const GradientBoostingModel& self, InputMatrix X) { return predict_released(self, X); }, "X"_a)
         .def("predict_proba",

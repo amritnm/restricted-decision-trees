@@ -406,9 +406,10 @@ and `max_bin` (default 256, 2–65536):
   boosting round's per-class trees. Binary / regression boosting fits one
   tree per round; with `tree_method="hist"` that tree scores its features in
   parallel. Gradient boosting also runs each round's per-row passes
-  (gradients, routing rows to the new leaves, score updates, losses) and its
-  predictions in row blocks on the `n_jobs` threads. No result depends on
-  `n_jobs`: per-row work is independent, and sums are taken in row order.
+  (gradients, routing rows to the new leaves, score updates, losses, the
+  `eval_set` rows' scores) and its predictions in row blocks on the `n_jobs`
+  threads. No result depends on `n_jobs`: per-row work is independent, and
+  sums are taken in row order.
 
 ## How it works
 

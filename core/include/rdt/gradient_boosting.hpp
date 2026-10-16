@@ -544,7 +544,7 @@ private:
             train_score_.push_back(train_loss);
 
             if (eval) {
-                score_eval_round(ev, *eval, round * n_outputs, pool);
+                score_eval_round(ev, *eval, round * n_outputs, row_pool);
                 const double score = eval_score(ev);
                 evals_result_.push_back(score);
                 if (eval_stopping) {
@@ -594,11 +594,6 @@ private:
     }
 
     // ---- eval set (see the file comment and EvalMetric) ----
-
-    // Rows per block when routing the eval rows through a round's trees; the
-    // blocks run in parallel, each row's score is updated by one thread in
-    // tree order, so the scores do not depend on the number of threads.
-    static constexpr std::size_t kEvalRowBlock = 4096;
 
     struct EvalState {
         EvalMetric metric = EvalMetric::Default;
@@ -681,13 +676,12 @@ private:
     }
 
     // Adds the round's trees (trees_[first_tree + k], k < n_outputs_) to the
-    // eval rows' raw scores, with add_leaf_value's arithmetic.
-    void score_eval_round(EvalState& ev, const EvalSet& eval, std::size_t first_tree, ThreadPool& pool) const {
-        const std::size_t m = ev.m;
-        const std::size_t n_blocks = (m + kEvalRowBlock - 1) / kEvalRowBlock;
-        run_tasks(pool.size() > 1 ? &pool : nullptr, n_blocks, [&](std::size_t b) {
-            const std::size_t begin = b * kEvalRowBlock;
-            const std::size_t end = std::min(m, begin + kEvalRowBlock);
+    // eval rows' raw scores, with add_leaf_value's arithmetic. Rows run in the
+    // row blocks of the other per-row passes and of prediction (for_blocks, on
+    // the boosting threads); each row's score is updated by one thread, in
+    // tree order, so the scores do not depend on the number of threads.
+    void score_eval_round(EvalState& ev, const EvalSet& eval, std::size_t first_tree, ThreadPool* pool) const {
+        for_blocks(pool, ev.m, [&](std::size_t begin, std::size_t end) {
             std::vector<double> values(end - begin);
             for (std::size_t k = 0; k < n_outputs_; ++k) {
                 const std::size_t t = first_tree + k;

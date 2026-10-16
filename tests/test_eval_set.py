@@ -119,6 +119,7 @@ def _assert_same_model(a, b, X, Xv, task):
     assert np.array_equal(a.train_score_, b.train_score_)
     assert np.array_equal(a.feature_importances_, b.feature_importances_)
     assert a.depth_features_ == b.depth_features_
+    assert a.depth_improvements_ == b.depth_improvements_
     assert a.level_features_ == b.level_features_
     for Z in (_dense(X), _dense(Xv)):
         assert np.array_equal(a.predict(Z), b.predict(Z))
@@ -148,8 +149,9 @@ def _reference(params, k, data):
     return GradientBoostingRDT(**ref).fit(X, y, sample_weight=w)
 
 
-def _check_truncation(i):
+def _check_truncation(i, hist_subtraction=True):
     params, patience, data, ev = _scenario(i)
+    params["hist_subtraction"] = hist_subtraction  # only read by tree_method='hist'
     m = _fit_es(params, patience, data, ev)
     metric = params["eval_metric"] or ("logloss" if params["task"] == "classification" else "rmse")
     values = m.evals_result_[metric]
@@ -163,14 +165,16 @@ def _check_truncation(i):
 
 
 # --------------------------------------------------------------------------- 1. truncation
+@pytest.mark.parametrize("hist_subtraction", [True, False], ids=["subtraction", "direct"])
 @pytest.mark.parametrize("i", range(12))
-def test_truncated_model_equals_fit_with_best_n_estimators(i):
-    _check_truncation(i)
+def test_truncated_model_equals_fit_with_best_n_estimators(i, hist_subtraction):
+    _check_truncation(i, hist_subtraction)
 
 
 @pytest.mark.slow
-def test_truncation_grid():
-    stopped = [_check_truncation(i) for i in range(12, 212)]
+@pytest.mark.parametrize("hist_subtraction", [True, False], ids=["subtraction", "direct"])
+def test_truncation_grid(hist_subtraction):
+    stopped = [_check_truncation(i, hist_subtraction) for i in range(12, 212)]
     assert sum(stopped) >= 150, f"only {sum(stopped)} of {len(stopped)} scenarios stopped before n_estimators"
 
 
@@ -488,8 +492,8 @@ def test_deterministic():
 @pytest.mark.parametrize("kind,tree_method", [("binary", "hist"), ("multi", "exact"), ("multi", "hist"),
                                               ("regression", "exact")])
 def test_n_jobs_does_not_change_the_result(kind, tree_method):
-    # More eval rows than one routing block (4096), so the blocks run in parallel.
-    X, y, Xv, yv, wv = _metric_problem(kind, seed=43, n=600, m=9000, p=6, quantize=4)
+    # More eval rows than one row block (16384, for_blocks), so the blocks run in parallel.
+    X, y, Xv, yv, wv = _metric_problem(kind, seed=43, n=600, m=40000, p=6, quantize=4)
     task = "regression" if kind == "regression" else "classification"
     fits = [GradientBoostingRDT(task=task, n_estimators=40, max_depth=3, learning_rate=0.8, random_state=0,
                                 tree_method=tree_method, n_jobs=j, early_stopping_rounds=4,
@@ -499,6 +503,27 @@ def test_n_jobs_does_not_change_the_result(kind, tree_method):
         assert other.evals_result_ == fits[0].evals_result_
         assert other.best_iteration_ == fits[0].best_iteration_
         _assert_same_model(fits[0], other, X, Xv[:500], task)
+
+
+@pytest.mark.parametrize("hist_subtraction", [True, False], ids=["subtraction", "direct"])
+@pytest.mark.parametrize("tree_method", ["exact", "hist"])
+def test_eval_scores_are_the_staged_predictions_bitwise(tree_method, hist_subtraction):
+    # The eval rows are scored in parallel row blocks (several blocks of 16384
+    # here); each round's metric must be that of the serial staged
+    # predictions, bit for bit. Unweighted RMSE / MAE are row-order sums of
+    # exactly representable terms' roundings, reproduced here with cumsum.
+    X, y, Xv, yv, _ = _metric_problem("regression", seed=59, n=800, m=40000, p=5, quantize=0)
+    for metric in ("rmse", "mae"):
+        m = GradientBoostingRDT(task="regression", n_estimators=15, max_depth=4, learning_rate=0.3, subsample=0.8,
+                                random_state=3, tree_method=tree_method, hist_subtraction=hist_subtraction,
+                                n_jobs=4, eval_metric=metric).fit(X, y, eval_set=(Xv, yv))
+        expected = []
+        for pred in m.staged_predict(_dense(Xv)):
+            d = yv - pred
+            terms = d * d if metric == "rmse" else np.abs(d)
+            mean = np.cumsum(terms)[-1] / float(len(yv))
+            expected.append(float(np.sqrt(mean)) if metric == "rmse" else float(mean))
+        assert m.evals_result_[metric] == expected
 
 
 @pytest.mark.parametrize("tree_method", ["exact", "hist"])

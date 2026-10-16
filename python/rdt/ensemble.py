@@ -569,9 +569,10 @@ class GradientBoostingRDT:
         round with one tree (binary, regression) scores its features in
         parallel (``tree_method='hist'``). Each round's per-row passes
         (gradients, routing every row to the new tree's leaf, score updates,
-        losses) and prediction run in row blocks on the threads too. Boosting
-        rounds themselves are sequential, and no result depends on
-        ``n_jobs``. None = 1, -1 = all available hardware threads.
+        losses, the ``eval_set`` rows' scores) and prediction run in row
+        blocks on the threads too. Boosting rounds themselves are
+        sequential, and no result depends on ``n_jobs``. None = 1, -1 = all
+        available hardware threads.
     presort : bool, default=True
         Split search implementation. True (default) sorts each feature once
         per fit and scores every node of a depth in one pass. False sorts

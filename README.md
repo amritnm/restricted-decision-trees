@@ -242,9 +242,15 @@ leaf. Each depth's feature maximises the sum over the nodes it splits of
 a hessian sum (default 1, no longer an alias of `min_samples_leaf`),
 `reg_lambda` defaults to 1, `feature_importances_` are normalised total gains,
 and the `absolute_error`/`huber`/`quantile` losses (no hessian) are rejected.
-With a single feature this reproduces XGBoost `tree_method="exact"` round by
-round to float32 precision (XGBoost applies `gamma` by pruning after growth
-rather than while growing, which can differ at depth ≥ 2). After fitting: `feature_importances_`,
+With a single feature this reproduces XGBoost (≥ 3.4) `tree_method="exact"`
+round by round to float32 precision, except that XGBoost applies `gamma` by
+pruning after growth rather than while growing (which can differ at depth ≥ 2),
+keeps zero-weight rows as candidate thresholds (so a split can sit elsewhere
+between the same weighted rows) and breaks exact gain ties towards the
+highest threshold (here the lowest). XGBoost 3.0–3.3 also differ when
+`max_delta_step > 0` and `reg_alpha > 0` (their clipped-weight gain lacks the
+`2·reg_alpha·|w|` term) and give a root leaf whose hessian sum is below
+`min_child_weight` weight 0. After fitting: `feature_importances_`,
 `train_score_` (loss per round), `n_estimators_` (rounds actually fitted —
 less than `n_estimators` if early stopping triggered), `depth_features_` (one
 `{depth: feature}` dict per tree in fitting order, a multiclass round

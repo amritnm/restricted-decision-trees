@@ -296,7 +296,9 @@ GBLoss loss_from_string(const std::string& loss) {
 // / staged_predict). The raw scores are accumulated natively, one round at a
 // time, with the GIL released; every stage is returned as a new array (no
 // buffer is shared between stages). The iterator keeps X and the model alive;
-// a refit of the model while iterating raises RuntimeError.
+// a refit of the model while iterating raises RuntimeError, and so does a
+// __next__ from another thread while one is in progress (it must not wait for
+// the in-progress one while holding the GIL that one needs to finish).
 class StagedScores {
 public:
     enum class Kind { Decision, Proba, Predict };
@@ -310,7 +312,10 @@ public:
     }
 
     OutputArray next() {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            throw std::runtime_error("this staged prediction iterator is already being advanced by another thread");
+        }
         const MatrixView xv = to_matrix_view(X_);
         const std::size_t n = xv.n_rows();
         std::vector<double> out;

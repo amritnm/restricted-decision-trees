@@ -144,6 +144,14 @@ def test_staged_iterator_and_refit():
     rest = list(gen)
     assert all(np.array_equal(a, b) for a, b in zip([first] + rest, expected))
 
+    # The generator is bound to the model at the staged_* call, not at the
+    # first next(): a refit in between does not change what it yields.
+    m.fit(X, y)
+    gen = m.staged_predict_proba(X)
+    m.fit(X, 1 - y)
+    assert all(np.array_equal(a, b) for a, b in zip(list(gen), expected))
+    assert len(expected) == 4
+
     # Refitting the very native object a native iterator reads is detected.
     it = m._model._staged(np.ascontiguousarray(X), "proba")
     next(it)
@@ -179,3 +187,47 @@ def test_depth_features_in_original_column_space():
         X, np.digitize(X[:, informative], [-0.5, 0.5]).astype(float))
     assert len(gb3.depth_features_) == 4 * 3  # one tree per class per round
     assert all(df[0] == informative for df in gb3.depth_features_)
+
+
+_CONCURRENT_NEXT = r"""
+import threading
+import numpy as np
+from rdt.ensemble import GradientBoostingRDT
+
+rng = np.random.default_rng(0)
+X = rng.standard_normal((2000, 4))
+y = (X[:, 0] + 0.5 * rng.standard_normal(2000) > 0).astype(float)
+m = GradientBoostingRDT(n_estimators=3, max_depth=6, random_state=0).fit(X, y)
+Xbig = np.ascontiguousarray(np.tile(X, (150, 1)))  # each round takes a while
+it = m._model._staged(Xbig, "proba")
+outcomes = []
+
+def advance():
+    try:
+        next(it)
+        outcomes.append("ok")
+    except RuntimeError as e:
+        outcomes.append("busy" if "already" in str(e) else repr(e))
+
+threads = [threading.Thread(target=advance) for _ in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+assert outcomes.count("ok") >= 1 and set(outcomes) <= {"ok", "busy"}, outcomes
+print("done", sorted(outcomes))
+"""
+
+
+def test_native_staged_iterator_concurrent_next_does_not_deadlock():
+    # The native iterator advances with the GIL released. A second thread
+    # calling __next__ on the same native iterator meanwhile must not block
+    # on it while holding the GIL (the first thread then waits for the GIL
+    # forever); it raises RuntimeError instead. (The public staged_* methods
+    # wrap the iterator in a generator, which refuses re-entry itself.)
+    import subprocess
+    import sys
+
+    proc = subprocess.run([sys.executable, "-c", _CONCURRENT_NEXT], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert "done" in proc.stdout

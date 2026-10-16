@@ -310,7 +310,8 @@ and `max_bin` (default 256, 2–65536):
   of training values per thread (8 bytes per training row); and, per depth,
   36 bytes per row of the tree for MSE / `friedman_mse` (28 for `newton`, 24
   for Gini / entropy) plus each thread's histograms (nodes × bins × (4 + 8·s)
-  bytes, `s` = 3, 2 or the number of classes). Gradient boosting's per-row
+  bytes, `s` = 3, 2 or the number of classes); a forest grows `n_jobs` trees
+  at a time, each with its own search state. Gradient boosting's per-row
   scores and gradients come on top, as with `"exact"`.
 
 ## Performance notes

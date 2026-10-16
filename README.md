@@ -119,7 +119,7 @@ means a parameter can't work exactly like it does elsewhere:
   The draws come from a generator seeded from the tree's own seed (so they do
   not depend on `n_jobs` and leave the other draws unchanged), and are exposed
   as `level_features_` (one `{depth: [columns of X]}` dict per tree, replayed
-  from the seeds).
+  from the seeds each time it is read; `fit` does not store them).
 - **`reg_alpha`/`reg_lambda`** (`GradientBoostingRDT` only) are, by default,
   a real effect (post-hoc leaf-value soft-thresholding/shrinkage) but not
   XGBoost's exact regularised leaf formula — the default engine is Friedman's

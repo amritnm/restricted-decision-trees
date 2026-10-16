@@ -221,8 +221,10 @@ class RandomForestRDT:
         One dict per tree (in the order of ``depth_features_``),
         ``{depth: [columns]}``: the candidate columns of each depth the tree
         searched, as columns of ``X`` (all of the tree's columns when
-        ``colsample_bylevel=1``). Replayed from the trees' seeds, not stored;
-        each ``depth_features_[t][d]`` is one of ``level_features_[t][d]``.
+        ``colsample_bylevel=1``). Replayed from the trees' seeds on each
+        access (``fit`` does not store them: they hold ``n_trees x depths x
+        columns`` entries); each ``depth_features_[t][d]`` is one of
+        ``level_features_[t][d]``.
     oob_score_ : float
         Only set if oob_score=True.
     """
@@ -286,7 +288,6 @@ class RandomForestRDT:
         self.estimators_: List[RDT] = []
         self.feature_importances_ = None
         self.depth_features_ = None
-        self.level_features_ = None
         self.oob_score_ = None
         self.n_features_ = None
         self.n_classes_ = None
@@ -325,7 +326,6 @@ class RandomForestRDT:
 
         self.feature_importances_ = np.array(self._model.feature_importances_)
         self.depth_features_ = [dict(d) for d in self._model.depth_features_]
-        self.level_features_ = [dict(d) for d in self._model.level_features_]
         if self.oob_score:
             self.oob_score_ = self._model.oob_score_
 
@@ -340,6 +340,15 @@ class RandomForestRDT:
             for i, tree in enumerate(self._model.estimators_)
         ]
         return self
+
+    @property
+    def level_features_(self) -> Optional[List[Dict[int, List[int]]]]:
+        """Per tree, ``{depth: [candidate columns of X]}`` (see the class
+        docstring), replayed from the trees' seeds on each access; None
+        before ``fit``."""
+        if self._model is None:
+            return None
+        return [dict(d) for d in self._model.level_features_]
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self._model is None:
@@ -499,8 +508,11 @@ class GradientBoostingRDT:
         One dict per tree (in the order of ``depth_features_``),
         ``{depth: [columns]}``: the candidate columns of each depth the tree
         searched, as columns of ``X`` (all of the tree's columns when
-        ``colsample_bylevel=1``). Replayed from the trees' seeds, not stored;
-        each ``depth_features_[t][d]`` is one of ``level_features_[t][d]``.
+        ``colsample_bylevel=1``). Replayed from the trees' seeds on each
+        access (``fit`` does not store them: they hold ``n_trees x depths x
+        columns`` entries); each ``depth_features_[t][d]`` is one of
+        ``level_features_[t][d]``.
+
     Staged predictions (``staged_decision_function``,
     ``staged_predict_proba``, ``staged_predict``) yield one array per fitted
     round (``n_estimators_`` of them), each a new array; the last equals
@@ -612,7 +624,6 @@ class GradientBoostingRDT:
         self.train_score_ = None
         self.n_estimators_ = None
         self.depth_features_ = None
-        self.level_features_ = None
         self.n_features_ = None
         self.n_classes_ = None
         self.classes_ = None
@@ -669,8 +680,16 @@ class GradientBoostingRDT:
         self.train_score_ = np.array(self._model.train_score_)
         self.n_estimators_ = self._model.n_estimators_fitted_
         self.depth_features_ = [dict(d) for d in self._model.depth_features_]
-        self.level_features_ = [dict(d) for d in self._model.level_features_]
         return self
+
+    @property
+    def level_features_(self) -> Optional[List[Dict[int, List[int]]]]:
+        """Per tree, ``{depth: [candidate columns of X]}`` (see the class
+        docstring), replayed from the trees' seeds on each access; None
+        before ``fit``."""
+        if self._model is None:
+            return None
+        return [dict(d) for d in self._model.level_features_]
 
     def _check_predict_X(self, X, classification_only: bool = False, what: str = "") -> np.ndarray:
         if classification_only and self.task != "classification":

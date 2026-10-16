@@ -178,6 +178,12 @@ nb::dict int_map_to_dict(const std::map<int, int>& m) {
     return d;
 }
 
+nb::list int_maps_to_list(const std::vector<std::map<int, int>>& maps) {
+    nb::list out;
+    for (const auto& m : maps) out.append(int_map_to_dict(m));
+    return out;
+}
+
 nb::dict double_map_to_dict(const std::map<int, double>& m) {
     nb::dict d;
     for (const auto& kv : m) d[nb::int_(kv.first)] = kv.second;
@@ -192,6 +198,67 @@ GBLoss loss_from_string(const std::string& loss) {
     if (loss == "huber") return GBLoss::Huber;
     if (loss == "quantile") return GBLoss::Quantile;
     throw std::invalid_argument("Unknown loss: " + loss);
+}
+
+// Staged predictions of a fitted GradientBoostingModel, one boosting round
+// per __next__ (scikit-learn's staged_decision_function / staged_predict_proba
+// / staged_predict). The raw scores are accumulated natively, one round at a
+// time, with the GIL released; every stage is returned as a new array (no
+// buffer is shared between stages). The iterator keeps X and the model alive;
+// a refit of the model while iterating raises RuntimeError.
+class StagedScores {
+public:
+    enum class Kind { Decision, Proba, Predict };
+
+    StagedScores(const GradientBoostingModel& model, InputMatrix X, Kind kind)
+        : model_(&model), X_(std::move(X)), kind_(kind) {
+        UseGuard guard(model_, /*exclusive=*/false);
+        check_predict_shape(X_, model_->n_features());
+        generation_ = model_->fit_generation();
+        F_ = model_->init_score_matrix(X_.shape(0));
+    }
+
+    OutputArray next() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const MatrixView xv = to_matrix_view(X_);
+        const std::size_t n = xv.n_rows();
+        std::vector<double> out;
+        std::size_t width = 1;
+        {
+            UseGuard guard(model_, /*exclusive=*/false);
+            if (model_->fit_generation() != generation_) {
+                throw std::runtime_error("the model was refitted during staged prediction");
+            }
+            if (round_ >= model_->n_estimators_fitted()) throw nb::stop_iteration();
+            width = kind_ == Kind::Proba ? model_->n_classes() : kind_ == Kind::Decision ? model_->n_outputs() : 1;
+            out.resize(n * width);
+            nb::gil_scoped_release release;
+            model_->add_round(xv, round_, F_);
+            ++round_;
+            switch (kind_) {
+                case Kind::Decision: model_->scores_to_decision(F_, n, out.data()); break;
+                case Kind::Proba: model_->scores_to_proba(F_, n, out.data()); break;
+                case Kind::Predict: model_->scores_to_labels(F_, n, out.data()); break;
+            }
+        }
+        return to_numpy(std::move(out), n, width, /*two_d=*/width > 1 || kind_ == Kind::Proba);
+    }
+
+private:
+    const GradientBoostingModel* model_;
+    InputMatrix X_;
+    Kind kind_;
+    std::uint64_t generation_ = 0;
+    std::vector<std::vector<double>> F_;
+    std::size_t round_ = 0;
+    std::mutex mutex_;
+};
+
+StagedScores::Kind staged_kind_from_string(const std::string& kind) {
+    if (kind == "decision") return StagedScores::Kind::Decision;
+    if (kind == "proba") return StagedScores::Kind::Proba;
+    if (kind == "predict") return StagedScores::Kind::Predict;
+    throw std::invalid_argument("Unknown staged prediction kind: " + kind);
 }
 
 } // namespace
@@ -364,6 +431,10 @@ NB_MODULE(_rdt_native, m) {
                       [](const RandomForestModel& self) {
                           return read(self, [](auto& m) { return m.feature_subsets(); });
                       })
+        .def_prop_ro("depth_features_",
+                      [](const RandomForestModel& self) {
+                          return read(self, [](auto& m) { return int_maps_to_list(m.depth_features()); });
+                      })
         .def_prop_ro(
             "estimators_",
             [](const RandomForestModel& self) {
@@ -375,6 +446,10 @@ NB_MODULE(_rdt_native, m) {
                 });
             },
             nb::rv_policy::reference_internal);
+
+    nb::class_<StagedScores>(m, "StagedScores")
+        .def("__iter__", [](nb::handle self) { return nb::borrow(self); })
+        .def("__next__", &StagedScores::next);
 
     nb::class_<GradientBoostingModel>(m, "GradientBoostingModel")
         .def(nb::new_([](std::string task, std::string loss, int max_depth,
@@ -421,6 +496,39 @@ NB_MODULE(_rdt_native, m) {
         .def("predict_proba",
              [](const GradientBoostingModel& self, InputMatrix X) { return predict_proba_released(self, X); },
              "X"_a)
+        .def("decision_function",
+             [](const GradientBoostingModel& self, InputMatrix X) {
+                 const MatrixView xv = to_matrix_view(X);
+                 std::vector<double> out;
+                 std::size_t k = 0;
+                 {
+                     UseGuard guard(&self, /*exclusive=*/false);
+                     check_predict_shape(X, self.n_features());
+                     k = self.n_outputs();
+                     out.resize(xv.n_rows() * k);
+                     nb::gil_scoped_release release;
+                     self.decision_function_into(xv, out.data());
+                 }
+                 return to_numpy(std::move(out), xv.n_rows(), k, /*two_d=*/k > 1);
+             },
+             "X"_a)
+        .def("_staged",
+             [](const GradientBoostingModel& self, InputMatrix X, const std::string& kind) {
+                 return new StagedScores(self, std::move(X), staged_kind_from_string(kind));
+             },
+             "X"_a, "kind"_a, nb::keep_alive<0, 1>())
+        .def_prop_ro("init_scores_",
+                      [](const GradientBoostingModel& self) {
+                          return read(self, [](auto& m) { return m.init_scores(); });
+                      })
+        .def_prop_ro("n_outputs_",
+                      [](const GradientBoostingModel& self) {
+                          return read(self, [](auto& m) { return m.n_outputs(); });
+                      })
+        .def_prop_ro("depth_features_",
+                      [](const GradientBoostingModel& self) {
+                          return read(self, [](auto& m) { return int_maps_to_list(m.depth_features()); });
+                      })
         .def_prop_ro("classes_",
                       [](const GradientBoostingModel& self) {
                           return read(self, [](auto& m) { return m.classes(); });

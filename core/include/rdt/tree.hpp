@@ -176,10 +176,13 @@ public:
         for (std::size_t i = 0; i < X.n_rows(); ++i) leaf_proba(find_leaf(X, i), out + i * k);
     }
 
-    // Leaf reached by row `row` of X. `col_map` (nullptr = identity) maps
-    // this tree's feature indices to X's columns -- how the ensembles predict
-    // through a tree fitted on a column subset without copying X.
-    const Node* find_leaf(const MatrixView& X, std::size_t row, const std::uint32_t* col_map = nullptr) const {
+    // Leaf reached by row `row` of X (a MatrixView, or a StridedMatrix of
+    // float / double, whose values compare to the thresholds as doubles).
+    // `col_map` (nullptr = identity) maps this tree's feature indices to X's
+    // columns -- how the ensembles predict through a tree fitted on a column
+    // subset without copying X.
+    template <class Matrix>
+    const Node* find_leaf(const Matrix& X, std::size_t row, const std::uint32_t* col_map = nullptr) const {
         const Node* node = root_.get();
         while (!node->is_leaf()) {
             const std::size_t col = col_map ? static_cast<std::size_t>(col_map[node->split_feature])

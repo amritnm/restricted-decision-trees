@@ -32,17 +32,23 @@ version:
   ``min_child_weight`` (a hessian sum, no longer an alias of
   ``min_samples_leaf``) and ``max_delta_step`` with XGBoost's meanings and
   defaults (1, 0, 0, 1, 0).
-- ``n_iter_no_change`` / ``early_stopping_rounds``: aliases.
+- ``n_iter_no_change`` / ``early_stopping_rounds``: aliases -- the early
+  stopping patience. ``GradientBoostingRDT.fit`` without ``eval_set`` uses
+  scikit-learn's internal holdout (``validation_fraction`` of the rows,
+  unchanged from earlier releases); with XGBoost's ``eval_set`` the patience
+  applies to the eval set instead, every row trains, ``validation_fraction``
+  is ignored, and the ensemble is truncated to its best round.
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Dict, List, Optional, Union
 
 import numpy as np
 
 from . import RDT, _rdt_native
-from ._validation import check_X, check_X_y, check_sample_weight, check_tree_method
+from ._validation import check_eval_set, check_X, check_X_y, check_sample_weight, check_tree_method
 
 __all__ = ["RandomForestRDT", "GradientBoostingRDT"]
 
@@ -83,6 +89,19 @@ def _check_colsample_bylevel(value) -> float:
             or not (0.0 < float(value) <= 1.0):
         raise ValueError(f"colsample_bylevel must be a number in (0, 1], got {value!r}")
     return float(value)
+
+
+_EVAL_METRICS = {"classification": ("logloss", "auc", "error"), "regression": ("rmse", "mae")}
+_DEFAULT_EVAL_METRIC = {"classification": "logloss", "regression": "rmse"}
+_DEFAULT_TOL = 1e-4                 # the validation_fraction holdout's tol
+_DEFAULT_VALIDATION_FRACTION = 0.1
+
+
+def _check_patience(value) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < 1:
+        raise ValueError(
+            f"early_stopping_rounds / n_iter_no_change must be an int >= 1 (or None) with eval_set, got {value!r}")
+    return int(value)
 
 
 def _resolve_random_state(random_state) -> int:
@@ -366,9 +385,35 @@ class GradientBoostingRDT:
     mean of the gradient). The initial score is the weighted constant
     minimiser of the loss (prior log-odds, log class priors, mean, median,
     quantile). ``sample_weight``/``scale_pos_weight`` weight the trees, the
-    init, the leaf values, ``train_score_`` and the early-stopping
-    validation loss. See the module docstring for how reg_alpha/reg_lambda
-    differ from XGBoost's exact mechanics.
+    init, the leaf values, ``train_score_`` and the internal early-stopping
+    holdout's loss (an ``eval_set`` is weighted by ``eval_sample_weight``
+    only). See the module docstring for how reg_alpha/reg_lambda differ from
+    XGBoost's exact mechanics.
+
+    Early stopping, two ways, both with patience ``n_iter_no_change`` (alias
+    ``early_stopping_rounds``):
+
+    - ``fit(X, y)``: scikit-learn's internal holdout -- ``validation_fraction``
+      of the rows are held out of training and fitting stops once their loss
+      has not improved by more than ``tol`` for ``n_iter_no_change`` rounds;
+      every fitted round is kept.
+    - ``fit(X, y, eval_set=(X_val, y_val))``: XGBoost's way, on your own
+      validation set. Every row of ``X`` trains (``validation_fraction`` is
+      ignored -- a ``UserWarning`` says so if you set it). After each round
+      the eval set's raw scores are updated with that round's trees only
+      (routed by the raw thresholds, exactly as ``predict`` does, hist
+      included) and ``eval_metric`` is computed on them (``evals_result_``).
+      A round improves when its score beats the best so far by more than
+      ``tol`` (default 0 here: strictly better; ties do not count); fitting
+      stops once ``early_stopping_rounds`` rounds pass without improvement,
+      and the model is truncated to the best round (``best_iteration_``,
+      0-based; ``n_estimators_ = best_iteration_ + 1``) -- also when
+      ``n_estimators`` runs out first. The eval set never influences
+      training: the kept model is bit-for-bit the model
+      ``fit(X, y)`` with ``n_estimators=best_iteration_ + 1`` and no early
+      stopping gives (predictions, staged predictions, ``train_score_``,
+      importances, ``depth_features_``). Without a patience the metric is
+      only recorded.
 
     Parameters
     ----------
@@ -404,12 +449,35 @@ class GradientBoostingRDT:
         Chosen once per tree, not per node (see module docstring).
     colsample_bytree : {'sqrt', 'log2', None} or int or float, optional
         XGBoost/LightGBM-style alias of ``max_features``.
-    validation_fraction : float, default=0.1
+    validation_fraction : float, optional (default 0.1)
+        Fraction of the rows held out for the internal early-stopping check
+        (with ``n_iter_no_change`` and no ``eval_set``). Ignored when ``fit``
+        gets an ``eval_set``; setting it explicitly then warns.
     n_iter_no_change : int, optional
-        Enables early stopping when set (> 0).
+        Early-stopping patience; enables early stopping when set (> 0) --
+        on the internal holdout, or on ``fit``'s ``eval_set`` when one is
+        given (which needs an int >= 1).
     early_stopping_rounds : int, optional
         XGBoost-style alias of ``n_iter_no_change``.
-    tol : float, default=1e-4
+    tol : float, optional
+        Minimum improvement for early stopping: a round improves when its
+        score beats the best so far by more than ``tol``. Default: 1e-4 for
+        the internal holdout's loss (scikit-learn's default), 0 for the
+        ``eval_set`` metric (strict improvement, as XGBoost). With an
+        ``eval_set`` it is in the metric's units and must be >= 0.
+    eval_metric : str, optional
+        Metric computed on ``fit``'s ``eval_set`` after every round, and the
+        early stopping criterion with a patience. Each is a mean over the
+        eval rows weighted by ``eval_sample_weight`` (1 without):
+        classification ``'logloss'`` (default; ``-log p`` of the true class
+        from ``predict_proba``, clipped to ``[eps, 1 - eps]`` with float64's
+        machine epsilon, as scikit-learn's ``log_loss``), ``'auc'`` (binary
+        only, higher is better: area under the weighted ROC curve of the raw
+        score ``decision_function``, tied scores sharing a trapezoid as in
+        scikit-learn's ``roc_auc_score``; the order of ``predict_proba[:, 1]``
+        except where probabilities round to 1.0), ``'error'`` (the weighted
+        fraction ``predict`` misclassifies); regression ``'rmse'`` (default)
+        or ``'mae'``. Needs an ``eval_set``.
     reg_alpha : float, default=0.0
     reg_lambda : float, optional
         Default 0.0 with ``split_criterion='friedman_mse'`` (post-hoc shrink,
@@ -485,10 +553,23 @@ class GradientBoostingRDT:
     feature_importances_ : ndarray of shape (n_features,)
     train_score_ : ndarray
         Training loss (sample-weighted if weights were given) at each round
-        actually fitted.
+        of the model (``n_estimators_`` values; truncated with the model on
+        ``eval_set`` early stopping).
     n_estimators_ : int
-        Rounds actually fitted -- less than ``n_estimators`` if early
-        stopping triggered.
+        Rounds in the model -- less than ``n_estimators`` if the internal
+        holdout stopped early (patience rounds included), or
+        ``best_iteration_ + 1`` with ``eval_set`` early stopping.
+    best_iteration_ : int or None
+        ``eval_set`` early stopping only: the 0-based round with the best
+        ``eval_metric`` score, which the model is truncated to (as XGBoost's
+        ``best_iteration``). None otherwise.
+    best_score_ : float or None
+        ``eval_set`` early stopping only: the score at ``best_iteration_``.
+    evals_result_ : dict or None
+        With an ``eval_set``: ``{eval_metric: [score after round 1, ...]}``
+        for every round actually run -- including the patience rounds that
+        early stopping then discards, so it can be longer than
+        ``n_estimators_``. None without an ``eval_set``.
     depth_features_ : list of dict
         One dict per tree, ``{depth: feature}``, in the order the trees were
         fitted (round by round; a multiclass round fits one tree per class, in
@@ -522,10 +603,10 @@ class GradientBoostingRDT:
         subsample: float = 1.0,
         max_features: Union[str, int, float, None] = None,
         colsample_bytree: Union[str, int, float, None] = None,
-        validation_fraction: float = 0.1,
+        validation_fraction: Optional[float] = None,
         n_iter_no_change: Optional[int] = None,
         early_stopping_rounds: Optional[int] = None,
-        tol: float = 1e-4,
+        tol: Optional[float] = None,
         reg_alpha: float = 0.0,
         reg_lambda: Optional[float] = None,
         scale_pos_weight: Optional[float] = None,
@@ -539,10 +620,18 @@ class GradientBoostingRDT:
         tree_method: str = "exact",
         max_bin: int = 256,
         colsample_bylevel: float = 1.0,
+        eval_metric: Optional[str] = None,
     ):
         self.task = task.lower()
         if self.task not in ("classification", "regression"):
             raise ValueError("task must be 'classification' or 'regression'")
+
+        if eval_metric is not None:
+            eval_metric = str(eval_metric).lower()
+            if eval_metric not in _EVAL_METRICS[self.task]:
+                raise ValueError(f"For {self.task}, eval_metric must be one of {_EVAL_METRICS[self.task]}, "
+                                 f"got {eval_metric!r}")
+        self.eval_metric = eval_metric
 
         if loss is None:
             self.loss = "log_loss" if self.task == "classification" else "squared_error"
@@ -582,7 +671,10 @@ class GradientBoostingRDT:
         self.subsample = subsample
         self.max_features = _resolve_alias(
             max_features, None, colsample_bytree, "max_features", "colsample_bytree")
-        self.validation_fraction = validation_fraction
+        # None: the default (0.1); remembered so that an explicit value
+        # ignored by eval_set early stopping can be warned about.
+        self._validation_fraction_set = validation_fraction is not None
+        self.validation_fraction = _DEFAULT_VALIDATION_FRACTION if validation_fraction is None else validation_fraction
         self.n_iter_no_change = _resolve_alias(
             n_iter_no_change, None, early_stopping_rounds, "n_iter_no_change", "early_stopping_rounds")
         self.tol = tol
@@ -613,13 +705,38 @@ class GradientBoostingRDT:
         self.n_estimators_ = None
         self.depth_features_ = None
         self.level_features_ = None
+        self.best_iteration_ = None
+        self.best_score_ = None
+        self.evals_result_ = None
         self.n_features_ = None
         self.n_classes_ = None
         self.classes_ = None
 
         self._model = None
 
-    def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None) -> "GradientBoostingRDT":
+    def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None,
+            eval_set=None, eval_sample_weight=None) -> "GradientBoostingRDT":
+        """Fit the ensemble.
+
+        Parameters
+        ----------
+        X, y, sample_weight
+            Training data (``sample_weight`` / ``scale_pos_weight`` weight
+            training only).
+        eval_set : (X_val, y_val) tuple, or a list holding exactly one, optional
+            A validation set scored after every round with ``eval_metric``
+            (``evals_result_``) and, with ``early_stopping_rounds`` /
+            ``n_iter_no_change``, used for early stopping instead of the
+            internal ``validation_fraction`` holdout (see the class
+            docstring). As XGBoost's ``eval_set``, but only one set: a list
+            of several raises. ``X_val`` follows ``X``'s rules (finite;
+            ``tree_method='hist'``: float32 / float64 in any layout, read in
+            place without a copy); classification labels must occur in ``y``.
+        eval_sample_weight : array of shape (n_val,), or a list holding one, optional
+            Non-negative weights of the eval rows in ``eval_metric``
+            (XGBoost's ``sample_weight_eval_set``). Training weights never
+            apply to the eval set.
+        """
         hist = self.tree_method == "hist"
         X, y, sample_weight = check_X_y(X, y, sample_weight, any_float_layout=hist)
         self.n_features_ = X.shape[1]
@@ -645,24 +762,49 @@ class GradientBoostingRDT:
         if sample_weight is not None:
             sample_weight = check_sample_weight(sample_weight, len(y), "sample_weight combined with scale_pos_weight")
 
+        evals = check_eval_set(eval_set, eval_sample_weight, X.shape[1], any_float_layout=hist,
+                               classes=self.classes_ if self.task == "classification" else None)
+        patience = self.n_iter_no_change if self.n_iter_no_change is not None else 0
+        eval_metric = ""  # the native default; only read with an eval set
+        if evals is None:
+            if self.eval_metric is not None:
+                raise ValueError(f"eval_metric={self.eval_metric!r} needs an eval_set passed to fit.")
+            tol = _DEFAULT_TOL if self.tol is None else self.tol
+        else:
+            eval_metric = self.eval_metric or _DEFAULT_EVAL_METRIC[self.task]
+            if eval_metric == "auc" and self.n_classes_ != 2:
+                raise ValueError(f"eval_metric='auc' needs binary classification; y has {self.n_classes_} classes. "
+                                 "Use 'logloss' or 'error'.")
+            if self.n_iter_no_change is not None:
+                patience = _check_patience(self.n_iter_no_change)
+            tol = 0.0 if self.tol is None else self.tol
+            if not (isinstance(tol, (int, float, np.integer, np.floating)) and not isinstance(tol, (bool, np.bool_))
+                    and np.isfinite(tol) and tol >= 0):
+                raise ValueError(f"tol must be a finite number >= 0 with eval_set, got {self.tol!r}")
+            if patience and self._validation_fraction_set:
+                warnings.warn(
+                    f"validation_fraction={self.validation_fraction!r} is ignored: with eval_set, early stopping "
+                    "uses the eval set and every row of X trains.", UserWarning, stacklevel=2)
+
         # The native fit runs with the GIL released; only publish the model
         # once it is fully fitted.
         model = _rdt_native.GradientBoostingModel(
             self.task, self.loss, self.max_depth, self.min_samples_split, self.min_samples_leaf,
             self.min_impurity_decrease, self.n_estimators, self.learning_rate, self.subsample,
             _resolve_max_features(self.max_features), self.validation_fraction,
-            self.n_iter_no_change if self.n_iter_no_change is not None else 0, self.tol,
+            patience, tol,
             self.reg_alpha, self.reg_lambda, self.huber_delta, self.quantile_alpha,
             _resolve_random_state(self.random_state), _resolve_n_jobs(self.n_jobs), presort=self.presort,
             split_criterion=self.split_criterion,
             min_child_weight=float(self.min_child_weight) if self.split_criterion == "newton" else 1.0,
             max_delta_step=float(self.max_delta_step), tree_method=self.tree_method, max_bin=self.max_bin,
-            colsample_bylevel=self.colsample_bylevel,
+            colsample_bylevel=self.colsample_bylevel, eval_metric=eval_metric,
         )
+        X_val, y_val, w_val = evals if evals is not None else (None, None, None)
         if hist:
-            model.fit_hist(X, y, sample_weight)
+            model.fit_hist(X, y, sample_weight, X_val, y_val, w_val)
         else:
-            model.fit(X, y, sample_weight)
+            model.fit(X, y, sample_weight, X_val, y_val, w_val)
         self._model = model
 
         self.feature_importances_ = np.array(self._model.feature_importances_)
@@ -670,6 +812,10 @@ class GradientBoostingRDT:
         self.n_estimators_ = self._model.n_estimators_fitted_
         self.depth_features_ = [dict(d) for d in self._model.depth_features_]
         self.level_features_ = [dict(d) for d in self._model.level_features_]
+        self.evals_result_ = None if evals is None else {eval_metric: [float(v) for v in self._model.evals_result_]}
+        early_stopped = evals is not None and patience > 0
+        self.best_iteration_ = int(self._model.best_iteration_) if early_stopped else None
+        self.best_score_ = float(self._model.best_score_) if early_stopped else None
         return self
 
     def _check_predict_X(self, X, classification_only: bool = False, what: str = "") -> np.ndarray:

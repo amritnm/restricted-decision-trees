@@ -33,6 +33,8 @@ import pytest
 from rdt import RDT, _rdt_native
 from rdt.ensemble import GradientBoostingRDT, RandomForestRDT
 
+from _peak_rss import PEAK_RSS, require_peak_rss  # tests/_peak_rss.py
+
 
 # --------------------------------------------------------------------------- exact rational tie check
 def _F(v):
@@ -535,19 +537,10 @@ def test_memmap_input(tmp_path):
             _same_models(_fit_all(X.astype(np.float32).astype(np.float64), y), got, X.astype(np.float32))
 
 
-_FIT_MEMORY_SCRIPT = textwrap.dedent("""
-    import resource, sys
+_FIT_MEMORY_SCRIPT = PEAK_RSS + textwrap.dedent("""
+    import sys
     import numpy as np
     from rdt.ensemble import GradientBoostingRDT, RandomForestRDT
-
-    def peak():
-        if sys.platform.startswith("linux"):
-            # VmHWM: this process's own peak. Linux carries ru_maxrss across execve, so it would
-            # start at the RSS of the (pytest) process that forked this one.
-            with open("/proc/self/status") as f:
-                return next(int(line.split()[1]) for line in f if line.startswith("VmHWM:")) * 1024
-        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return r if sys.platform == "darwin" else r * 1024
 
     kind, layout = sys.argv[1], sys.argv[2]
     rng = np.random.default_rng(0)
@@ -570,7 +563,7 @@ _FIT_MEMORY_SCRIPT = textwrap.dedent("""
 
 @pytest.mark.parametrize("kind,layout", [("gb", "f64C"), ("rf", "f32F")])
 def test_hist_fit_does_not_copy_X(kind, layout):
-    pytest.importorskip("resource")
+    require_peak_rss()
     out = subprocess.run([sys.executable, "-c", _FIT_MEMORY_SCRIPT, kind, layout],
                          capture_output=True, text=True, check=True).stdout.split()
     growth, x_bytes = int(out[0]), int(out[1])
@@ -580,19 +573,10 @@ def test_hist_fit_does_not_copy_X(kind, layout):
     assert growth < bins + 0.5 * x_bytes, f"fit grew peak RSS by {growth / 2**20:.0f} MiB (X is {x_bytes / 2**20:.0f} MiB)"
 
 
-_TALL_FIT_MEMORY_SCRIPT = textwrap.dedent("""
-    import resource, sys
+_TALL_FIT_MEMORY_SCRIPT = PEAK_RSS + textwrap.dedent("""
+    import sys
     import numpy as np
     from rdt import RDT
-
-    def peak():
-        if sys.platform.startswith("linux"):
-            # VmHWM: this process's own peak. Linux carries ru_maxrss across execve, so it would
-            # start at the RSS of the (pytest) process that forked this one.
-            with open("/proc/self/status") as f:
-                return next(int(line.split()[1]) for line in f if line.startswith("VmHWM:")) * 1024
-        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return r if sys.platform == "darwin" else r * 1024
 
     rng = np.random.default_rng(0)
     n, p = 500000, 64                       # tall and narrow, float32 C order: 122 MiB
@@ -611,7 +595,7 @@ _TALL_FIT_MEMORY_SCRIPT = textwrap.dedent("""
 def test_hist_binning_buffers_stay_small_on_tall_X():
     # Binning sorts each column's training values; on tall X the per-thread sort buffers must not
     # gather many columns at once (a block of 16 float32 columns per thread is 2.6x X at n_jobs=4).
-    pytest.importorskip("resource")
+    require_peak_rss()
     out = subprocess.run([sys.executable, "-c", _TALL_FIT_MEMORY_SCRIPT], capture_output=True, text=True,
                          check=True).stdout.split()
     growth, x_bytes = int(out[0]), int(out[1])

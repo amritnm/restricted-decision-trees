@@ -68,8 +68,10 @@ jobs:
       - name: Install test dependencies
         # xgboost >= 3.4 (needed by the parity tests) requires Python >= 3.12;
         # on older Pythons those tests skip via importorskip(minversion=...).
+        # psutil: the memory tests read the peak working set with it on Windows.
         run: |
-          python -m pip install pytest numpy scikit-learn "xgboost>=3.4; python_version >= '3.12'"
+          python -m pip install pytest numpy scikit-learn "xgboost>=3.4; python_version >= '3.12'" \
+            "psutil; sys_platform == 'win32'"
           python -m pip list
           python -c "import rdt, sys; print(rdt.__file__, sys.version)"
 

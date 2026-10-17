@@ -35,6 +35,8 @@ import pytest
 from rdt import RDT
 from rdt.ensemble import GradientBoostingRDT, RandomForestRDT
 
+from _peak_rss import PEAK_RSS, require_peak_rss  # tests/_peak_rss.py
+
 TIE_RTOL = 1e-12
 
 
@@ -333,19 +335,10 @@ def test_colsample_bylevel_draws_do_not_change():
 # without a cache (a cached warm-up fit frees its arena). Before that, Linux measured 0 MiB of growth
 # with a 32 MiB budget and ~40 MiB without one (so the bound could not fail there), and macOS counted
 # none of the budgeted cache (it reused the warm-up's pages).
-_CACHE_MEMORY_SCRIPT = textwrap.dedent("""
-    import resource, sys
+_CACHE_MEMORY_SCRIPT = PEAK_RSS + textwrap.dedent("""
+    import sys
     import numpy as np
     from rdt.ensemble import GradientBoostingRDT
-
-    def peak():
-        if sys.platform.startswith("linux"):
-            # VmHWM: this process's own peak. Linux carries ru_maxrss across execve, so it would
-            # start at the RSS of the (pytest) process that forked this one.
-            with open("/proc/self/status") as f:
-                return next(int(line.split()[1]) for line in f if line.startswith("VmHWM:")) * 1024
-        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return r if sys.platform == "darwin" else r * 1024
 
     rng = np.random.default_rng(0)
     n, p = 20000, 400
@@ -364,7 +357,7 @@ _CACHE_MEMORY_SCRIPT = textwrap.dedent("""
 
 
 def test_cache_budget_bounds_memory():
-    pytest.importorskip("resource")
+    require_peak_rss()
 
     def growth(mb):
         out = subprocess.run([sys.executable, "-c", _CACHE_MEMORY_SCRIPT, str(mb)], capture_output=True, text=True,
@@ -381,19 +374,10 @@ def test_cache_budget_bounds_memory():
     assert unbounded > direct + 100 * 2**20, (direct / 2**20, unbounded / 2**20)
 
 
-_MULTICLASS_MEMORY_SCRIPT = textwrap.dedent("""
-    import resource, sys
+_MULTICLASS_MEMORY_SCRIPT = PEAK_RSS + textwrap.dedent("""
+    import sys
     import numpy as np
     from rdt.ensemble import GradientBoostingRDT
-
-    def peak():
-        if sys.platform.startswith("linux"):
-            # VmHWM: this process's own peak. Linux carries ru_maxrss across execve, so it would
-            # start at the RSS of the (pytest) process that forked this one.
-            with open("/proc/self/status") as f:
-                return next(int(line.split()[1]) for line in f if line.startswith("VmHWM:")) * 1024
-        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return r if sys.platform == "darwin" else r * 1024
 
     rng = np.random.default_rng(0)
     n, p = 20000, 200
@@ -412,7 +396,7 @@ _MULTICLASS_MEMORY_SCRIPT = textwrap.dedent("""
 
 
 def test_multiclass_cache_budget_is_per_tree_being_fitted():
-    pytest.importorskip("resource")
+    require_peak_rss()
 
     def growth(mb):
         out = subprocess.run([sys.executable, "-c", _MULTICLASS_MEMORY_SCRIPT, str(mb)], capture_output=True,

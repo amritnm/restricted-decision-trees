@@ -33,6 +33,8 @@ from sklearn.metrics import log_loss, mean_absolute_error, mean_squared_error, r
 
 from rdt.ensemble import GradientBoostingRDT
 
+from _peak_rss import PEAK_RSS, require_peak_rss  # tests/_peak_rss.py
+
 
 # --------------------------------------------------------------------------- data / scenarios
 def _make(rng, task, n_classes, n, p, quantize):
@@ -553,14 +555,10 @@ def test_hist_eval_set_memmap(tmp_path):
     assert a.evals_result_ == b.evals_result_
 
 
-_EVAL_MEMORY_SCRIPT = textwrap.dedent("""
-    import resource, sys
+_EVAL_MEMORY_SCRIPT = PEAK_RSS + textwrap.dedent("""
+    import sys
     import numpy as np
     from rdt.ensemble import GradientBoostingRDT
-
-    def peak():
-        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return r if sys.platform == "darwin" else r * 1024
 
     rng = np.random.default_rng(0)
     m, p = 40000, 1000                                   # X_val: 160 MB of float32, Fortran order
@@ -580,7 +578,7 @@ _EVAL_MEMORY_SCRIPT = textwrap.dedent("""
 
 
 def test_hist_float32_eval_set_is_not_copied():
-    pytest.importorskip("resource")
+    require_peak_rss()
     out = subprocess.run([sys.executable, "-c", _EVAL_MEMORY_SCRIPT], capture_output=True, text=True,
                          check=True).stdout.split()
     growth, xv_bytes = int(out[0]), int(out[1])

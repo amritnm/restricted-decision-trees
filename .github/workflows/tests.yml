@@ -49,6 +49,12 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -v .
 
+      - name: Install libomp (macOS)
+        # The macOS xgboost wheels link against Homebrew's libomp.dylib, which
+        # the runner image does not ship.
+        if: runner.os == 'macOS'
+        run: brew install libomp
+
       - name: Install test dependencies
         # xgboost >= 3.4 (needed by the parity tests) requires Python >= 3.12;
         # on older Pythons those tests skip via importorskip(minversion=...).
@@ -56,6 +62,11 @@ jobs:
           python -m pip install pytest numpy scikit-learn "xgboost>=3.4; python_version >= '3.12'"
           python -m pip list
           python -c "import rdt, sys; print(rdt.__file__, sys.version)"
+
+      - name: Check xgboost loads
+        # Fail here rather than let the parity tests error at collection.
+        if: matrix.python != '3.10'
+        run: python -c "import xgboost; print('xgboost', xgboost.__version__)"
 
       - name: Run tests
         run: python -m pytest tests -ra --durations=15

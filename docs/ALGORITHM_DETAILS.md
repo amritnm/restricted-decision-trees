@@ -208,6 +208,30 @@ MAE(S) = mean(|y_i - median(y)|)
 ```
 More robust to outliers; leads to a median prediction in leaves.
 
+### Newton criterion (gradient boosting, `split_criterion="newton"`)
+
+Each boosting round's tree can instead be grown on per-row gradients `g_i`
+and hessians `h_i` of the loss (multiplied by the sample weight), as XGBoost
+does. With `G`, `H` a node's sums and `T(G) = sign(G)·max(|G| - alpha, 0)`:
+
+```
+score(G, H) = T(G)^2 / (H + lambda)              (0 if H <= 0)
+gain        = score(G_L, H_L) + score(G_R, H_R) - score(G, H)
+```
+
+(when `max_delta_step > 0`, `score` is evaluated at the clipped weight
+`w`: `-(2 G w + (H + lambda) w^2 + 2 alpha |w|)`, as XGBoost ≥ 3.4 does;
+3.0–3.3 leave out the `2 alpha |w|` term). A node's best threshold is
+the valid boundary (both children `H >= min_child_weight` and `> 0`, and the
+`min_samples_leaf` count rule) with the highest gain; the node splits only if
+that gain is `>= gamma` and `> 1e-6`. The depth's feature is the one that
+maximises `sum over splitting nodes of (gain - gamma)`; nodes it does not
+split become leaves, so pruning by `gamma` happens node by node as the tree
+grows (like XGBoost's `hist`; XGBoost's `exact` prunes after growing).
+Leaves hold `-T(G) / (H + lambda)`, clipped to `±max_delta_step` when that is
+`> 0`. The presorted search and the per-node search evaluate the same
+expressions in the same order and agree bit for bit.
+
 ## Leaf prediction
 
 **Classification**: the majority class among the leaf's samples (ties broken

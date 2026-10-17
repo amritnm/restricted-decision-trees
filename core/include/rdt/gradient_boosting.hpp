@@ -44,14 +44,27 @@
 // the init, the leaf values and the loss reported in train_score_ / used for
 // early stopping.
 //
-// Splits are still chosen first-order (MSE on the gradient), not with
-// XGBoost's hessian-weighted gain. reg_alpha/reg_lambda are applied as a
-// post-hoc shrink of each fitted tree's *predictions* (equivalent to
-// shrinking its leaf values, since predict() just returns the landed-on
-// leaf's value) -- soft-threshold for alpha, ridge-style denominator shrink
-// for lambda. A real effect, but not XGBoost's exact regularised leaf
-// formula.
+// With the default split criterion (friedman_mse) splits are chosen
+// first-order (MSE on the gradient), not with XGBoost's hessian-weighted gain,
+// and reg_alpha/reg_lambda are applied as a post-hoc shrink of each fitted
+// tree's *predictions* (equivalent to shrinking its leaf values, since
+// predict() just returns the landed-on leaf's value) -- soft-threshold for
+// alpha, ridge-style denominator shrink for lambda. A real effect, but not
+// XGBoost's exact regularised leaf formula.
+//
+// split_criterion = newton grows each tree XGBoost's way instead (see
+// Criterion::Newton in tree.hpp): per-row gradients g = dL/dF and hessians h
+// (times the sample weight) -- log_loss: g = p - y, h = max(p(1-p), 1e-16)
+// (binary), h = max(2p(1-p) w, 1e-16) (multiclass, per class, as XGBoost's
+// softmax); exponential: g = -y~ e, h = e with e = exp(-y~ F); squared_error:
+// g = F - y, h = 1 -- splits by the gain T(G)^2/(H+lambda) with gamma,
+// min_child_weight (a hessian sum) and max_delta_step, and leaves
+// -T(G)/(H+lambda) (clipped), shrunk by learning_rate. reg_alpha/reg_lambda
+// enter only these formulas (no post-hoc shrink, no Friedman leaf step).
+// Losses without a hessian (absolute_error, huber, quantile) are rejected.
 namespace rdt {
+
+enum class SplitCriterion { FriedmanMSE, Newton };
 
 enum class GBLoss {
     LogLoss,        // classification: binary + multiclass
@@ -74,6 +87,10 @@ struct GBParams {
     double tol = 1e-4;
     double reg_alpha = 0.0;
     double reg_lambda = 0.0;
+    SplitCriterion split_criterion = SplitCriterion::FriedmanMSE;
+    // Newton only (XGBoost's meaning; gamma is tree_params.min_impurity_decrease):
+    double min_child_weight = 1.0; // hessian sum per child
+    double max_delta_step = 0.0;
     double huber_delta = 1.0;
     double quantile_alpha = 0.5;
     std::uint64_t random_state = 0;
@@ -99,6 +116,11 @@ public:
         train_score_.clear();
         rounds_fitted_ = 0;
 
+        if (newton() && !(params_.loss == GBLoss::LogLoss || params_.loss == GBLoss::Exponential ||
+                          params_.loss == GBLoss::SquaredError)) {
+            throw std::invalid_argument(
+                "split_criterion='newton' needs a loss with a hessian (log_loss, exponential, squared_error)");
+        }
         bool is_classification = params_.tree_params.task == Task::Classification;
         if (is_classification) {
             std::vector<double> labels(n);
@@ -168,6 +190,9 @@ public:
         // are written/read); reused across rounds. Replaces v0.2.0's per-round
         // unordered_map from row to residual.
         std::vector<std::vector<double>> residual(n_outputs, std::vector<double>(n, 0.0));
+        // Newton: hessian per output, indexed like residual (which then holds
+        // the gradient dL/dF rather than its negative).
+        std::vector<std::vector<double>> hessian(newton() ? n_outputs : 0, std::vector<double>(n, 0.0));
 
         for (std::size_t round = 0; round < n_est; ++round) {
             std::vector<RDTModel> round_trees;
@@ -175,7 +200,14 @@ public:
             for (std::size_t k = 0; k < n_outputs; ++k) {
                 TreeParams tp = params_.tree_params;
                 tp.task = Task::Regression;
-                tp.criterion = Criterion::MSE;
+                tp.criterion = newton() ? Criterion::Newton : Criterion::MSE;
+                if (newton()) {
+                    tp.newton.reg_lambda = params_.reg_lambda;
+                    tp.newton.reg_alpha = params_.reg_alpha;
+                    tp.newton.gamma = params_.tree_params.min_impurity_decrease;
+                    tp.newton.min_child_weight = params_.min_child_weight;
+                    tp.newton.max_delta_step = params_.max_delta_step;
+                }
                 tp.retain_indices = false; // see TreeParams::retain_indices
                 round_trees.emplace_back(tp);
             }
@@ -216,9 +248,18 @@ public:
 
             pool.parallel_for(n_outputs, [&](std::size_t k) {
                 std::vector<double>& residual_k = residual[k];
-                for (std::size_t r = 0; r < train_rows.size(); ++r) {
-                    std::uint32_t i = train_rows[r];
-                    residual_k[i] = negative_gradient(i, k, y_enc, F, n_outputs);
+                if (newton()) {
+                    std::vector<double>& hessian_k = hessian[k];
+                    for (std::size_t r = 0; r < train_rows.size(); ++r) {
+                        std::uint32_t i = train_rows[r];
+                        const double w = sample_weight ? (*sample_weight)[i] : 1.0;
+                        gradient_hessian(i, k, y_enc, F, n_outputs, w, residual_k[i], hessian_k[i]);
+                    }
+                } else {
+                    for (std::size_t r = 0; r < train_rows.size(); ++r) {
+                        std::uint32_t i = train_rows[r];
+                        residual_k[i] = negative_gradient(i, k, y_enc, F, n_outputs);
+                    }
                 }
                 const std::vector<std::uint32_t>& fit_rows = round_fit_rows[k];
                 const std::vector<std::uint32_t>& col_subset = round_col_subsets[k];
@@ -228,14 +269,17 @@ public:
                 const std::size_t m = fit_rows.size();
                 IndexedMatrixView X_sub(X, fit_rows.data(), m, col_subset.data(), col_subset.size());
                 std::vector<double> fit_residual(m);
-                std::vector<double> fit_weight;
+                std::vector<double> fit_weight, fit_hessian;
                 if (sample_weight) fit_weight.resize(m);
+                if (newton()) fit_hessian.resize(m);
                 for (std::size_t r = 0; r < m; ++r) {
                     fit_residual[r] = residual_k[fit_rows[r]];
                     if (sample_weight) fit_weight[r] = (*sample_weight)[fit_rows[r]];
+                    if (newton()) fit_hessian[r] = hessian[k][fit_rows[r]];
                 }
                 VectorView residual_view(fit_residual.data(), m);
                 VectorView w_view(fit_weight.data(), fit_weight.size());
+                VectorView h_view(fit_hessian.data(), fit_hessian.size());
 
                 // This round's presorted columns: the per-fit ones for
                 // col_subset, restricted to fit_rows and renumbered to the
@@ -253,9 +297,11 @@ public:
                         presorted = round_sorted.view();
                     }
                 }
+                // Newton trees set their own leaf values (and take the
+                // sample weights only to leave zero-weight rows out).
                 round_trees[k].fit(X_sub, residual_view, sample_weight ? &w_view : nullptr,
-                                   presort ? &presorted : nullptr);
-                if (has_newton_leaf_step()) {
+                                   presort ? &presorted : nullptr, nullptr, newton() ? &h_view : nullptr);
+                if (!newton() && has_newton_leaf_step()) {
                     update_leaf_values(round_trees[k], X, col_subset, fit_rows, fit_residual,
                                        sample_weight ? &fit_weight : nullptr, y_enc[k], n_outputs);
                 }
@@ -558,6 +604,49 @@ private:
         return init;
     }
 
+    bool newton() const { return params_.split_criterion == SplitCriterion::Newton; }
+
+    // Newton: gradient dL/dF and hessian of the loss w.r.t. output k's raw
+    // score at sample i, times the sample weight w, as XGBoost computes them
+    // (binary:logistic, multi:softprob, reg:squarederror; exponential by the
+    // same rules).
+    void gradient_hessian(std::size_t i, std::size_t k, const std::vector<std::vector<double>>& y_enc,
+                          const std::vector<std::vector<double>>& F, std::size_t n_outputs, double w,
+                          double& g, double& h) const {
+        constexpr double kHessEps = 1e-16; // XGBoost's floor on logistic / softmax hessians
+        const double target = y_enc[k][i];
+        const double f = F[k][i];
+        switch (params_.loss) {
+            case GBLoss::LogLoss:
+                if (n_outputs == 1) {
+                    const double p = sigmoid_like(f);
+                    g = (p - target) * w;
+                    h = std::max(p * (1.0 - p), kHessEps) * w;
+                } else {
+                    double max_f = F[0][i];
+                    for (std::size_t j = 1; j < n_outputs; ++j) max_f = std::max(max_f, F[j][i]);
+                    double sum = 0.0;
+                    for (std::size_t j = 0; j < n_outputs; ++j) sum += std::exp(F[j][i] - max_f);
+                    const double p = std::exp(f - max_f) / sum;
+                    g = (p - target) * w;
+                    h = std::max(2.0 * p * (1.0 - p) * w, kHessEps);
+                }
+                return;
+            case GBLoss::Exponential: {
+                const double e = std::exp(-target * f); // target in {-1, +1}
+                g = -target * e * w;
+                h = e * w;
+                return;
+            }
+            case GBLoss::SquaredError:
+                g = (f - target) * w;
+                h = w;
+                return;
+            default:
+                throw std::logic_error("gradient_hessian: loss has no hessian");
+        }
+    }
+
     bool has_newton_leaf_step() const {
         return params_.loss == GBLoss::LogLoss || params_.loss == GBLoss::Exponential;
     }
@@ -632,15 +721,17 @@ private:
         return 0.0;
     }
 
+    // Friedman mode's post-hoc reg_lambda / reg_alpha shrink (newton leaves
+    // are already regularised).
     double shrink_leaf_value(double v) const {
-        if (params_.reg_lambda == 0.0 && params_.reg_alpha == 0.0) return v;
+        if (newton() || (params_.reg_lambda == 0.0 && params_.reg_alpha == 0.0)) return v;
         double shrunk = v / (1.0 + params_.reg_lambda);
         double sign = shrunk > 0 ? 1.0 : (shrunk < 0 ? -1.0 : 0.0);
         return sign * std::max(std::abs(shrunk) - params_.reg_alpha, 0.0);
     }
 
     void shrink_leaf_values(std::vector<double>& values) const {
-        if (params_.reg_lambda == 0.0 && params_.reg_alpha == 0.0) return;
+        if (newton() || (params_.reg_lambda == 0.0 && params_.reg_alpha == 0.0)) return;
         for (double& v : values) v = shrink_leaf_value(v);
     }
 

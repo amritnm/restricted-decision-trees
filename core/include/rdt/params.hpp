@@ -7,7 +7,9 @@ namespace rdt {
 
 enum class Task { Classification, Regression };
 
-enum class Criterion { Gini, Entropy, MSE, MAE };
+// Newton: XGBoost's second-order gain on per-row gradients / hessians
+// (gradient boosting with split_criterion='newton'; regression task only).
+enum class Criterion { Gini, Entropy, MSE, MAE, Newton };
 
 inline Criterion default_criterion(Task task) {
     return task == Task::Classification ? Criterion::Gini : Criterion::MSE;
@@ -18,6 +20,7 @@ inline Criterion criterion_from_string(const std::string& name) {
     if (name == "entropy") return Criterion::Entropy;
     if (name == "mse") return Criterion::MSE;
     if (name == "mae") return Criterion::MAE;
+    if (name == "newton") return Criterion::Newton;
     throw std::invalid_argument("Unknown criterion: " + name);
 }
 
@@ -27,9 +30,22 @@ inline std::string to_string(Criterion c) {
         case Criterion::Entropy: return "entropy";
         case Criterion::MSE: return "mse";
         case Criterion::MAE: return "mae";
+        case Criterion::Newton: return "newton";
     }
     return "";
 }
+
+// XGBoost's split / leaf parameters for Criterion::Newton, with XGBoost's
+// meaning and defaults. A node's score is score(G, H) = T(G)^2 / (H + lambda),
+// T(G) = sign(G) * max(|G| - alpha, 0) (XGBoost's code scale: no 1/2); a split's
+// gain is score(left) + score(right) - score(node).
+struct NewtonParams {
+    double reg_lambda = 1.0;
+    double reg_alpha = 0.0;
+    double gamma = 0.0;            // min_split_loss: a node splits only if its gain >= gamma
+    double min_child_weight = 1.0; // minimum hessian sum in each child
+    double max_delta_step = 0.0;   // > 0: leaf weights clipped to +-max_delta_step
+};
 
 struct TreeParams {
     Task task = Task::Classification;
@@ -46,6 +62,9 @@ struct TreeParams {
     // each depth); XGBoost/LightGBM's closest equivalent is
     // gamma/min_split_loss, on a different (unnormalised gain) scale.
     double min_impurity_decrease = 0.0;
+    // Criterion::Newton only (min_impurity_decrease is not used then: gamma
+    // gates each node's split instead).
+    NewtonParams newton;
 
     // Implementation choices that do not change which splits are chosen.
     //

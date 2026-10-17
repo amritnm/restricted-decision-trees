@@ -134,6 +134,27 @@ void fit_released(Model& self, const InputMatrix& X, const InputVector& y,
     self.fit(xv, yv, wv ? &*wv : nullptr);
 }
 
+// RDTModel::fit, with the per-row hessians a criterion='newton' tree needs.
+void fit_tree_released(RDTModel& self, const InputMatrix& X, const InputVector& y,
+                       const std::optional<InputVector>& sample_weight, const std::optional<InputVector>& hessian) {
+    check_fit_shapes(X, y, sample_weight);
+    if (hessian && hessian->shape(0) != X.shape(0)) throw std::invalid_argument("X and hessian have different numbers of rows");
+    const MatrixView xv = to_matrix_view(X);
+    const VectorView yv = to_vector_view(y);
+    std::optional<VectorView> wv, hv;
+    if (sample_weight) wv = to_vector_view(*sample_weight);
+    if (hessian) hv = to_vector_view(*hessian);
+    UseGuard guard(&self, /*exclusive=*/true);
+    nb::gil_scoped_release release;
+    self.fit(xv, yv, wv ? &*wv : nullptr, nullptr, hv ? &*hv : nullptr);
+}
+
+SplitCriterion split_criterion_from_string(const std::string& name) {
+    if (name == "friedman_mse") return SplitCriterion::FriedmanMSE;
+    if (name == "newton") return SplitCriterion::Newton;
+    throw std::invalid_argument("Unknown split_criterion: " + name);
+}
+
 template <class Model>
 OutputArray predict_released(const Model& self, const InputMatrix& X) {
     const MatrixView xv = to_matrix_view(X);
@@ -292,10 +313,15 @@ NB_MODULE(_rdt_native, m) {
         .def_prop_ro("right", [](const Node& n) -> const Node* { return n.right.get(); },
                       nb::rv_policy::reference_internal);
 
+    // criterion='newton' (task='regression'): fit(X, gradient, hessian=...)
+    // grows an XGBoost-style tree on the given per-row gradients / hessians
+    // (as GradientBoostingRDT(split_criterion='newton') does each round); the
+    // reg_* / gamma / min_child_weight / max_delta_step arguments only apply then.
     nb::class_<RDTModel>(m, "RDTModel")
         .def(nb::new_([](std::string task, std::string criterion, int max_depth,
                           int min_samples_split, int min_samples_leaf, double min_impurity_decrease,
-                          bool presort) {
+                          bool presort, double reg_lambda, double reg_alpha, double gamma,
+                          double min_child_weight, double max_delta_step) {
                  TreeParams p;
                  p.task = (task == "classification") ? Task::Classification : Task::Regression;
                  p.criterion = criterion_from_string(criterion);
@@ -304,15 +330,20 @@ NB_MODULE(_rdt_native, m) {
                  p.min_samples_leaf = min_samples_leaf;
                  p.min_impurity_decrease = min_impurity_decrease;
                  p.presort = presort;
+                 p.newton.reg_lambda = reg_lambda;
+                 p.newton.reg_alpha = reg_alpha;
+                 p.newton.gamma = gamma;
+                 p.newton.min_child_weight = min_child_weight;
+                 p.newton.max_delta_step = max_delta_step;
                  return new RDTModel(p);
              }),
              "task"_a, "criterion"_a, "max_depth"_a, "min_samples_split"_a, "min_samples_leaf"_a,
-             "min_impurity_decrease"_a = 0.0, "presort"_a = true)
+             "min_impurity_decrease"_a = 0.0, "presort"_a = true, "reg_lambda"_a = 1.0, "reg_alpha"_a = 0.0,
+             "gamma"_a = 0.0, "min_child_weight"_a = 1.0, "max_delta_step"_a = 0.0)
         .def("fit",
-             [](RDTModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
-                 fit_released(self, X, y, sample_weight);
-             },
-             "X"_a, "y"_a, "sample_weight"_a = nb::none())
+             [](RDTModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight,
+                std::optional<InputVector> hessian) { fit_tree_released(self, X, y, sample_weight, hessian); },
+             "X"_a, "y"_a, "sample_weight"_a = nb::none(), "hessian"_a = nb::none())
         .def("predict", [](const RDTModel& self, InputMatrix X) { return predict_released(self, X); }, "X"_a)
         .def("predict_proba", [](const RDTModel& self, InputMatrix X) { return predict_proba_released(self, X); },
              "X"_a)
@@ -462,8 +493,12 @@ NB_MODULE(_rdt_native, m) {
                           int n_estimators, double learning_rate, double subsample,
                           MaxFeaturesSpec max_features, double validation_fraction, int n_iter_no_change,
                           double tol, double reg_alpha, double reg_lambda, double huber_delta,
-                          double quantile_alpha, std::uint64_t random_state, int n_jobs, bool presort) {
+                          double quantile_alpha, std::uint64_t random_state, int n_jobs, bool presort,
+                          std::string split_criterion, double min_child_weight, double max_delta_step) {
                  GBParams p;
+                 p.split_criterion = split_criterion_from_string(split_criterion);
+                 p.min_child_weight = min_child_weight;
+                 p.max_delta_step = max_delta_step;
                  p.tree_params.task = (task == "classification") ? Task::Classification : Task::Regression;
                  p.tree_params.max_depth = max_depth;
                  p.tree_params.min_samples_split = min_samples_split;
@@ -490,7 +525,8 @@ NB_MODULE(_rdt_native, m) {
              "min_impurity_decrease"_a, "n_estimators"_a, "learning_rate"_a, "subsample"_a,
              "max_features"_a, "validation_fraction"_a, "n_iter_no_change"_a, "tol"_a,
              "reg_alpha"_a, "reg_lambda"_a, "huber_delta"_a, "quantile_alpha"_a, "random_state"_a, "n_jobs"_a,
-             "presort"_a = true)
+             "presort"_a = true, "split_criterion"_a = "friedman_mse", "min_child_weight"_a = 1.0,
+             "max_delta_step"_a = 0.0)
         .def("fit",
              [](GradientBoostingModel& self, InputMatrix X, InputVector y, std::optional<InputVector> sample_weight) {
                  fit_released(self, X, y, sample_weight);

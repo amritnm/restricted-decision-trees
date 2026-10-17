@@ -65,9 +65,79 @@
 // -T(G)/(H+lambda) (clipped), shrunk by learning_rate. reg_alpha/reg_lambda
 // enter only these formulas (no post-hoc shrink, no Friedman leaf step).
 // Losses without a hessian (absolute_error, huber, quantile) are rejected.
+//
+// Early stopping, two ways (both with patience n_iter_no_change):
+//
+// - Without an eval set: scikit-learn's internal holdout. validation_fraction
+//   of the rows (drawn from random_state) are held out of training, and
+//   fitting stops once the holdout's (weighted) loss has not improved by more
+//   than tol for n_iter_no_change rounds. Every fitted round is kept.
+// - With an eval set (EvalSet: the caller's own validation rows, XGBoost's
+//   eval_set): every row trains (validation_fraction is ignored) and, after
+//   each round, the eval rows' raw scores are updated by that round's trees
+//   only, routed by the raw thresholds as predict() routes them, so they are
+//   exactly the staged decision function of the eval rows (hist trees
+//   included). eval_metric is computed on them each round (evals_result());
+//   a round improves when it beats the best score so far by more than tol
+//   (lower is better, AUC: higher); fitting stops once n_iter_no_change
+//   rounds pass without improvement, and the ensemble is then truncated to
+//   its best round (best_iteration(), 0-based) -- also when n_estimators ran
+//   out first. The eval set never influences the trees: rounds 0..best are
+//   bit-for-bit those of a fit with n_estimators = best + 1 and no eval set.
+//   With n_iter_no_change <= 0 the metric is only recorded.
 namespace rdt {
 
 enum class SplitCriterion { FriedmanMSE, Newton };
+
+// Per-round metric on an eval set. Default: LogLoss for classification, RMSE
+// for regression. Each is a weighted mean over the eval rows (the eval
+// weights, or 1), computed from predict_proba / predict / the raw scores
+// exactly as those methods produce them:
+// - LogLoss: -log(clip(p[true class], eps, 1 - eps)), eps = float64 machine
+//   epsilon (scikit-learn's log_loss on predict_proba);
+// - AUC (binary): area under the weighted ROC curve of the raw score, tied
+//   scores sharing a trapezoid (scikit-learn's roc_auc_score);
+// - Error: weight of the rows predict() misclassifies over the total weight;
+// - RMSE: sqrt of the weighted mean squared error; MAE: weighted mean
+//   absolute error (regression).
+enum class EvalMetric { Default, LogLoss, AUC, Error, RMSE, MAE };
+
+// An eval set's features, of any matrix type (a MatrixView, or a
+// StridedMatrix of float / double read in place): the boosting loop routes
+// their rows through each new tree by its raw thresholds, as predict() does.
+class EvalFeatures {
+public:
+    virtual ~EvalFeatures() = default;
+    virtual std::size_t n_rows() const = 0;
+    virtual std::size_t n_cols() const = 0;
+    // out[i - begin] = the value of the leaf that row i reaches in `tree`
+    // (whose features map to these columns through `cols`), i in [begin, end).
+    virtual void leaf_values(const RDTModel& tree, const std::uint32_t* cols, std::size_t begin, std::size_t end,
+                             double* out) const = 0;
+};
+
+template <class Matrix>
+class EvalFeaturesOf final : public EvalFeatures {
+public:
+    explicit EvalFeaturesOf(const Matrix& X) : X_(X) {}
+    std::size_t n_rows() const override { return X_.n_rows(); }
+    std::size_t n_cols() const override { return X_.n_cols(); }
+    void leaf_values(const RDTModel& tree, const std::uint32_t* cols, std::size_t begin, std::size_t end,
+                     double* out) const override {
+        for (std::size_t i = begin; i < end; ++i) out[i - begin] = tree.find_leaf(X_, i, cols)->value;
+    }
+
+private:
+    Matrix X_; // a non-owning view
+};
+
+// The caller's validation rows: features, targets (class labels, each one of
+// the training labels, for classification) and optional non-negative weights.
+struct EvalSet {
+    const EvalFeatures* X = nullptr;
+    VectorView y;
+    const VectorView* sample_weight = nullptr;
+};
 
 enum class GBLoss {
     LogLoss,        // classification: binary + multiclass
@@ -85,9 +155,10 @@ struct GBParams {
     double subsample = 1.0;              // row fraction per round, without replacement
     MaxFeaturesSpec max_features = MaxFeaturesSpec::All();
     GBLoss loss = GBLoss::LogLoss;        // caller defaults to SquaredError for regression
-    double validation_fraction = 0.1;
-    int n_iter_no_change = 0;             // <= 0 disables early stopping
+    double validation_fraction = 0.1;     // ignored when fit is given an eval set
+    int n_iter_no_change = 0;             // patience; <= 0 disables early stopping
     double tol = 1e-4;
+    EvalMetric eval_metric = EvalMetric::Default; // eval set only
     double reg_alpha = 0.0;
     double reg_lambda = 0.0;
     SplitCriterion split_criterion = SplitCriterion::FriedmanMSE;
@@ -109,13 +180,17 @@ public:
     GradientBoostingModel(GradientBoostingModel&&) = default;
     GradientBoostingModel& operator=(GradientBoostingModel&&) = default;
 
-    void fit(const MatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr) {
+    // `eval` (optional): the caller's validation rows, scored after every
+    // round (see the file comment); they are read, never copied, and never
+    // influence the trees.
+    void fit(const MatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr,
+             const EvalSet* eval = nullptr) {
         if (params_.tree_params.tree_method == TreeMethod::Hist) {
-            fit_hist(X, y, sample_weight);
+            fit_hist(X, y, sample_weight, eval);
             return;
         }
         const bool presort = params_.tree_params.presort && X.n_rows() <= kPresortMaxRows;
-        boost(X.n_rows(), X.n_cols(), y, sample_weight,
+        boost(X.n_rows(), X.n_cols(), y, sample_weight, eval,
               [&](const std::vector<std::uint32_t>& train_rows, ThreadPool&) {
                   return ExactSource(X, presort, train_rows);
               });
@@ -125,13 +200,15 @@ public:
     // without copying) is binned once -- cuts from the training rows (after the
     // early-stopping split) with positive weight, every row binned -- and is
     // not read again: the trees are fitted on the bins and the training scores
-    // (validation rows included) are updated through them.
+    // (validation rows included) are updated through them. An eval set is not
+    // binned: its rows are routed by the trees' raw thresholds.
     template <class Matrix>
-    void fit_hist(const Matrix& X, const VectorView& y, const VectorView* sample_weight = nullptr) {
+    void fit_hist(const Matrix& X, const VectorView& y, const VectorView* sample_weight = nullptr,
+                  const EvalSet* eval = nullptr) {
         if (params_.tree_params.tree_method != TreeMethod::Hist) {
             throw std::invalid_argument("fit_hist needs tree_method='hist'");
         }
-        boost(X.n_rows(), X.n_cols(), y, sample_weight,
+        boost(X.n_rows(), X.n_cols(), y, sample_weight, eval,
               [&](const std::vector<std::uint32_t>& train_rows, ThreadPool& pool) {
                   std::vector<std::uint32_t> cut_rows;
                   cut_rows.reserve(train_rows.size());
@@ -228,7 +305,7 @@ private:
     // (ExactSource / HistSource) once the training rows are known.
     template <class MakeSource>
     void boost(std::size_t n, std::size_t n_cols, const VectorView& y, const VectorView* sample_weight,
-               MakeSource&& make_source) {
+               const EvalSet* eval, MakeSource&& make_source) {
         ++fit_generation_;
         n_features_ = n_cols;
         classes_.clear();
@@ -236,6 +313,10 @@ private:
         feature_subsets_.clear();
         train_score_.clear();
         rounds_fitted_ = 0;
+        evals_result_.clear();
+        best_iteration_ = -1;
+        best_score_ = std::numeric_limits<double>::quiet_NaN();
+        resolved_eval_metric_ = EvalMetric::Default;
 
         if (newton() && !(params_.loss == GBLoss::LogLoss || params_.loss == GBLoss::Exponential ||
                           params_.loss == GBLoss::SquaredError)) {
@@ -256,13 +337,19 @@ private:
         const std::size_t n_outputs = (is_classification && classes_.size() > 2) ? classes_.size() : 1;
         n_outputs_ = n_outputs;
 
+        // The eval set is validated (and its targets encoded) before any work.
+        EvalState ev;
+        if (eval) ev = prepare_eval(*eval, n_cols);
+        const bool eval_stopping = eval && params_.n_iter_no_change > 0;
+
         // y encoded per-output as what each output's gradient formula needs:
         // multiclass -> one-hot; binary log_loss/exponential -> {0,1}/{-1,+1}; regression -> y itself.
         std::vector<std::vector<double>> y_enc = encode_targets(y, n, is_classification, n_outputs);
 
         Rng split_rng(derive_seed(params_.random_state, 0xF0));
         std::vector<std::uint32_t> train_rows, val_rows;
-        bool early_stopping = params_.n_iter_no_change > 0 && params_.validation_fraction > 0.0;
+        // The internal holdout: only without an eval set.
+        bool early_stopping = !eval && params_.n_iter_no_change > 0 && params_.validation_fraction > 0.0;
         if (early_stopping) {
             split_train_val(static_cast<std::uint32_t>(n), params_.validation_fraction, split_rng, train_rows, val_rows);
         } else {
@@ -292,6 +379,12 @@ private:
         for (std::size_t k = 0; k < n_outputs; ++k) {
             for (std::size_t i = 0; i < n; ++i) F[k][i] = init_scores_[k];
         }
+        if (eval) {
+            ev.F.assign(n_outputs, std::vector<double>());
+            for (std::size_t k = 0; k < n_outputs; ++k) ev.F[k].assign(ev.m, init_scores_[k]);
+        }
+        std::size_t eval_best_round = 0;
+        int eval_rounds_without_improve = 0;
 
         double best_val_score = std::numeric_limits<double>::infinity();
         int rounds_without_improve = 0;
@@ -470,6 +563,27 @@ private:
             double train_loss = compute_loss(y_enc, F, train_rows, n_outputs, sample_weight, row_pool, loss_terms);
             train_score_.push_back(train_loss);
 
+            if (eval) {
+                score_eval_round(ev, *eval, round * n_outputs, row_pool);
+                const double score = eval_score(ev);
+                evals_result_.push_back(score);
+                if (eval_stopping) {
+                    // Round 0 sets the best unconditionally; later rounds must
+                    // beat it by more than tol (ties are not improvements).
+                    const bool improved = round == 0 ||
+                        (ev.metric == EvalMetric::AUC ? score > best_score_ + params_.tol
+                                                      : score < best_score_ - params_.tol);
+                    if (improved) {
+                        best_score_ = score;
+                        eval_best_round = round;
+                        eval_rounds_without_improve = 0;
+                    } else {
+                        ++eval_rounds_without_improve;
+                    }
+                    if (eval_rounds_without_improve >= params_.n_iter_no_change) break;
+                }
+            }
+
             if (early_stopping) {
                 double val_loss = compute_loss(y_enc, F, val_rows, n_outputs, sample_weight, row_pool, loss_terms);
                 if (val_loss < best_val_score - params_.tol) {
@@ -482,7 +596,213 @@ private:
             }
         }
 
+        if (eval_stopping && rounds_fitted_ > 0) {
+            // Keep rounds 0..best: everything per-round (trees, their column
+            // subsets, train_score_) is cut back; importances, depth / level
+            // features and staged predictions follow from the kept trees.
+            best_iteration_ = static_cast<std::int64_t>(eval_best_round);
+            const std::size_t keep = eval_best_round + 1;
+            trees_.erase(trees_.begin() + static_cast<std::ptrdiff_t>(keep * n_outputs), trees_.end());
+            feature_subsets_.erase(feature_subsets_.begin() + static_cast<std::ptrdiff_t>(keep * n_outputs),
+                                   feature_subsets_.end());
+            train_score_.resize(keep);
+            rounds_fitted_ = keep;
+        }
+        if (eval) resolved_eval_metric_ = ev.metric;
+
         compute_feature_importances();
+    }
+
+    // ---- eval set (see the file comment and EvalMetric) ----
+
+    struct EvalState {
+        EvalMetric metric = EvalMetric::Default;
+        std::size_t m = 0;
+        std::vector<std::vector<double>> F;   // n_outputs x m raw scores, as the staged decision function
+        std::vector<double> target;           // regression targets
+        std::vector<std::uint32_t> cls;       // classification: index into classes_
+        std::vector<double> weight;           // empty: every row weighs 1
+        std::vector<std::pair<double, std::uint32_t>> order; // AUC: (score, row), reused every round
+        std::vector<double> exp_buf;          // multiclass softmax, reused
+    };
+
+    // Validates the eval set against the training data and the metric, and
+    // encodes its targets.
+    EvalState prepare_eval(const EvalSet& eval, std::size_t n_cols) const {
+        if (!eval.X) throw std::invalid_argument("eval set: no features");
+        const std::size_t m = eval.X->n_rows();
+        if (m == 0) throw std::invalid_argument("eval set: no rows");
+        if (eval.X->n_cols() != n_cols) {
+            throw std::invalid_argument("eval set: X_val has a different number of features than X");
+        }
+        if (eval.y.size() != m) throw std::invalid_argument("eval set: X_val and y_val have different numbers of rows");
+        if (eval.sample_weight && eval.sample_weight->size() != m) {
+            throw std::invalid_argument("eval set: X_val and its sample weights have different numbers of rows");
+        }
+        const bool is_classification = params_.tree_params.task == Task::Classification;
+        EvalState ev;
+        ev.m = m;
+        ev.metric = params_.eval_metric;
+        if (ev.metric == EvalMetric::Default) ev.metric = is_classification ? EvalMetric::LogLoss : EvalMetric::RMSE;
+        const bool classification_metric =
+            ev.metric == EvalMetric::LogLoss || ev.metric == EvalMetric::AUC || ev.metric == EvalMetric::Error;
+        if (classification_metric != is_classification) {
+            throw std::invalid_argument(is_classification
+                                            ? "eval_metric: classification takes 'logloss', 'auc' or 'error'"
+                                            : "eval_metric: regression takes 'rmse' or 'mae'");
+        }
+        if (ev.metric == EvalMetric::AUC && classes_.size() != 2) {
+            throw std::invalid_argument("eval_metric='auc' needs binary classification");
+        }
+        double total = 0.0;
+        if (eval.sample_weight) {
+            ev.weight.resize(m);
+            for (std::size_t i = 0; i < m; ++i) {
+                const double w = (*eval.sample_weight)[i];
+                if (!(std::isfinite(w) && w >= 0.0)) {
+                    throw std::invalid_argument("eval set: sample weights must be finite and non-negative");
+                }
+                ev.weight[i] = w;
+                total += w;
+            }
+            if (!(total > 0.0)) throw std::invalid_argument("eval set: sample weights sum to zero");
+        }
+        if (is_classification) {
+            ev.cls.resize(m);
+            double class_weight[2] = {0.0, 0.0};
+            for (std::size_t i = 0; i < m; ++i) {
+                const double label = eval.y[i];
+                auto it = std::lower_bound(classes_.begin(), classes_.end(), label);
+                if (it == classes_.end() || *it != label) {
+                    throw std::invalid_argument("eval set: y_val has a label that is not in the training y");
+                }
+                ev.cls[i] = static_cast<std::uint32_t>(it - classes_.begin());
+                if (classes_.size() == 2) class_weight[ev.cls[i]] += ev.weight.empty() ? 1.0 : ev.weight[i];
+            }
+            if (ev.metric == EvalMetric::AUC && !(class_weight[0] > 0.0 && class_weight[1] > 0.0)) {
+                throw std::invalid_argument(
+                    "eval_metric='auc' needs both classes in y_val (with positive eval sample weight)");
+            }
+            if (n_outputs_ > 1) ev.exp_buf.resize(n_outputs_);
+        } else {
+            ev.target.resize(m);
+            for (std::size_t i = 0; i < m; ++i) {
+                if (!std::isfinite(eval.y[i])) throw std::invalid_argument("eval set: y_val must be finite");
+                ev.target[i] = eval.y[i];
+            }
+        }
+        if (ev.metric == EvalMetric::AUC) ev.order.reserve(m);
+        return ev;
+    }
+
+    // Adds the round's trees (trees_[first_tree + k], k < n_outputs_) to the
+    // eval rows' raw scores, with add_leaf_value's arithmetic. Rows run in the
+    // row blocks of the other per-row passes and of prediction (for_blocks, on
+    // the boosting threads); each row's score is updated by one thread, in
+    // tree order, so the scores do not depend on the number of threads.
+    void score_eval_round(EvalState& ev, const EvalSet& eval, std::size_t first_tree, ThreadPool* pool) const {
+        for_blocks(pool, ev.m, [&](std::size_t begin, std::size_t end) {
+            std::vector<double> values(end - begin);
+            for (std::size_t k = 0; k < n_outputs_; ++k) {
+                const std::size_t t = first_tree + k;
+                eval.X->leaf_values(trees_[t], feature_subsets_[t].data(), begin, end, values.data());
+                std::vector<double>& Fk = ev.F[k];
+                for (std::size_t i = begin; i < end; ++i) add_leaf_value(values[i - begin], Fk[i]);
+            }
+        });
+    }
+
+    // The metric of the eval rows' current scores (sums in row order).
+    double eval_score(EvalState& ev) const {
+        const std::size_t m = ev.m;
+        const bool weighted = !ev.weight.empty();
+        const std::vector<double>& F0 = ev.F[0];
+        double num = 0.0, den = 0.0;
+        switch (ev.metric) {
+            case EvalMetric::LogLoss:
+                for (std::size_t i = 0; i < m; ++i) {
+                    double p;
+                    if (n_outputs_ == 1) { // as scores_to_proba
+                        const double p1 = positive_proba(F0[i]);
+                        p = ev.cls[i] == 1 ? p1 : 1.0 - p1;
+                    } else {
+                        double max_f = ev.F[0][i];
+                        for (std::size_t k = 1; k < n_outputs_; ++k) max_f = std::max(max_f, ev.F[k][i]);
+                        double sum = 0.0;
+                        for (std::size_t k = 0; k < n_outputs_; ++k) {
+                            ev.exp_buf[k] = std::exp(ev.F[k][i] - max_f);
+                            sum += ev.exp_buf[k];
+                        }
+                        p = ev.exp_buf[ev.cls[i]] / sum;
+                    }
+                    p = std::min(std::max(p, kProbaEps), 1.0 - kProbaEps);
+                    const double w = weighted ? ev.weight[i] : 1.0;
+                    num += w * -std::log(p);
+                    den += w;
+                }
+                return num / den;
+            case EvalMetric::Error:
+                for (std::size_t i = 0; i < m; ++i) {
+                    std::uint32_t pred = 0; // as scores_to_labels
+                    if (n_outputs_ == 1) {
+                        pred = positive_proba(F0[i]) >= 0.5 ? 1u : 0u;
+                    } else {
+                        double best_val = ev.F[0][i];
+                        for (std::size_t k = 1; k < n_outputs_; ++k) {
+                            if (ev.F[k][i] > best_val) { best_val = ev.F[k][i]; pred = static_cast<std::uint32_t>(k); }
+                        }
+                    }
+                    const double w = weighted ? ev.weight[i] : 1.0;
+                    if (pred != ev.cls[i]) num += w;
+                    den += w;
+                }
+                return num / den;
+            case EvalMetric::AUC:
+                return eval_auc(ev);
+            case EvalMetric::RMSE:
+            case EvalMetric::MAE:
+                for (std::size_t i = 0; i < m; ++i) {
+                    const double d = ev.target[i] - F0[i];
+                    const double w = weighted ? ev.weight[i] : 1.0;
+                    num += w * (ev.metric == EvalMetric::RMSE ? d * d : std::abs(d));
+                    den += w;
+                }
+                return ev.metric == EvalMetric::RMSE ? std::sqrt(num / den) : num / den;
+            case EvalMetric::Default:
+                break;
+        }
+        throw std::logic_error("eval_score: unresolved metric");
+    }
+
+    // Weighted ROC AUC of the raw scores, as scikit-learn's roc_auc_score:
+    // rows by decreasing score (ties by decreasing row, a total order), one
+    // ROC point per distinct score, trapezoids between consecutive points (so
+    // a tied positive / negative pair counts one half).
+    double eval_auc(EvalState& ev) const {
+        const std::size_t m = ev.m;
+        const bool weighted = !ev.weight.empty();
+        auto& order = ev.order;
+        order.resize(m);
+        for (std::size_t i = 0; i < m; ++i) order[i] = {ev.F[0][i], static_cast<std::uint32_t>(i)};
+        std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) {
+            return a.first > b.first || (a.first == b.first && a.second > b.second);
+        });
+        double tp = 0.0, fp = 0.0, tp_prev = 0.0, fp_prev = 0.0, twice_area = 0.0;
+        for (std::size_t j = 0; j < m; ++j) {
+            const std::uint32_t i = order[j].second;
+            const double w = weighted ? ev.weight[i] : 1.0;
+            if (ev.cls[i] == 1) {
+                tp += w;
+            } else {
+                fp += w;
+            }
+            if (j + 1 == m || order[j + 1].first != order[j].first) {
+                twice_area += (fp - fp_prev) * (tp + tp_prev);
+                tp_prev = tp;
+                fp_prev = fp;
+            }
+        }
+        return twice_area / (2.0 * tp * fp);
     }
 
 public:
@@ -603,6 +923,15 @@ public:
     // Incremented by every fit(); lets a staged iterator detect a refit.
     std::uint64_t fit_generation() const { return fit_generation_; }
 
+    // Eval set results of the last fit (empty / -1 / NaN without one): the
+    // metric after every round run (patience rounds included), and with early
+    // stopping the 0-based best round the model was truncated to and its score.
+    const std::vector<double>& evals_result() const { return evals_result_; }
+    std::int64_t best_iteration() const { return best_iteration_; }
+    double best_score() const { return best_score_; }
+    // The metric evals_result() holds (Default before a fit with an eval set).
+    EvalMetric eval_metric() const { return resolved_eval_metric_; }
+
     // Per tree (round-major), the candidate columns of each searched depth
     // (colsample_bylevel) as columns of X, replayed from each tree's seed.
     std::vector<std::map<int, std::vector<std::uint32_t>>> level_features() const {
@@ -647,6 +976,10 @@ private:
     std::vector<double> train_score_;
     std::size_t rounds_fitted_ = 0;
     std::uint64_t fit_generation_ = 0;
+    std::vector<double> evals_result_;
+    std::int64_t best_iteration_ = -1;
+    double best_score_ = std::numeric_limits<double>::quiet_NaN();
+    EvalMetric resolved_eval_metric_ = EvalMetric::Default;
 
     std::vector<std::vector<double>> encode_targets(const VectorView& y, std::size_t n,
                                                       bool is_classification, std::size_t n_outputs) const {
@@ -975,10 +1308,17 @@ private:
     }
 
     // F += learning_rate * (tree t's raw score for row i of X), predicting
-    // through the tree's column subset (no copy of X). The one place a tree's
-    // contribution is added, shared by predict and the staged predictions.
+    // through the tree's column subset (no copy of X). Shared by predict and
+    // the staged predictions.
     void add_tree_score(std::size_t t, const MatrixView& X, std::size_t i, double& F) const {
-        double raw = shrink_leaf_value(trees_[t].find_leaf(X, i, feature_subsets_[t].data())->value);
+        add_leaf_value(trees_[t].find_leaf(X, i, feature_subsets_[t].data())->value, F);
+    }
+
+    // The one place a reached leaf's value is added to a raw score (predict,
+    // staged predictions, the eval set), with the same arithmetic as the
+    // training scores' update.
+    void add_leaf_value(double leaf_value, double& F) const {
+        double raw = shrink_leaf_value(leaf_value);
         F += params_.learning_rate * raw;
     }
 

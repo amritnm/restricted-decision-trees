@@ -28,10 +28,11 @@ def _assert_all_finite(a: np.ndarray, name: str) -> None:
         )
 
 
-def check_X(X, n_features: Optional[int] = None, any_float_layout: bool = False) -> np.ndarray:
+def check_X(X, n_features: Optional[int] = None, any_float_layout: bool = False, name: str = "X") -> np.ndarray:
     """Return ``X`` as a C-contiguous float64 2D array, or raise ValueError.
 
     ``n_features`` (when given) is the number of columns seen during fit.
+    ``name``: how errors refer to the array (e.g. an eval set's features).
     ``any_float_layout`` (tree_method='hist' fits): a float32 / float64
     array in native byte order is returned as is -- any memory order or
     strides, a memory-mapped file included -- instead of being copied; the
@@ -53,16 +54,16 @@ def check_X(X, n_features: Optional[int] = None, any_float_layout: bool = False)
     if not any_float_layout:
         X = np.asarray(X, dtype=np.float64, order="C")
     if X.ndim != 2:
-        raise ValueError(f"Expected a 2D array for X, got an array of shape {X.shape}.")
+        raise ValueError(f"Expected a 2D array for {name}, got an array of shape {X.shape}.")
     if X.shape[0] < 1:
-        raise ValueError(f"X has 0 samples (shape={X.shape}); at least 1 is required.")
+        raise ValueError(f"{name} has 0 samples (shape={X.shape}); at least 1 is required.")
     if X.shape[1] < 1:
-        raise ValueError(f"X has 0 features (shape={X.shape}); at least 1 is required.")
+        raise ValueError(f"{name} has 0 features (shape={X.shape}); at least 1 is required.")
     if n_features is not None and X.shape[1] != n_features:
         raise ValueError(
-            f"X has {X.shape[1]} features, but this model was fitted with {n_features} features."
+            f"{name} has {X.shape[1]} features, but this model was fitted with {n_features} features."
         )
-    _assert_all_finite(X, "X")
+    _assert_all_finite(X, name)
     return X
 
 
@@ -90,7 +91,7 @@ def check_hist_subtraction(hist_subtraction, max_hist_cache_mb) -> Tuple[bool, f
     return bool(hist_subtraction), float(max_hist_cache_mb)
 
 
-def check_sample_weight(sample_weight, n_samples: int, name: str = "sample_weight") -> np.ndarray:
+def check_sample_weight(sample_weight, n_samples: int, name: str = "sample_weight", x_name: str = "X") -> np.ndarray:
     """Return the weights as a C-contiguous float64 1D array of length
     ``n_samples``, or raise ValueError unless they are finite, non-negative
     and not all zero.
@@ -102,7 +103,7 @@ def check_sample_weight(sample_weight, n_samples: int, name: str = "sample_weigh
     if sample_weight.ndim != 1:
         raise ValueError(f"{name} must be a 1D array, got an array of shape {sample_weight.shape}.")
     if sample_weight.shape[0] != n_samples:
-        raise ValueError(f"X has {n_samples} samples, but {name} has {sample_weight.shape[0]}.")
+        raise ValueError(f"{x_name} has {n_samples} samples, but {name} has {sample_weight.shape[0]}.")
     _assert_all_finite(sample_weight, name)
     if np.any(sample_weight < 0):
         raise ValueError(f"{name} must be non-negative.")
@@ -129,3 +130,52 @@ def check_X_y(X, y, sample_weight=None, any_float_layout: bool = False
         sample_weight = check_sample_weight(sample_weight, n_samples)
 
     return X, y, sample_weight
+
+
+def check_eval_set(eval_set, eval_sample_weight, n_features: int, any_float_layout: bool = False,
+                   classes: Optional[np.ndarray] = None
+                   ) -> Optional[Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]]:
+    """Validate ``fit``'s ``eval_set`` / ``eval_sample_weight`` (XGBoost's
+    sklearn API, a single validation set): ``eval_set`` is a ``(X_val, y_val)``
+    tuple or a list holding exactly one such pair; ``eval_sample_weight`` a 1D
+    array (or a list holding exactly one). ``X_val`` follows ``X``'s rules
+    (``any_float_layout``: see ``check_X``) and must have ``n_features``
+    columns; ``y_val``'s labels must be among ``classes`` (classification).
+    Returns ``(X_val, y_val, w_val)``, or None without an eval set.
+    """
+    if eval_set is None:
+        if eval_sample_weight is not None:
+            raise ValueError("eval_sample_weight was given without eval_set.")
+        return None
+    if isinstance(eval_set, tuple) and len(eval_set) == 2:
+        pair = eval_set
+    elif isinstance(eval_set, list):
+        if len(eval_set) != 1:
+            raise ValueError(
+                f"eval_set takes a single validation set, (X_val, y_val) or [(X_val, y_val)]; got a list of "
+                f"{len(eval_set)} entries. Early stopping and evals_result_ use exactly one eval set.")
+        pair = eval_set[0]
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise ValueError("eval_set's entry must be an (X_val, y_val) pair.")
+    else:
+        raise ValueError("eval_set must be an (X_val, y_val) tuple or a list holding one such tuple, "
+                         f"got {type(eval_set).__name__}.")
+    X_val = check_X(pair[0], n_features, any_float_layout=any_float_layout, name="eval_set X_val")
+    m = X_val.shape[0]
+    y_val = np.asarray(pair[1], dtype=np.float64, order="C")
+    if y_val.ndim != 1:
+        raise ValueError(f"eval_set y_val must be a 1D array, got an array of shape {y_val.shape}.")
+    if y_val.shape[0] != m:
+        raise ValueError(f"eval_set X_val has {m} samples, but y_val has {y_val.shape[0]}.")
+    _assert_all_finite(y_val, "eval_set y_val")
+    if classes is not None:
+        unseen = np.setdiff1d(np.unique(y_val), classes)
+        if unseen.size:
+            raise ValueError(f"eval_set y_val has labels not seen in the training y: {unseen[:10].tolist()}.")
+    w_val = None
+    if eval_sample_weight is not None:
+        w = eval_sample_weight
+        if isinstance(w, (list, tuple)) and len(w) == 1 and np.ndim(w[0]) == 1:
+            w = w[0]  # [w_val], like XGBoost's sample_weight_eval_set
+        w_val = check_sample_weight(w, m, "eval_sample_weight", x_name="eval_set X_val")
+    return X_val, y_val, w_val

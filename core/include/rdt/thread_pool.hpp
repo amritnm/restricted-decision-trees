@@ -34,6 +34,8 @@ public:
         }
     }
 
+    std::size_t size() const { return workers_.size(); }
+
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 

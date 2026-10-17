@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "rdt/criteria.hpp"
+#include "rdt/hist.hpp"
 #include "rdt/matrix.hpp"
 #include "rdt/node.hpp"
 #include "rdt/params.hpp"
@@ -60,7 +61,33 @@ public:
 
     void fit(const MatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr,
              const std::vector<double>* classes = nullptr, const VectorView* hessian = nullptr) {
+        if (params_.tree_method == TreeMethod::Hist) {
+            fit_hist(X, y, sample_weight, classes, hessian);
+            return;
+        }
         fit(IndexedMatrixView(X), y, sample_weight, nullptr, classes, hessian);
+    }
+
+    // tree_method='hist' on a whole matrix (MatrixView or
+    // StridedMatrix<float/double>, read without copying): bins it (cuts from
+    // the rows with positive weight, see hist.hpp), fits on the bins with
+    // TreeParams::n_jobs threads, and drops the bins.
+    template <class Matrix>
+    void fit_hist(const Matrix& X, const VectorView& y, const VectorView* sample_weight = nullptr,
+                  const std::vector<double>* classes = nullptr, const VectorView* hessian = nullptr) {
+        if (params_.criterion == Criterion::MAE) {
+            throw std::invalid_argument("tree_method='hist' does not support criterion='mae'");
+        }
+        std::vector<std::uint32_t> cut_rows;
+        cut_rows.reserve(X.n_rows());
+        for (std::size_t i = 0; i < X.n_rows(); ++i) {
+            if (!sample_weight || (*sample_weight)[i] > 0.0) cut_rows.push_back(static_cast<std::uint32_t>(i));
+        }
+        const std::size_t threads = resolve_n_jobs(params_.n_jobs);
+        std::unique_ptr<ThreadPool> pool;
+        if (threads > 1) pool = std::make_unique<ThreadPool>(threads);
+        BinnedMatrix bins(X, cut_rows, params_.max_bin, pool.get());
+        fit_binned(BinnedView(bins), y, sample_weight, classes, hessian, pool.get());
     }
 
     // Fit on a row/column-mapped view of a matrix (e.g. a bootstrap sample
@@ -85,38 +112,7 @@ public:
     void fit(const IndexedMatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr,
              const PresortedView* presorted = nullptr, const std::vector<double>* classes = nullptr,
              const VectorView* hessian = nullptr) {
-        if (params_.criterion == Criterion::Newton) {
-            if (params_.task != Task::Regression) {
-                throw std::invalid_argument("RDTModel::fit: criterion 'newton' needs task='regression'");
-            }
-            if (!hessian || hessian->size() != y.size()) {
-                throw std::invalid_argument("RDTModel::fit: criterion 'newton' needs a hessian per row");
-            }
-        }
-        hessian_ = params_.criterion == Criterion::Newton ? hessian : nullptr;
-        n_features_ = X.n_cols();
-        depth_features_.clear();
-        depth_improvements_.clear();
-        classes_.clear();
-
-        if (params_.task == Task::Classification && classes) {
-            classes_ = *classes;
-            if (!std::is_sorted(classes_.begin(), classes_.end()) ||
-                std::adjacent_find(classes_.begin(), classes_.end()) != classes_.end()) {
-                throw std::invalid_argument("RDTModel::fit: classes must be sorted and unique");
-            }
-            for (std::size_t i = 0; i < y.size(); ++i) {
-                if (!std::binary_search(classes_.begin(), classes_.end(), y[i])) {
-                    throw std::invalid_argument("RDTModel::fit: y contains a label that is not in classes");
-                }
-            }
-        } else if (params_.task == Task::Classification) {
-            std::vector<double> labels(y.size());
-            for (std::size_t i = 0; i < y.size(); ++i) labels[i] = y[i];
-            std::sort(labels.begin(), labels.end());
-            labels.erase(std::unique(labels.begin(), labels.end()), labels.end());
-            classes_ = std::move(labels);
-        }
+        std::vector<std::uint32_t> root_indices = begin_fit(X.n_cols(), X.n_rows(), y, sample_weight, classes, hessian);
 
         if (presorted) {
             bool ok = presorted->n_entries == X.n_rows() && presorted->columns.size() == X.n_cols();
@@ -130,21 +126,6 @@ public:
             if (!ok) throw std::invalid_argument("presorted columns must cover exactly X's rows and columns");
         }
 
-        // Zero-weight samples carry no information. Like scikit-learn's
-        // splitter, leave them out of the tree entirely (equivalent to
-        // deleting those rows): otherwise a split could isolate them into a
-        // leaf with zero total weight, i.e. all-zero class counts and a
-        // predict_proba row summing to 0, and they would shift thresholds and
-        // count towards min_samples_split/min_samples_leaf. (With presorted
-        // columns supplied by the caller they are simply never routed to a
-        // node, see build_tree.)
-        std::vector<std::uint32_t> root_indices;
-        root_indices.reserve(X.n_rows());
-        for (std::size_t i = 0; i < X.n_rows(); ++i) {
-            if (sample_weight && (*sample_weight)[i] == 0.0) continue;
-            root_indices.push_back(static_cast<std::uint32_t>(i));
-        }
-
         const bool presort = params_.presort && DepthScanner::supports(params_.criterion) &&
                              X.n_rows() <= kPresortMaxRows;
         SortedColumns own_sorted;
@@ -154,7 +135,25 @@ public:
             own_view = own_sorted.view();
             presorted = &own_view;
         }
-        root_ = build_tree(X, y, sample_weight, std::move(root_indices), presort ? presorted : nullptr);
+        root_ = build_tree(X, X.n_rows(), y, sample_weight, std::move(root_indices), presort ? presorted : nullptr);
+        hessian_ = nullptr;
+    }
+
+    // Fit on binned features (tree_method='hist', hist.hpp): `X` maps the
+    // tree's rows / columns to a BinnedMatrix (no copy); y, sample_weight,
+    // classes and hessian as in fit(). Each node's threshold routes every
+    // binned row of X as its split bin does (BinnedMatrix::split_point), so
+    // predicting with the raw X routes every row as its bins did. `pool` (may
+    // be nullptr) scores a depth's features in parallel; the result does not
+    // depend on it. Not available for MAE.
+    void fit_binned(const BinnedView& X, const VectorView& y, const VectorView* sample_weight = nullptr,
+                    const std::vector<double>* classes = nullptr, const VectorView* hessian = nullptr,
+                    ThreadPool* pool = nullptr) {
+        if (params_.criterion == Criterion::MAE) {
+            throw std::invalid_argument("tree_method='hist' does not support criterion='mae'");
+        }
+        std::vector<std::uint32_t> root_indices = begin_fit(X.n_cols, X.n_rows, y, sample_weight, classes, hessian);
+        root_ = build_tree(IndexedMatrixView(), X.n_rows, y, sample_weight, std::move(root_indices), nullptr, &X, pool);
         hessian_ = nullptr;
     }
 
@@ -188,6 +187,24 @@ public:
             node = (X(row, col) <= node->split_threshold) ? node->left.get() : node->right.get();
         }
         return node;
+    }
+
+    // Leaf reached by row `row` of a BinnedMatrix through the split bins (a
+    // hist tree; `col_map` as for find_leaf). Same leaf as find_leaf on the
+    // raw row.
+    const Node* find_leaf_binned(const BinnedMatrix& bins, std::size_t row, const std::uint32_t* col_map = nullptr) const {
+        const Node* node = root_.get();
+        while (!node->is_leaf()) {
+            const std::size_t col = col_map ? static_cast<std::size_t>(col_map[node->split_feature])
+                                            : static_cast<std::size_t>(node->split_feature);
+            node = bins.bin(row, col) <= static_cast<std::uint32_t>(node->split_bin) ? node->left.get()
+                                                                                       : node->right.get();
+        }
+        return node;
+    }
+
+    Node* leaf_for_binned(const BinnedMatrix& bins, std::size_t row, const std::uint32_t* col_map = nullptr) {
+        return const_cast<Node*>(find_leaf_binned(bins, row, col_map));
     }
 
     // Mutable find_leaf, so gradient boosting can overwrite leaf values after
@@ -229,6 +246,61 @@ private:
     const VectorView* hessian_ = nullptr; // Newton: the hessians, during fit only
 
     bool newton() const { return params_.criterion == Criterion::Newton; }
+
+    // Shared start of fit / fit_binned: checks, classes, and the root's rows
+    // (every row with a non-zero weight).
+    std::vector<std::uint32_t> begin_fit(std::size_t n_cols, std::size_t n_rows, const VectorView& y,
+                                         const VectorView* sample_weight, const std::vector<double>* classes,
+                                         const VectorView* hessian) {
+        if (params_.criterion == Criterion::Newton) {
+            if (params_.task != Task::Regression) {
+                throw std::invalid_argument("RDTModel::fit: criterion 'newton' needs task='regression'");
+            }
+            if (!hessian || hessian->size() != y.size()) {
+                throw std::invalid_argument("RDTModel::fit: criterion 'newton' needs a hessian per row");
+            }
+        }
+        hessian_ = params_.criterion == Criterion::Newton ? hessian : nullptr;
+        n_features_ = n_cols;
+        depth_features_.clear();
+        depth_improvements_.clear();
+        classes_.clear();
+
+        if (params_.task == Task::Classification && classes) {
+            classes_ = *classes;
+            if (!std::is_sorted(classes_.begin(), classes_.end()) ||
+                std::adjacent_find(classes_.begin(), classes_.end()) != classes_.end()) {
+                throw std::invalid_argument("RDTModel::fit: classes must be sorted and unique");
+            }
+            for (std::size_t i = 0; i < y.size(); ++i) {
+                if (!std::binary_search(classes_.begin(), classes_.end(), y[i])) {
+                    throw std::invalid_argument("RDTModel::fit: y contains a label that is not in classes");
+                }
+            }
+        } else if (params_.task == Task::Classification) {
+            std::vector<double> labels(y.size());
+            for (std::size_t i = 0; i < y.size(); ++i) labels[i] = y[i];
+            std::sort(labels.begin(), labels.end());
+            labels.erase(std::unique(labels.begin(), labels.end()), labels.end());
+            classes_ = std::move(labels);
+        }
+
+        // Zero-weight samples carry no information. Like scikit-learn's
+        // splitter, leave them out of the tree entirely (equivalent to
+        // deleting those rows): otherwise a split could isolate them into a
+        // leaf with zero total weight, i.e. all-zero class counts and a
+        // predict_proba row summing to 0, and they would shift thresholds and
+        // count towards min_samples_split/min_samples_leaf. (With presorted
+        // columns supplied by the caller they are simply never routed to a
+        // node, see build_tree.)
+        std::vector<std::uint32_t> root_indices;
+        root_indices.reserve(n_rows);
+        for (std::size_t i = 0; i < n_rows; ++i) {
+            if (sample_weight && (*sample_weight)[i] == 0.0) continue;
+            root_indices.push_back(static_cast<std::uint32_t>(i));
+        }
+        return root_indices;
+    }
 
     static bool all_same_label(const VectorView& y, const std::vector<std::uint32_t>& indices) {
         if (indices.empty()) return true;
@@ -304,6 +376,7 @@ private:
         double gain_sum = 0.0; // Newton: sum of the splitting nodes' gains
         std::vector<char> found;
         std::vector<double> threshold;
+        std::vector<std::uint32_t> split_bin; // hist: node k's rows with bin <= split_bin[k] go left
     };
 
     // Newton: a node's gradient / hessian totals, summed over its rows in
@@ -419,6 +492,76 @@ private:
         return best;
     }
 
+    // Histogram search (tree_method='hist', hist.hpp): the same choice rule as
+    // the other searches. Each feature's per-node results are computed by
+    // one task (features are split into contiguous chunks across `pool`) and
+    // reduced here in feature order, so the result does not depend on the
+    // number of threads.
+    DepthChoice find_optimal_feature_hist(
+        const BinnedView& X, const VectorView& y, const VectorView* sample_weight,
+        const std::vector<Node*>& nodes, const std::vector<double>& node_share,
+        const std::vector<double>& node_g, const std::vector<double>& node_h,
+        const std::vector<std::int32_t>& cls, HistScanner& scanner, ThreadPool* pool) const {
+
+        std::vector<const std::vector<std::uint32_t>*> node_rows(nodes.size());
+        for (std::size_t k = 0; k < nodes.size(); ++k) node_rows[k] = &nodes[k]->indices;
+        scanner.begin_depth(X, node_rows, y, newton() ? nullptr : sample_weight, hessian_, cls.data(), &node_g, &node_h);
+
+        const std::size_t n_feat = n_features_;
+        std::vector<std::vector<HistSplit>> results(n_feat);
+        const std::size_t n_chunks = pool ? std::min(n_feat, 4 * pool->size()) : 1;
+        run_tasks(pool, n_chunks, [&](std::size_t c) {
+            HistScanner::Scratch scratch;
+            const std::size_t f0 = n_feat * c / n_chunks, f1 = n_feat * (c + 1) / n_chunks;
+            for (std::size_t f = f0; f < f1; ++f) scanner.score_feature(X, f, results[f], scratch);
+        });
+
+        DepthChoice best;
+        std::size_t best_f = 0;
+        for (std::size_t f = 0; f < n_feat; ++f) {
+            std::vector<HistSplit>& splits = results[f];
+            double total_improvement = 0.0, gain_sum = 0.0;
+            bool valid_split_found = false;
+            for (std::size_t k = 0; k < splits.size(); ++k) {
+                splits[k].found = add_node_score(splits[k].found, splits[k].improvement, node_share[k],
+                                                 total_improvement, gain_sum);
+                if (splits[k].found) valid_split_found = true;
+            }
+            if (valid_split_found && total_improvement > best.total_improvement) {
+                best.total_improvement = total_improvement;
+                best.gain_sum = gain_sum;
+                best.feature = static_cast<int>(f);
+                best_f = f;
+            }
+        }
+        if (best.feature >= 0) {
+            best.found.assign(nodes.size(), 0);
+            best.threshold.assign(nodes.size(), 0.0);
+            best.split_bin.assign(nodes.size(), 0);
+            for (std::size_t k = 0; k < nodes.size(); ++k) {
+                const HistSplit& sp = results[best_f][k];
+                if (!sp.found) continue;
+                best.found[k] = 1;
+                const auto point = X.m->split_point(X.col(best_f), sp.lo_bin, sp.hi_bin);
+                best.threshold[k] = point.first;
+                best.split_bin[k] = point.second;
+            }
+        }
+        return best;
+    }
+
+    // split_indices by bins: rows of `indices` with bin <= split_bin go left.
+    static void split_indices_binned(const BinnedView& X, const std::vector<std::uint32_t>& indices, int feature,
+                                     std::uint32_t split_bin, std::vector<std::uint32_t>& left,
+                                     std::vector<std::uint32_t>& right) {
+        left.clear();
+        right.clear();
+        for (auto idx : indices) {
+            if (X.bin(idx, static_cast<std::size_t>(feature)) <= split_bin) left.push_back(idx);
+            else right.push_back(idx);
+        }
+    }
+
     void release_indices(Node& node) const {
         if (params_.retain_indices) return;
         std::vector<std::uint32_t>().swap(node.indices);
@@ -437,10 +580,13 @@ private:
         return w;
     }
 
-    std::unique_ptr<Node> build_tree(const IndexedMatrixView& X, const VectorView& y,
+    // `X` (exact search) or `binned` (hist search) supplies the features of
+    // the n_rows tree rows.
+    std::unique_ptr<Node> build_tree(const IndexedMatrixView& X, std::size_t n_rows, const VectorView& y,
                                       const VectorView* sample_weight,
                                       std::vector<std::uint32_t> root_indices,
-                                      const PresortedView* presorted) {
+                                      const PresortedView* presorted,
+                                      const BinnedView* binned = nullptr, ThreadPool* pool = nullptr) {
         auto root = std::make_unique<Node>();
         root->n_samples = root_indices.size();
         root->indices = std::move(root_indices);
@@ -463,7 +609,7 @@ private:
         std::vector<ScanRow> scan_rows;
         DepthScanner scanner(params_.criterion, params_.min_samples_leaf, classes_.size(), params_.newton);
         if (presorted) {
-            scan_rows.resize(X.n_rows());
+            scan_rows.resize(n_rows);
             for (auto idx : root->indices) {
                 ScanRow& r = scan_rows[idx];
                 r.y = y[idx];
@@ -471,6 +617,24 @@ private:
                 if (params_.task == Task::Classification) {
                     r.cls = static_cast<std::int32_t>(
                         std::lower_bound(classes_.begin(), classes_.end(), y[idx]) - classes_.begin());
+                }
+            }
+        }
+
+        // Hist search state: the scanner and each row's class index.
+        std::unique_ptr<HistScanner> hist_scanner;
+        std::vector<std::int32_t> row_class;
+        if (binned) {
+            hist_scanner = std::make_unique<HistScanner>(params_.criterion, params_.min_samples_leaf, classes_.size(),
+                                                         params_.newton);
+            if (params_.task == Task::Classification) {
+                row_class.assign(n_rows, 0);
+                for (auto idx : root->indices) {
+                    auto it = std::lower_bound(classes_.begin(), classes_.end(), y[idx]);
+                    if (it == classes_.end() || !(*it == y[idx])) {
+                        throw std::invalid_argument("RDTModel::fit_binned: y contains a label that is not a class");
+                    }
+                    row_class[idx] = static_cast<std::int32_t>(it - classes_.begin());
                 }
             }
         }
@@ -506,7 +670,10 @@ private:
             }
 
             DepthChoice choice;
-            if (presorted) {
+            if (binned) {
+                choice = find_optimal_feature_hist(*binned, y, sample_weight, nodes_to_split, node_share, node_g, node_h,
+                                                   row_class, *hist_scanner, pool);
+            } else if (presorted) {
                 for (std::size_t k = 0; k < nodes_to_split.size(); ++k) {
                     for (auto idx : nodes_to_split[k]->indices) scan_rows[idx].node = static_cast<std::int32_t>(k);
                 }
@@ -542,7 +709,13 @@ private:
                 double threshold = choice.threshold[k];
 
                 std::vector<std::uint32_t> left_indices, right_indices;
-                split_indices(X, node->indices, best_feature, threshold, left_indices, right_indices);
+                if (binned) {
+                    split_indices_binned(*binned, node->indices, best_feature, choice.split_bin[k], left_indices,
+                                         right_indices);
+                    node->split_bin = static_cast<std::int32_t>(choice.split_bin[k]);
+                } else {
+                    split_indices(X, node->indices, best_feature, threshold, left_indices, right_indices);
+                }
 
                 if (left_indices.empty() || right_indices.empty()) {
                     finish_leaf(*node, y, sample_weight);

@@ -4,10 +4,12 @@
 #include <cmath>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "rdt/hist.hpp"
 #include "rdt/matrix.hpp"
 #include "rdt/params.hpp"
 #include "rdt/rng.hpp"
@@ -89,8 +91,65 @@ public:
     RandomForestModel& operator=(RandomForestModel&&) = default;
 
     void fit(const MatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr) {
-        n_features_ = X.n_cols();
-        n_samples_ = X.n_rows();
+        if (params_.tree_params.tree_method == TreeMethod::Hist) {
+            fit_hist(X, y, sample_weight);
+            return;
+        }
+        grow(X.n_rows(), X.n_cols(), y, sample_weight, ExactSource{X});
+    }
+
+    // tree_method='hist': X (MatrixView or StridedMatrix<float/double>, read
+    // without copying) is binned once per fit -- cuts from the rows with
+    // positive weight, every row binned -- and the trees (and the OOB score)
+    // use the bins only.
+    template <class Matrix>
+    void fit_hist(const Matrix& X, const VectorView& y, const VectorView* sample_weight = nullptr) {
+        if (params_.tree_params.tree_method != TreeMethod::Hist) {
+            throw std::invalid_argument("fit_hist needs tree_method='hist'");
+        }
+        std::vector<std::uint32_t> cut_rows;
+        cut_rows.reserve(X.n_rows());
+        for (std::size_t i = 0; i < X.n_rows(); ++i) {
+            if (!sample_weight || (*sample_weight)[i] > 0.0) cut_rows.push_back(static_cast<std::uint32_t>(i));
+        }
+        std::unique_ptr<ThreadPool> pool;
+        if (resolve_n_jobs(params_.n_jobs) > 1) pool = std::make_unique<ThreadPool>(resolve_n_jobs(params_.n_jobs));
+        HistSource src{BinnedMatrix(X, cut_rows, params_.tree_params.max_bin, pool.get())};
+        pool.reset();
+        grow(X.n_rows(), X.n_cols(), y, sample_weight, src);
+    }
+
+private:
+    // A tree's features: the rows / columns of X (exact) or of the bins (hist).
+    struct ExactSource {
+        MatrixView X;
+        void fit_tree(RDTModel& tree, const std::vector<std::uint32_t>& rows, const std::vector<std::uint32_t>& cols,
+                      const VectorView& y, const VectorView* w, const std::vector<double>* classes) const {
+            IndexedMatrixView sub(X, rows.data(), rows.size(), cols.data(), cols.size());
+            tree.fit(sub, y, w, nullptr, classes);
+        }
+        const Node* leaf(const RDTModel& tree, std::size_t row, const std::uint32_t* cols) const {
+            return tree.find_leaf(X, row, cols);
+        }
+    };
+
+    struct HistSource {
+        BinnedMatrix bins;
+        void fit_tree(RDTModel& tree, const std::vector<std::uint32_t>& rows, const std::vector<std::uint32_t>& cols,
+                      const VectorView& y, const VectorView* w, const std::vector<double>* classes) const {
+            BinnedView sub(bins, rows.data(), rows.size(), cols.data(), cols.size());
+            tree.fit_binned(sub, y, w, classes);
+        }
+        const Node* leaf(const RDTModel& tree, std::size_t row, const std::uint32_t* cols) const {
+            return tree.find_leaf_binned(bins, row, cols);
+        }
+    };
+
+    template <class Source>
+    void grow(std::size_t n_rows, std::size_t n_cols, const VectorView& y, const VectorView* sample_weight,
+              const Source& src) {
+        n_features_ = n_cols;
+        n_samples_ = n_rows;
         classes_.clear();
 
         if (params_.tree_params.task == Task::Classification) {
@@ -167,8 +226,7 @@ public:
             }
             feature_subsets_[t] = col_indices;
 
-            // The tree's rows/columns as a view of X: nothing is copied.
-            IndexedMatrixView sub(X, row_indices.data(), row_indices.size(), col_indices.data(), col_indices.size());
+            // The tree's rows/columns as a view of X (or of the bins): nothing is copied.
             std::vector<double> sub_y(row_indices.size());
             std::vector<double> sub_w;
             if (sample_weight) sub_w.resize(row_indices.size());
@@ -185,9 +243,9 @@ public:
                 params_.tree_params.task == Task::Classification ? &classes_ : nullptr;
             if (sample_weight) {
                 VectorView sub_W(sub_w.data(), sub_w.size());
-                trees_[t].fit(sub, sub_Y, &sub_W, nullptr, tree_classes);
+                src.fit_tree(trees_[t], row_indices, col_indices, sub_Y, &sub_W, tree_classes);
             } else {
-                trees_[t].fit(sub, sub_Y, nullptr, nullptr, tree_classes);
+                src.fit_tree(trees_[t], row_indices, col_indices, sub_Y, nullptr, tree_classes);
             }
         });
 
@@ -201,8 +259,10 @@ public:
         }
 
         compute_feature_importances();
-        if (params_.oob_score) compute_oob_score(X, y, oob_row_indices);
+        if (params_.oob_score) compute_oob_score(src, y, oob_row_indices);
     }
+
+public:
 
     std::vector<double> predict(const MatrixView& X) const {
         const std::size_t n = X.n_rows();
@@ -336,7 +396,8 @@ private:
         if (sum > 0.0) for (double& v : feature_importances_) v /= sum;
     }
 
-    void compute_oob_score(const MatrixView& X, const VectorView& y,
+    template <class Source>
+    void compute_oob_score(const Source& src, const VectorView& y,
                             const std::vector<std::vector<std::uint32_t>>& oob_row_indices) {
         const bool classification = params_.tree_params.task == Task::Classification;
         std::vector<std::vector<double>> vote_sums(n_samples_,
@@ -350,13 +411,13 @@ private:
             const std::uint32_t* cols = feature_subsets_[t].data();
             if (classification) {
                 for (std::size_t i = 0; i < oob.size(); ++i) {
-                    const Node* leaf = trees_[t].find_leaf(X, oob[i], cols);
+                    const Node* leaf = src.leaf(trees_[t], oob[i], cols);
                     add_tree_proba(trees_[t], leaf, tree_proba, vote_sums[oob[i]].data());
                     vote_counts[oob[i]]++;
                 }
             } else {
                 for (std::size_t i = 0; i < oob.size(); ++i) {
-                    vote_sums[oob[i]][0] += trees_[t].find_leaf(X, oob[i], cols)->value;
+                    vote_sums[oob[i]][0] += src.leaf(trees_[t], oob[i], cols)->value;
                     vote_counts[oob[i]]++;
                 }
             }

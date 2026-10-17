@@ -276,6 +276,30 @@ Tree growth stops at a node when:
 5. **Insufficient improvement**: the depth's total weighted impurity decrease
    is below `min_impurity_decrease` (every node at that depth becomes a leaf).
 
+### Histogram search (`tree_method="hist"`)
+
+Each feature is binned once per fit from the training rows with positive
+weight: one bin per distinct value when there are at most `max_bin` of them,
+otherwise approximately equal-count bins (boundaries only between distinct
+values). Bin `b`'s upper cut is the guarded midpoint between the largest
+training value in bin `b` and the smallest in bin `b + 1`; every row's bin is
+the number of cuts below its value. At each depth, for each feature, one pass
+over the bin column accumulates every node's per-bin statistics (class
+weights; centred `w·d`, `w·d²`, `w` for MSE; `G`, `H` for Newton), and each
+node's bins are swept left to right with the same candidate rule (between
+non-empty bins), `min_samples_leaf` test, impurity / gain expressions and
+tie order as the exact search. A split between a node's adjacent non-empty
+bins `lo < hi` gets the threshold `split_threshold(max training value of bin
+lo, min training value of bin hi)` — the exact search's threshold whenever
+every bin holds one value — moved to the nearest bin boundary when a row
+outside the training rows (validation, zero weight) falls inside the gap the
+threshold would cut, so that for every row of `X`, `x <= threshold` exactly
+when its bin is `<= split_bin`. Training scores (and the forest's OOB votes)
+are routed through the bins; `X` is not read after binning.
+
+Cost per depth: `O(m * n)` to build the histograms plus `O(m * nodes * max_bin)`
+to sweep them; binning costs one sort per feature over the training rows.
+
 ## Complexity
 
 For `d` depths, `m` candidate features and `n` samples:

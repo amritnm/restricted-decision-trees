@@ -12,7 +12,7 @@ from typing import Optional
 import numpy as np
 
 from . import _rdt_native
-from ._validation import check_X, check_X_y
+from ._validation import check_X, check_X_y, check_tree_method
 
 __all__ = ["RDT"]
 
@@ -50,6 +50,27 @@ class RDT:
         same floating-point operations (tied feature values are visited in
         row order by both), so they produce identical trees; False only
         trades speed for the presort's memory (4 bytes per row and feature).
+        Ignored with ``tree_method='hist'``.
+    tree_method : {'exact', 'hist'}, default='exact'
+        'exact' scores every boundary between distinct feature values.
+        'hist' bins every feature once per fit (``max_bin`` bins at most,
+        from the rows with positive weight: one bin per distinct value when
+        there are at most ``max_bin`` of them, else approximately equal-count
+        bins) and scores the boundaries between bins, from per-node
+        histograms. A split's threshold lies between its two bins (the exact
+        search's midpoint when bins hold one value each), so predicting on
+        the raw ``X`` routes every row as its bins did.
+        ``fit`` then accepts float32 or float64 ``X`` in any memory layout
+        (C or Fortran order, strided views, ``np.memmap``) without copying it.
+        Not implemented for ``criterion='mae'``.
+    max_bin : int, default=256
+        Maximum number of bins per feature with ``tree_method='hist'``
+        (2 to 65536; bins are stored as uint8, or every feature's as uint16
+        when any feature has more than 256 bins).
+    n_jobs : int, optional
+        Threads for the ``tree_method='hist'`` split search (features are
+        scored in parallel; the tree does not depend on it). None = 1,
+        -1 = all hardware threads.
     """
 
     def __init__(
@@ -61,6 +82,9 @@ class RDT:
         min_samples_leaf: int = 1,
         min_impurity_decrease: float = 0.0,
         presort: bool = True,
+        tree_method: str = "exact",
+        max_bin: int = 256,
+        n_jobs: Optional[int] = None,
     ):
         self.task = task.lower()
         if self.task not in ("classification", "regression"):
@@ -81,6 +105,8 @@ class RDT:
         self.min_samples_leaf = min_samples_leaf
         self.min_impurity_decrease = min_impurity_decrease
         self.presort = presort
+        self.tree_method, self.max_bin = check_tree_method(tree_method, max_bin, self.criterion)
+        self.n_jobs = n_jobs
 
         self.root = None
         self.n_features_ = None
@@ -94,14 +120,15 @@ class RDT:
     @classmethod
     def _wrap_native(cls, model, *, task: str, criterion: str, max_depth: int,
                       min_samples_split: int, min_samples_leaf: int,
-                      min_impurity_decrease: float, n_features: int) -> "RDT":
+                      min_impurity_decrease: float, n_features: int,
+                      tree_method: str = "exact", max_bin: int = 256) -> "RDT":
         """Wrap an already-fitted native RDTModel (e.g. one sub-tree of an
         ensemble) for introspection -- .root, .depth_features_, .predict(),
         rdt.visualize compatibility -- without re-fitting."""
         self = cls(
             task=task, criterion=criterion, max_depth=max_depth,
             min_samples_split=min_samples_split, min_samples_leaf=min_samples_leaf,
-            min_impurity_decrease=min_impurity_decrease,
+            min_impurity_decrease=min_impurity_decrease, tree_method=tree_method, max_bin=max_bin,
         )
         self._model = model
         self.n_features_ = n_features
@@ -114,7 +141,8 @@ class RDT:
         return self
 
     def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None) -> "RDT":
-        X, y, sample_weight = check_X_y(X, y, sample_weight)
+        hist = self.tree_method == "hist"
+        X, y, sample_weight = check_X_y(X, y, sample_weight, any_float_layout=hist)
 
         self.n_features_ = X.shape[1]
 
@@ -123,9 +151,13 @@ class RDT:
         model = _rdt_native.RDTModel(
             self.task, self.criterion, self.max_depth,
             self.min_samples_split, self.min_samples_leaf, self.min_impurity_decrease,
-            presort=self.presort,
+            presort=self.presort, tree_method=self.tree_method, max_bin=self.max_bin,
+            n_jobs=1 if self.n_jobs is None else int(self.n_jobs),
         )
-        model.fit(X, y, sample_weight)
+        if hist:
+            model.fit_hist(X, y, sample_weight)
+        else:
+            model.fit(X, y, sample_weight)
         self._model = model
 
         if self.task == "classification":

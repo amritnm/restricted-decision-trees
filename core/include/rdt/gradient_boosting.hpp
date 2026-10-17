@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "rdt/forest.hpp" // MaxFeaturesSpec, resolve_max_features, kPredictRowBlock
+#include "rdt/hist.hpp"
 #include "rdt/matrix.hpp"
 #include "rdt/params.hpp"
 #include "rdt/presort.hpp"
@@ -107,9 +108,126 @@ public:
     GradientBoostingModel& operator=(GradientBoostingModel&&) = default;
 
     void fit(const MatrixView& X, const VectorView& y, const VectorView* sample_weight = nullptr) {
+        if (params_.tree_params.tree_method == TreeMethod::Hist) {
+            fit_hist(X, y, sample_weight);
+            return;
+        }
+        const bool presort = params_.tree_params.presort && X.n_rows() <= kPresortMaxRows;
+        boost(X.n_rows(), X.n_cols(), y, sample_weight,
+              [&](const std::vector<std::uint32_t>& train_rows, ThreadPool&) {
+                  return ExactSource(X, presort, train_rows);
+              });
+    }
+
+    // tree_method='hist': X (MatrixView or StridedMatrix<float/double>, read
+    // without copying) is binned once -- cuts from the training rows (after the
+    // early-stopping split) with positive weight, every row binned -- and is
+    // not read again: the trees are fitted on the bins and the training scores
+    // (validation rows included) are updated through them.
+    template <class Matrix>
+    void fit_hist(const Matrix& X, const VectorView& y, const VectorView* sample_weight = nullptr) {
+        if (params_.tree_params.tree_method != TreeMethod::Hist) {
+            throw std::invalid_argument("fit_hist needs tree_method='hist'");
+        }
+        boost(X.n_rows(), X.n_cols(), y, sample_weight,
+              [&](const std::vector<std::uint32_t>& train_rows, ThreadPool& pool) {
+                  std::vector<std::uint32_t> cut_rows;
+                  cut_rows.reserve(train_rows.size());
+                  for (auto r : train_rows) {
+                      if (!sample_weight || (*sample_weight)[r] > 0.0) cut_rows.push_back(r);
+                  }
+                  return HistSource(X, cut_rows, params_.tree_params.max_bin, pool.size() > 1 ? &pool : nullptr);
+              });
+    }
+
+private:
+    // Where a round's trees get their features: the exact search on X (with
+    // the per-fit presorted columns) or the histogram search on the bins.
+    class ExactSource {
+    public:
+        static constexpr bool kFeatureParallel = false;
+
+        ExactSource(const MatrixView& X, bool presort, const std::vector<std::uint32_t>& train_rows)
+            : X_(X), presort_(presort), sorted_columns_(X, presort ? train_rows : std::vector<std::uint32_t>()) {}
+
+        // Every round's trees are fitted on a subset of train_rows, so each
+        // column's training rows are sorted once per fit -- lazily, the first
+        // time a round draws the column -- and kept (4 bytes per (training
+        // row, sorted column) for the duration of fit()); each round derives
+        // its trees' presorted columns from these in O(n) per column
+        // (presort.hpp).
+        void prepare(const std::vector<std::uint32_t>& col_subset) {
+            if (presort_) sorted_columns_.ensure(col_subset);
+        }
+
+        void fit_tree(RDTModel& tree, const std::vector<std::uint32_t>& fit_rows,
+                      const std::vector<std::uint32_t>& col_subset, const VectorView& residual,
+                      const VectorView* weight, const VectorView* hessian, ThreadPool*) const {
+            // The tree sees X[fit_rows, col_subset] as a view (no copy of X).
+            const std::size_t n = X_.n_rows();
+            const std::size_t m = fit_rows.size();
+            IndexedMatrixView X_sub(X_, fit_rows.data(), m, col_subset.data(), col_subset.size());
+            // This round's presorted columns: the per-fit ones for
+            // col_subset, restricted to fit_rows and renumbered to the
+            // tree's row ids 0..m-1 (fit_rows is ascending, so tied
+            // values stay in row order).
+            SortedColumns round_sorted;
+            PresortedView presorted;
+            if (presort_) {
+                presorted = sorted_columns_.view(col_subset);
+                const bool all_rows = m == n; // fit_rows == 0..n-1: ids already match
+                if (!all_rows) {
+                    std::vector<std::int32_t> new_id(n, -1);
+                    for (std::size_t r = 0; r < m; ++r) new_id[fit_rows[r]] = static_cast<std::int32_t>(r);
+                    round_sorted = SortedColumns(presorted, new_id.data(), m);
+                    presorted = round_sorted.view();
+                }
+            }
+            tree.fit(X_sub, residual, weight, presort_ ? &presorted : nullptr, nullptr, hessian);
+        }
+
+        Node* leaf(RDTModel& tree, std::size_t row, const std::uint32_t* cols) const {
+            return tree.leaf_for(X_, row, cols);
+        }
+
+    private:
+        MatrixView X_;
+        bool presort_;
+        LazySortedColumns sorted_columns_;
+    };
+
+    class HistSource {
+    public:
+        static constexpr bool kFeatureParallel = true;
+
+        template <class Matrix>
+        HistSource(const Matrix& X, const std::vector<std::uint32_t>& cut_rows, int max_bin, ThreadPool* pool)
+            : bins_(X, cut_rows, max_bin, pool) {}
+
+        void prepare(const std::vector<std::uint32_t>&) {}
+
+        void fit_tree(RDTModel& tree, const std::vector<std::uint32_t>& fit_rows,
+                      const std::vector<std::uint32_t>& col_subset, const VectorView& residual,
+                      const VectorView* weight, const VectorView* hessian, ThreadPool* pool) const {
+            BinnedView view(bins_, fit_rows.data(), fit_rows.size(), col_subset.data(), col_subset.size());
+            tree.fit_binned(view, residual, weight, nullptr, hessian, pool);
+        }
+
+        Node* leaf(RDTModel& tree, std::size_t row, const std::uint32_t* cols) const {
+            return tree.leaf_for_binned(bins_, row, cols);
+        }
+
+    private:
+        BinnedMatrix bins_;
+    };
+
+    // The boosting loop. make_source(train_rows, pool) builds the Source
+    // (ExactSource / HistSource) once the training rows are known.
+    template <class MakeSource>
+    void boost(std::size_t n, std::size_t n_cols, const VectorView& y, const VectorView* sample_weight,
+               MakeSource&& make_source) {
         ++fit_generation_;
-        n_features_ = X.n_cols();
-        const std::size_t n = X.n_rows();
+        n_features_ = n_cols;
         classes_.clear();
         trees_.clear();
         feature_subsets_.clear();
@@ -176,15 +294,8 @@ public:
         int rounds_without_improve = 0;
         const std::size_t n_est = static_cast<std::size_t>(params_.n_estimators);
         ThreadPool pool(resolve_n_jobs(params_.n_jobs));
-
-        // Every round's trees are fitted on a subset of train_rows, so each
-        // column's training rows are sorted once per fit -- lazily, the first
-        // time a round draws the column -- and kept (4 bytes per (training
-        // row, sorted column) for the duration of fit()); each round derives
-        // its trees' presorted columns from these in O(n) per column
-        // (presort.hpp).
-        const bool presort = params_.tree_params.presort && n <= kPresortMaxRows;
-        LazySortedColumns sorted_columns(X, presort ? train_rows : std::vector<std::uint32_t>());
+        auto source = make_source(train_rows, pool);
+        using Source = decltype(source);
 
         // Negative gradient per output, indexed by sample (only train_rows
         // are written/read); reused across rounds. Replaces v0.2.0's per-round
@@ -243,10 +354,13 @@ public:
                     col_subset.resize(n_features_);
                     for (std::uint32_t f = 0; f < n_features_; ++f) col_subset[f] = f;
                 }
-                if (presort) sorted_columns.ensure(col_subset);
+                source.prepare(col_subset);
             }
 
-            pool.parallel_for(n_outputs, [&](std::size_t k) {
+            // One output's work for this round. tree_pool: threads for the
+            // tree's own feature search (hist), only when the round has a
+            // single tree; a multiclass round's trees run in parallel instead.
+            auto fit_output = [&](std::size_t k, ThreadPool* tree_pool) {
                 std::vector<double>& residual_k = residual[k];
                 if (newton()) {
                     std::vector<double>& hessian_k = hessian[k];
@@ -264,10 +378,8 @@ public:
                 const std::vector<std::uint32_t>& fit_rows = round_fit_rows[k];
                 const std::vector<std::uint32_t>& col_subset = round_col_subsets[k];
 
-                // The tree sees X[fit_rows, col_subset] as a view (no copy of
-                // X); only its residuals / weights are gathered.
+                // Only the fit rows' residuals / weights are gathered.
                 const std::size_t m = fit_rows.size();
-                IndexedMatrixView X_sub(X, fit_rows.data(), m, col_subset.data(), col_subset.size());
                 std::vector<double> fit_residual(m);
                 std::vector<double> fit_weight, fit_hessian;
                 if (sample_weight) fit_weight.resize(m);
@@ -281,38 +393,29 @@ public:
                 VectorView w_view(fit_weight.data(), fit_weight.size());
                 VectorView h_view(fit_hessian.data(), fit_hessian.size());
 
-                // This round's presorted columns: the per-fit ones for
-                // col_subset, restricted to fit_rows and renumbered to the
-                // tree's row ids 0..m-1 (fit_rows is ascending, so tied
-                // values stay in row order).
-                SortedColumns round_sorted;
-                PresortedView presorted;
-                if (presort) {
-                    presorted = sorted_columns.view(col_subset);
-                    const bool all_rows = m == n; // fit_rows == 0..n-1: ids already match
-                    if (!all_rows) {
-                        std::vector<std::int32_t> new_id(n, -1);
-                        for (std::size_t r = 0; r < m; ++r) new_id[fit_rows[r]] = static_cast<std::int32_t>(r);
-                        round_sorted = SortedColumns(presorted, new_id.data(), m);
-                        presorted = round_sorted.view();
-                    }
-                }
                 // Newton trees set their own leaf values (and take the
                 // sample weights only to leave zero-weight rows out).
-                round_trees[k].fit(X_sub, residual_view, sample_weight ? &w_view : nullptr,
-                                   presort ? &presorted : nullptr, nullptr, newton() ? &h_view : nullptr);
+                source.fit_tree(round_trees[k], fit_rows, col_subset, residual_view,
+                                sample_weight ? &w_view : nullptr, newton() ? &h_view : nullptr, tree_pool);
+                // Rows are routed through the source (X and the tree's column
+                // subset, or the bins), which evaluates exactly what the fit
+                // partitioned on.
+                auto leaf_of = [&](std::size_t row) { return source.leaf(round_trees[k], row, col_subset.data()); };
                 if (!newton() && has_newton_leaf_step()) {
-                    update_leaf_values(round_trees[k], X, col_subset, fit_rows, fit_residual,
-                                       sample_weight ? &fit_weight : nullptr, y_enc[k], n_outputs);
+                    update_leaf_values(leaf_of, fit_rows, fit_residual, sample_weight ? &fit_weight : nullptr,
+                                       y_enc[k], n_outputs);
                 }
 
                 std::vector<double> raw_pred(n);
-                for (std::size_t i = 0; i < n; ++i) {
-                    raw_pred[i] = round_trees[k].find_leaf(X, i, col_subset.data())->value;
-                }
+                for (std::size_t i = 0; i < n; ++i) raw_pred[i] = leaf_of(i)->value;
                 shrink_leaf_values(raw_pred);
                 round_raw_preds[k] = std::move(raw_pred);
-            });
+            };
+            if (Source::kFeatureParallel && n_outputs == 1) {
+                fit_output(0, pool.size() > 1 ? &pool : nullptr);
+            } else {
+                pool.parallel_for(n_outputs, [&](std::size_t k) { fit_output(k, nullptr); });
+            }
 
             for (std::size_t k = 0; k < n_outputs; ++k) {
                 for (std::size_t i = 0; i < n; ++i) F[k][i] += params_.learning_rate * round_raw_preds[k][i];
@@ -339,6 +442,7 @@ public:
         compute_feature_importances();
     }
 
+public:
     std::vector<double> predict(const MatrixView& X) const {
         std::vector<double> out(X.n_rows());
         scores_to_labels(accumulate_scores(X), X.n_rows(), out.data());
@@ -658,10 +762,9 @@ private:
     // to; the hessian follows from it: p*(1-p) with p = y - g for log_loss,
     // |g| = exp(-y~*F) for exponential. Multiclass scales the numerator by
     // (K-1)/K. A leaf whose hessian sum is ~0 (all p in {0,1}) gets 0.
-    // Rows are routed through the full X and the tree's column subset, which
-    // evaluates exactly the X(row, col) values the fit partitioned on.
-    void update_leaf_values(RDTModel& tree, const MatrixView& X, const std::vector<std::uint32_t>& col_subset,
-                            const std::vector<std::uint32_t>& fit_rows,
+    // `leaf_of(row)` is the (mutable) leaf the row reaches.
+    template <class LeafOf>
+    void update_leaf_values(LeafOf&& leaf_of, const std::vector<std::uint32_t>& fit_rows,
                             const std::vector<double>& fit_residual, const std::vector<double>* fit_weight,
                             const std::vector<double>& enc, std::size_t n_outputs) const {
         std::unordered_map<Node*, std::pair<double, double>> sums; // leaf -> (sum w*g, sum w*h)
@@ -675,7 +778,7 @@ private:
                 h = p * (1.0 - p);
             }
             const double w = fit_weight ? (*fit_weight)[r] : 1.0;
-            auto& acc = sums[tree.leaf_for(X, fit_rows[r], col_subset.data())];
+            auto& acc = sums[leaf_of(fit_rows[r])];
             acc.first += w * g;
             acc.second += w * h;
         }

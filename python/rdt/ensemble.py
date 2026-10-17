@@ -42,7 +42,7 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 
 from . import RDT, _rdt_native
-from ._validation import check_X, check_X_y, check_sample_weight
+from ._validation import check_X, check_X_y, check_sample_weight, check_tree_method
 
 __all__ = ["RandomForestRDT", "GradientBoostingRDT"]
 
@@ -177,6 +177,17 @@ class RandomForestRDT:
         same floating-point operations (tied feature values are visited in
         row order by both), so they produce identical models; False only
         trades speed for the presort's memory (4 bytes per row and feature).
+    tree_method : {'exact', 'hist'}, default='exact'
+        'hist': every feature is binned once per fit (at most ``max_bin``
+        bins, from the rows with positive weight) and the trees are grown
+        from per-node histograms on each tree's bootstrap rows / column
+        subset of the bins (``n_jobs`` builds the trees in parallel); ``fit``
+        then accepts float32 or float64 ``X`` in any memory layout (C /
+        Fortran order, strided views, ``np.memmap``) without copying it, and
+        reads it only to bin it (the OOB score uses the bins too). See
+        ``rdt.RDT``. Not implemented for ``criterion='mae'``.
+    max_bin : int, default=256
+        Maximum bins per feature with ``tree_method='hist'`` (2 to 65536).
 
     Attributes (after fitting)
     ---------------------------
@@ -214,6 +225,8 @@ class RandomForestRDT:
         random_state: Optional[int] = None,
         n_jobs: Optional[int] = None,
         presort: bool = True,
+        tree_method: str = "exact",
+        max_bin: int = 256,
     ):
         self.task = task.lower()
         if self.task not in ("classification", "regression"):
@@ -244,6 +257,7 @@ class RandomForestRDT:
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.presort = presort
+        self.tree_method, self.max_bin = check_tree_method(tree_method, max_bin, self.criterion)
 
         self.estimators_: List[RDT] = []
         self.feature_importances_ = None
@@ -256,7 +270,8 @@ class RandomForestRDT:
         self._model = None
 
     def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None) -> "RandomForestRDT":
-        X, y, sample_weight = check_X_y(X, y, sample_weight)
+        hist = self.tree_method == "hist"
+        X, y, sample_weight = check_X_y(X, y, sample_weight, any_float_layout=hist)
         self.n_features_ = X.shape[1]
 
         if self.task == "classification":
@@ -274,9 +289,12 @@ class RandomForestRDT:
             self.min_impurity_decrease, self.n_estimators, _resolve_max_features(self.max_features),
             self.bootstrap, max_samples_fraction, self.oob_score,
             _resolve_random_state(self.random_state), _resolve_n_jobs(self.n_jobs),
-            max_samples_count, presort=self.presort,
+            max_samples_count, presort=self.presort, tree_method=self.tree_method, max_bin=self.max_bin,
         )
-        model.fit(X, y, sample_weight)
+        if hist:
+            model.fit_hist(X, y, sample_weight)
+        else:
+            model.fit(X, y, sample_weight)
         self._model = model
 
         self.feature_importances_ = np.array(self._model.feature_importances_)
@@ -290,6 +308,7 @@ class RandomForestRDT:
                 tree, task=self.task, criterion=self.criterion, max_depth=self.max_depth,
                 min_samples_split=self.min_samples_split, min_samples_leaf=self.min_samples_leaf,
                 min_impurity_decrease=self.min_impurity_decrease, n_features=len(feature_subsets[i]),
+                tree_method=self.tree_method, max_bin=self.max_bin,
             )
             for i, tree in enumerate(self._model.estimators_)
         ]
@@ -391,6 +410,19 @@ class GradientBoostingRDT:
     max_delta_step : float, default=0.0
         ``split_criterion='newton'`` only: if > 0, leaf weights (before
         ``learning_rate``) are clipped to +-max_delta_step, as in XGBoost.
+    tree_method : {'exact', 'hist'}, default='exact'
+        'hist': every feature is binned once per fit (at most ``max_bin``
+        bins, from the training rows -- after the early-stopping split --
+        with positive weight) and the trees are grown from per-node
+        histograms; ``fit`` then accepts float32 or float64 ``X`` in any
+        memory layout (C / Fortran order, strided views, ``np.memmap``)
+        without copying it and reads it only to bin it: the training scores
+        (validation rows included) are updated through the bins. A round
+        that fits one tree (binary, regression) scores its features in
+        parallel with ``n_jobs`` threads; a multiclass round fits its
+        per-class trees in parallel instead. See ``rdt.RDT``.
+    max_bin : int, default=256
+        Maximum bins per feature with ``tree_method='hist'`` (2 to 65536).
     scale_pos_weight : float, optional
         XGBoost-style: multiplies the positive class's (``classes_[1]``)
         sample weight. Binary classification only.
@@ -462,6 +494,8 @@ class GradientBoostingRDT:
         presort: bool = True,
         split_criterion: str = "friedman_mse",
         max_delta_step: float = 0.0,
+        tree_method: str = "exact",
+        max_bin: int = 256,
     ):
         self.task = task.lower()
         if self.task not in ("classification", "regression"):
@@ -528,6 +562,7 @@ class GradientBoostingRDT:
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.presort = presort
+        self.tree_method, self.max_bin = check_tree_method(tree_method, max_bin)
 
         self.feature_importances_ = None
         self.train_score_ = None
@@ -540,7 +575,8 @@ class GradientBoostingRDT:
         self._model = None
 
     def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None) -> "GradientBoostingRDT":
-        X, y, sample_weight = check_X_y(X, y, sample_weight)
+        hist = self.tree_method == "hist"
+        X, y, sample_weight = check_X_y(X, y, sample_weight, any_float_layout=hist)
         self.n_features_ = X.shape[1]
 
         if self.task == "classification":
@@ -575,9 +611,12 @@ class GradientBoostingRDT:
             _resolve_random_state(self.random_state), _resolve_n_jobs(self.n_jobs), presort=self.presort,
             split_criterion=self.split_criterion,
             min_child_weight=float(self.min_child_weight) if self.split_criterion == "newton" else 1.0,
-            max_delta_step=float(self.max_delta_step),
+            max_delta_step=float(self.max_delta_step), tree_method=self.tree_method, max_bin=self.max_bin,
         )
-        model.fit(X, y, sample_weight)
+        if hist:
+            model.fit_hist(X, y, sample_weight)
+        else:
+            model.fit(X, y, sample_weight)
         self._model = model
 
         self.feature_importances_ = np.array(self._model.feature_importances_)

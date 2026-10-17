@@ -63,6 +63,25 @@ inline std::uint32_t resolve_max_features(const MaxFeaturesSpec& spec, std::uint
 // cache across trees. Per-row accumulation order over trees is unchanged.
 constexpr std::size_t kPredictRowBlock = 256;
 
+// derive_seed index of a tree's colsample_bylevel generator (from the tree's seed).
+constexpr std::size_t kBylevelSeedIndex = 0xB7;
+
+// Each tree's searched depths' candidate columns, mapped through its column subset.
+inline std::vector<std::map<int, std::vector<std::uint32_t>>> map_level_features(
+    const std::vector<RDTModel>& trees, const std::vector<std::vector<std::uint32_t>>& subsets) {
+    std::vector<std::map<int, std::vector<std::uint32_t>>> out(trees.size());
+    for (std::size_t t = 0; t < trees.size(); ++t) {
+        const auto levels = trees[t].level_candidates();
+        for (std::size_t d = 0; d < levels.size(); ++d) {
+            std::vector<std::uint32_t> cols;
+            cols.reserve(levels[d].size());
+            for (auto f : levels[d]) cols.push_back(subsets[t][f]);
+            out[t][static_cast<int>(d)] = std::move(cols);
+        }
+    }
+    return out;
+}
+
 // A bootstrap sample containing only zero-weight rows is redrawn at most
 // this many times in total before RandomForestModel::fit gives up.
 constexpr int kMaxBootstrapDraws = 100;
@@ -175,7 +194,15 @@ private:
         tree_params.retain_indices = !params_.bootstrap;
         trees_.clear();
         trees_.reserve(n_est);
-        for (std::size_t i = 0; i < n_est; ++i) trees_.emplace_back(tree_params);
+        for (std::size_t i = 0; i < n_est; ++i) {
+            // colsample_bylevel's draws use their own generator, seeded from
+            // the tree's seed here, before any thread starts: they leave the
+            // tree's bootstrap / column draws unchanged and do not depend on
+            // n_jobs.
+            TreeParams tp = tree_params;
+            tp.bylevel_seed = derive_seed(derive_seed(params_.random_state, i), kBylevelSeedIndex);
+            trees_.emplace_back(tp);
+        }
         feature_subsets_.assign(n_est, {});
         std::vector<std::vector<std::uint32_t>> oob_row_indices(n_est);
         // Trees whose bootstrap never drew a positively weighted row; reported
@@ -319,6 +346,13 @@ public:
     const std::vector<RDTModel>& estimators() const { return trees_; }
     const std::vector<std::vector<std::uint32_t>>& feature_subsets() const { return feature_subsets_; }
     const std::vector<double>& feature_importances() const { return feature_importances_; }
+    // Per tree, the candidate columns of each searched depth
+    // (colsample_bylevel), as columns of the X passed to fit -- replayed from
+    // each tree's seed, not stored.
+    std::vector<std::map<int, std::vector<std::uint32_t>>> level_features() const {
+        return map_level_features(trees_, feature_subsets_);
+    }
+
     // Per tree, the feature chosen at each depth as a column of the X passed
     // to fit (each tree's own column indices mapped through its column subset).
     std::vector<std::map<int, int>> depth_features() const {

@@ -78,6 +78,13 @@ def _resolve_max_features(value):
     raise ValueError(f"Invalid max_features/colsample_bytree: {value!r}")
 
 
+def _check_colsample_bylevel(value) -> float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)) \
+            or not (0.0 < float(value) <= 1.0):
+        raise ValueError(f"colsample_bylevel must be a number in (0, 1], got {value!r}")
+    return float(value)
+
+
 def _resolve_random_state(random_state) -> int:
     if random_state is None:
         return int(np.random.default_rng().integers(0, 2**63 - 1))
@@ -177,6 +184,15 @@ class RandomForestRDT:
         same floating-point operations (tied feature values are visited in
         row order by both), so they produce identical models; False only
         trades speed for the presort's memory (4 bytes per row and feature).
+    colsample_bylevel : float, default=1.0
+        Fraction in (0, 1] of the tree's columns (after ``max_features`` /
+        ``colsample_bytree``) scored at each depth: every searched depth draws
+        a fresh subset of ``max(1, floor(colsample_bylevel * m))`` of the
+        tree's ``m`` columns, without replacement, and the depth's feature is
+        chosen among them (the restricted-tree analogue of XGBoost's
+        ``colsample_bylevel``). The draws come from a generator seeded from the
+        tree's own seed, so they do not depend on ``n_jobs`` and leave the
+        other random draws unchanged; 1.0 draws nothing.
     tree_method : {'exact', 'hist'}, default='exact'
         'hist': every feature is binned once per fit (at most ``max_bin``
         bins, from the rows with positive weight) and the trees are grown
@@ -201,6 +217,14 @@ class RandomForestRDT:
         depth as a column index of the ``X`` passed to ``fit`` (each tree's
         own column indices, as in ``estimators_[i].depth_features_``, mapped
         through its column subset).
+    level_features_ : list of dict
+        One dict per tree (in the order of ``depth_features_``),
+        ``{depth: [columns]}``: the candidate columns of each depth the tree
+        searched, as columns of ``X`` (all of the tree's columns when
+        ``colsample_bylevel=1``). Replayed from the trees' seeds on each
+        access (``fit`` does not store them: they hold ``n_trees x depths x
+        columns`` entries); each ``depth_features_[t][d]`` is one of
+        ``level_features_[t][d]``.
     oob_score_ : float
         Only set if oob_score=True.
     """
@@ -227,6 +251,7 @@ class RandomForestRDT:
         presort: bool = True,
         tree_method: str = "exact",
         max_bin: int = 256,
+        colsample_bylevel: float = 1.0,
     ):
         self.task = task.lower()
         if self.task not in ("classification", "regression"):
@@ -258,6 +283,7 @@ class RandomForestRDT:
         self.n_jobs = n_jobs
         self.presort = presort
         self.tree_method, self.max_bin = check_tree_method(tree_method, max_bin, self.criterion)
+        self.colsample_bylevel = _check_colsample_bylevel(colsample_bylevel)
 
         self.estimators_: List[RDT] = []
         self.feature_importances_ = None
@@ -290,6 +316,7 @@ class RandomForestRDT:
             self.bootstrap, max_samples_fraction, self.oob_score,
             _resolve_random_state(self.random_state), _resolve_n_jobs(self.n_jobs),
             max_samples_count, presort=self.presort, tree_method=self.tree_method, max_bin=self.max_bin,
+            colsample_bylevel=self.colsample_bylevel,
         )
         if hist:
             model.fit_hist(X, y, sample_weight)
@@ -313,6 +340,15 @@ class RandomForestRDT:
             for i, tree in enumerate(self._model.estimators_)
         ]
         return self
+
+    @property
+    def level_features_(self) -> Optional[List[Dict[int, List[int]]]]:
+        """Per tree, ``{depth: [candidate columns of X]}`` (see the class
+        docstring), replayed from the trees' seeds on each access; None
+        before ``fit``."""
+        if self._model is None:
+            return None
+        return [dict(d) for d in self._model.level_features_]
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self._model is None:
@@ -410,6 +446,15 @@ class GradientBoostingRDT:
     max_delta_step : float, default=0.0
         ``split_criterion='newton'`` only: if > 0, leaf weights (before
         ``learning_rate``) are clipped to +-max_delta_step, as in XGBoost.
+    colsample_bylevel : float, default=1.0
+        Fraction in (0, 1] of the tree's columns (after ``max_features`` /
+        ``colsample_bytree``) scored at each depth: every searched depth draws
+        a fresh subset of ``max(1, floor(colsample_bylevel * m))`` of the
+        tree's ``m`` columns, without replacement, and the depth's feature is
+        chosen among them (the restricted-tree analogue of XGBoost's
+        ``colsample_bylevel``). The draws come from a generator seeded from the
+        tree's own seed, so they do not depend on ``n_jobs`` and leave the
+        other random draws unchanged; 1.0 draws nothing.
     tree_method : {'exact', 'hist'}, default='exact'
         'hist': every feature is binned once per fit (at most ``max_bin``
         bins, from the training rows -- after the early-stopping split --
@@ -459,6 +504,15 @@ class GradientBoostingRDT:
         ``classes_`` order). Features are column indices of the ``X`` passed
         to ``fit`` (mapped through each tree's column subset).
 
+    level_features_ : list of dict
+        One dict per tree (in the order of ``depth_features_``),
+        ``{depth: [columns]}``: the candidate columns of each depth the tree
+        searched, as columns of ``X`` (all of the tree's columns when
+        ``colsample_bylevel=1``). Replayed from the trees' seeds on each
+        access (``fit`` does not store them: they hold ``n_trees x depths x
+        columns`` entries); each ``depth_features_[t][d]`` is one of
+        ``level_features_[t][d]``.
+
     Staged predictions (``staged_decision_function``,
     ``staged_predict_proba``, ``staged_predict``) yield one array per fitted
     round (``n_estimators_`` of them), each a new array; the last equals
@@ -496,6 +550,7 @@ class GradientBoostingRDT:
         max_delta_step: float = 0.0,
         tree_method: str = "exact",
         max_bin: int = 256,
+        colsample_bylevel: float = 1.0,
     ):
         self.task = task.lower()
         if self.task not in ("classification", "regression"):
@@ -563,6 +618,7 @@ class GradientBoostingRDT:
         self.n_jobs = n_jobs
         self.presort = presort
         self.tree_method, self.max_bin = check_tree_method(tree_method, max_bin)
+        self.colsample_bylevel = _check_colsample_bylevel(colsample_bylevel)
 
         self.feature_importances_ = None
         self.train_score_ = None
@@ -612,6 +668,7 @@ class GradientBoostingRDT:
             split_criterion=self.split_criterion,
             min_child_weight=float(self.min_child_weight) if self.split_criterion == "newton" else 1.0,
             max_delta_step=float(self.max_delta_step), tree_method=self.tree_method, max_bin=self.max_bin,
+            colsample_bylevel=self.colsample_bylevel,
         )
         if hist:
             model.fit_hist(X, y, sample_weight)
@@ -624,6 +681,15 @@ class GradientBoostingRDT:
         self.n_estimators_ = self._model.n_estimators_fitted_
         self.depth_features_ = [dict(d) for d in self._model.depth_features_]
         return self
+
+    @property
+    def level_features_(self) -> Optional[List[Dict[int, List[int]]]]:
+        """Per tree, ``{depth: [candidate columns of X]}`` (see the class
+        docstring), replayed from the trees' seeds on each access; None
+        before ``fit``."""
+        if self._model is None:
+            return None
+        return [dict(d) for d in self._model.level_features_]
 
     def _check_predict_X(self, X, classification_only: bool = False, what: str = "") -> np.ndarray:
         if classification_only and self.task != "classification":

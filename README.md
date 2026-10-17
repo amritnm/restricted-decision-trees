@@ -112,6 +112,14 @@ means a parameter can't work exactly like it does elsewhere:
 - **`max_features`/`colsample_bytree`** can't be resampled *per node* the
   way scikit-learn/XGBoost do it — each tree gets one random column subset
   chosen once, before that tree is fit.
+  **`colsample_bylevel`** (`RandomForestRDT`, `GradientBoostingRDT`, default
+  1.0) is the per-depth analogue: each depth a tree searches scores only a
+  fresh random subset of `max(1, floor(colsample_bylevel * m))` of the tree's
+  `m` columns (without replacement); the depth's feature is chosen among them.
+  The draws come from a generator seeded from the tree's own seed (so they do
+  not depend on `n_jobs` and leave the other draws unchanged), and are exposed
+  as `level_features_` (one `{depth: [columns of X]}` dict per tree, replayed
+  from the seeds each time it is read; `fit` does not store them).
 - **`reg_alpha`/`reg_lambda`** (`GradientBoostingRDT` only) are, by default,
   a real effect (post-hoc leaf-value soft-thresholding/shrinkage) but not
   XGBoost's exact regularised leaf formula — the default engine is Friedman's
@@ -185,14 +193,16 @@ Bagging ensemble: `n_estimators`, `task`, `criterion`, `max_depth`,
 `min_impurity_decrease` (alias `gamma`), `max_features` (alias
 `colsample_bytree`), `bootstrap`, `max_samples`, `oob_score`, `class_weight`
 (`'balanced'` or dict), `random_state`, `n_jobs`, `presort`, `tree_method`,
-`max_bin`. `max_samples` follows
+`max_bin`, `colsample_bylevel`. `max_samples` follows
 scikit-learn: an int is the number of rows drawn per tree, a float is a
 fraction of `n_samples`, `None` means `n_samples`. After fitting:
 `estimators_` (list of `RDT`, individually introspectable),
 `feature_importances_`, `oob_score_` (if requested), `depth_features_` (one
 `{depth: feature}` dict per tree, with features as column indices of the `X`
 passed to `fit` -- each tree's own indices, as in
-`estimators_[i].depth_features_`, mapped through its column subset).
+`estimators_[i].depth_features_`, mapped through its column subset) and
+`level_features_` (each tree's per-depth candidate columns, see
+`colsample_bylevel`).
 
 ### `rdt.ensemble.GradientBoostingRDT`
 
@@ -213,7 +223,7 @@ early-stopping validation loss. Parameters: `n_estimators`, `task`, `loss` (clas
 `early_stopping_rounds`), `tol`, `reg_alpha`, `reg_lambda`,
 `scale_pos_weight` (binary only), `huber_delta`, `quantile_alpha`,
 `random_state`, `n_jobs`, `presort`, `split_criterion`, `max_delta_step`,
-`tree_method`, `max_bin`.
+`tree_method`, `max_bin`, `colsample_bylevel`.
 Classification needs at least two classes in `y`.
 
 `split_criterion="newton"` grows each round's tree the XGBoost way: per-row
@@ -244,7 +254,8 @@ highest threshold (here the lowest). XGBoost 3.0–3.3 also differ when
 `train_score_` (loss per round), `n_estimators_` (rounds actually fitted —
 less than `n_estimators` if early stopping triggered), `depth_features_` (one
 `{depth: feature}` dict per tree in fitting order, a multiclass round
-contributing one tree per class; features are columns of `X`).
+contributing one tree per class; features are columns of `X`), `level_features_`
+(each tree's per-depth candidate columns, see `colsample_bylevel`).
 
 Methods: `predict`, `predict_proba` and, as in scikit-learn,
 `decision_function(X)` (raw scores: shape `(n_samples,)` for binary

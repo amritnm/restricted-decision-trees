@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -86,6 +87,12 @@ struct TreeParams {
     // Threads for a standalone tree's hist search (RDTModel::fit_hist); the
     // ensembles pass their own pool instead.
     int n_jobs = 1;
+    // colsample_bylevel (ensembles): at each searched depth the tree scores
+    // only a fresh random subset of max(1, floor(colsample_bylevel * m)) of
+    // its m columns (without replacement, ascending), drawn from an Rng
+    // seeded with bylevel_seed. 1.0: every column, nothing is drawn.
+    double colsample_bylevel = 1.0;
+    std::uint64_t bylevel_seed = 0;
 
     // Implementation choices that do not change which splits are chosen.
     //

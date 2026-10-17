@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -162,7 +164,7 @@ private:
 
         void fit_tree(RDTModel& tree, const std::vector<std::uint32_t>& fit_rows,
                       const std::vector<std::uint32_t>& col_subset, const VectorView& residual,
-                      const VectorView* weight, const VectorView* hessian, ThreadPool*) const {
+                      const VectorView* weight, const VectorView* hessian, ThreadPool*, HistArena*) const {
             // The tree sees X[fit_rows, col_subset] as a view (no copy of X).
             const std::size_t n = X_.n_rows();
             const std::size_t m = fit_rows.size();
@@ -208,9 +210,10 @@ private:
 
         void fit_tree(RDTModel& tree, const std::vector<std::uint32_t>& fit_rows,
                       const std::vector<std::uint32_t>& col_subset, const VectorView& residual,
-                      const VectorView* weight, const VectorView* hessian, ThreadPool* pool) const {
+                      const VectorView* weight, const VectorView* hessian, ThreadPool* pool,
+                      HistArena* arena) const {
             BinnedView view(bins_, fit_rows.data(), fit_rows.size(), col_subset.data(), col_subset.size());
-            tree.fit_binned(view, residual, weight, nullptr, hessian, pool);
+            tree.fit_binned(view, residual, weight, nullptr, hessian, pool, arena);
         }
 
         Node* leaf(RDTModel& tree, std::size_t row, const std::uint32_t* cols) const {
@@ -304,6 +307,26 @@ private:
         // Newton: hessian per output, indexed like residual (which then holds
         // the gradient dL/dF rather than its negative).
         std::vector<std::vector<double>> hessian(newton() ? n_outputs : 0, std::vector<double>(n, 0.0));
+        std::vector<double> loss_terms; // compute_loss's per-row scratch
+        // The subtraction caches (hist), reused round after round: one arena
+        // per tree being fitted at the same time -- a multiclass round's
+        // trees take one from this free list and give it back, so its kept
+        // histograms take at most max_hist_cache_bytes per tree in flight
+        // (min(n_jobs, n_outputs)), not per output. Which arena a tree gets
+        // does not change the tree.
+        std::mutex arena_mutex;
+        std::vector<std::unique_ptr<HistArena>> free_arenas;
+        auto take_arena = [&]() -> std::unique_ptr<HistArena> {
+            std::lock_guard<std::mutex> lock(arena_mutex);
+            if (free_arenas.empty()) return std::make_unique<HistArena>();
+            std::unique_ptr<HistArena> a = std::move(free_arenas.back());
+            free_arenas.pop_back();
+            return a;
+        };
+        auto give_arena = [&](std::unique_ptr<HistArena> a) {
+            std::lock_guard<std::mutex> lock(arena_mutex);
+            free_arenas.push_back(std::move(a));
+        };
 
         for (std::size_t round = 0; round < n_est; ++round) {
             std::vector<RDTModel> round_trees;
@@ -363,20 +386,26 @@ private:
             // One output's work for this round. tree_pool: threads for the
             // tree's own feature search (hist), only when the round has a
             // single tree; a multiclass round's trees run in parallel instead.
+            // The per-row passes below (gradients, gathers, routing every row
+            // to its leaf) run in row blocks on tree_pool.
             auto fit_output = [&](std::size_t k, ThreadPool* tree_pool) {
                 std::vector<double>& residual_k = residual[k];
                 if (newton()) {
                     std::vector<double>& hessian_k = hessian[k];
-                    for (std::size_t r = 0; r < train_rows.size(); ++r) {
-                        std::uint32_t i = train_rows[r];
-                        const double w = sample_weight ? (*sample_weight)[i] : 1.0;
-                        gradient_hessian(i, k, y_enc, F, n_outputs, w, residual_k[i], hessian_k[i]);
-                    }
+                    for_blocks(tree_pool, train_rows.size(), [&](std::size_t r0, std::size_t r1) {
+                        for (std::size_t r = r0; r < r1; ++r) {
+                            std::uint32_t i = train_rows[r];
+                            const double w = sample_weight ? (*sample_weight)[i] : 1.0;
+                            gradient_hessian(i, k, y_enc, F, n_outputs, w, residual_k[i], hessian_k[i]);
+                        }
+                    });
                 } else {
-                    for (std::size_t r = 0; r < train_rows.size(); ++r) {
-                        std::uint32_t i = train_rows[r];
-                        residual_k[i] = negative_gradient(i, k, y_enc, F, n_outputs);
-                    }
+                    for_blocks(tree_pool, train_rows.size(), [&](std::size_t r0, std::size_t r1) {
+                        for (std::size_t r = r0; r < r1; ++r) {
+                            std::uint32_t i = train_rows[r];
+                            residual_k[i] = negative_gradient(i, k, y_enc, F, n_outputs);
+                        }
+                    });
                 }
                 const std::vector<std::uint32_t>& fit_rows = round_fit_rows[k];
                 const std::vector<std::uint32_t>& col_subset = round_col_subsets[k];
@@ -387,19 +416,24 @@ private:
                 std::vector<double> fit_weight, fit_hessian;
                 if (sample_weight) fit_weight.resize(m);
                 if (newton()) fit_hessian.resize(m);
-                for (std::size_t r = 0; r < m; ++r) {
-                    fit_residual[r] = residual_k[fit_rows[r]];
-                    if (sample_weight) fit_weight[r] = (*sample_weight)[fit_rows[r]];
-                    if (newton()) fit_hessian[r] = hessian[k][fit_rows[r]];
-                }
+                for_blocks(tree_pool, m, [&](std::size_t r0, std::size_t r1) {
+                    for (std::size_t r = r0; r < r1; ++r) {
+                        fit_residual[r] = residual_k[fit_rows[r]];
+                        if (sample_weight) fit_weight[r] = (*sample_weight)[fit_rows[r]];
+                        if (newton()) fit_hessian[r] = hessian[k][fit_rows[r]];
+                    }
+                });
                 VectorView residual_view(fit_residual.data(), m);
                 VectorView w_view(fit_weight.data(), fit_weight.size());
                 VectorView h_view(fit_hessian.data(), fit_hessian.size());
 
                 // Newton trees set their own leaf values (and take the
                 // sample weights only to leave zero-weight rows out).
+                std::unique_ptr<HistArena> arena = take_arena();
                 source.fit_tree(round_trees[k], fit_rows, col_subset, residual_view,
-                                sample_weight ? &w_view : nullptr, newton() ? &h_view : nullptr, tree_pool);
+                                sample_weight ? &w_view : nullptr, newton() ? &h_view : nullptr, tree_pool,
+                                arena.get());
+                give_arena(std::move(arena));
                 // Rows are routed through the source (X and the tree's column
                 // subset, or the bins), which evaluates exactly what the fit
                 // partitioned on.
@@ -410,8 +444,9 @@ private:
                 }
 
                 std::vector<double> raw_pred(n);
-                for (std::size_t i = 0; i < n; ++i) raw_pred[i] = leaf_of(i)->value;
-                shrink_leaf_values(raw_pred);
+                for_blocks(tree_pool, n, [&](std::size_t i0, std::size_t i1) {
+                    for (std::size_t i = i0; i < i1; ++i) raw_pred[i] = shrink_leaf_value(leaf_of(i)->value);
+                });
                 round_raw_preds[k] = std::move(raw_pred);
             };
             if (Source::kFeatureParallel && n_outputs == 1) {
@@ -420,18 +455,23 @@ private:
                 pool.parallel_for(n_outputs, [&](std::size_t k) { fit_output(k, nullptr); });
             }
 
+            ThreadPool* row_pool = pool.size() > 1 ? &pool : nullptr;
             for (std::size_t k = 0; k < n_outputs; ++k) {
-                for (std::size_t i = 0; i < n; ++i) F[k][i] += params_.learning_rate * round_raw_preds[k][i];
+                const std::vector<double>& raw = round_raw_preds[k];
+                std::vector<double>& Fk = F[k];
+                for_blocks(row_pool, n, [&](std::size_t i0, std::size_t i1) {
+                    for (std::size_t i = i0; i < i1; ++i) Fk[i] += params_.learning_rate * raw[i];
+                });
                 trees_.push_back(std::move(round_trees[k]));
                 feature_subsets_.push_back(std::move(round_col_subsets[k]));
             }
             rounds_fitted_ = round + 1;
 
-            double train_loss = compute_loss(y_enc, F, train_rows, n_outputs, sample_weight);
+            double train_loss = compute_loss(y_enc, F, train_rows, n_outputs, sample_weight, row_pool, loss_terms);
             train_score_.push_back(train_loss);
 
             if (early_stopping) {
-                double val_loss = compute_loss(y_enc, F, val_rows, n_outputs, sample_weight);
+                double val_loss = compute_loss(y_enc, F, val_rows, n_outputs, sample_weight, row_pool, loss_terms);
                 if (val_loss < best_val_score - params_.tol) {
                     best_val_score = val_loss;
                     rounds_without_improve = 0;
@@ -485,9 +525,13 @@ public:
 
     void add_round(const MatrixView& X, std::size_t round, std::vector<std::vector<double>>& F) const {
         if (round >= rounds_fitted_) throw std::out_of_range("add_round: round out of range");
+        const std::size_t n = X.n_rows();
+        auto pool = predict_pool(n * n_outputs_);
         for (std::size_t k = 0; k < n_outputs_; ++k) {
             const std::size_t t = round * n_outputs_ + k;
-            for (std::size_t i = 0; i < X.n_rows(); ++i) add_tree_score(t, X, i, F[k][i]);
+            for_blocks(pool.get(), n, [&](std::size_t i0, std::size_t i1) {
+                for (std::size_t i = i0; i < i1; ++i) add_tree_score(t, X, i, F[k][i]);
+            });
         }
     }
 
@@ -568,6 +612,19 @@ public:
     // Per tree (round-major, as trees are fitted), the feature chosen at
     // each depth as a column of the X passed to fit (each tree's own column
     // indices mapped through its column subset).
+    // The fitted trees, round-major (trees()[round * n_outputs() + k]); a
+    // tree's features are indices into its column subset.
+    const std::vector<RDTModel>& trees() const { return trees_; }
+
+    // Each tree's depth_improvements() (Newton: the depth's total gain), in
+    // the order of depth_features().
+    std::vector<std::map<int, double>> depth_improvements() const {
+        std::vector<std::map<int, double>> out;
+        out.reserve(trees_.size());
+        for (const auto& tree : trees_) out.push_back(tree.depth_improvements());
+        return out;
+    }
+
     std::vector<std::map<int, int>> depth_features() const {
         std::vector<std::map<int, int>> out(trees_.size());
         for (std::size_t t = 0; t < trees_.size(); ++t) {
@@ -842,11 +899,6 @@ private:
         return sign * std::max(std::abs(shrunk) - params_.reg_alpha, 0.0);
     }
 
-    void shrink_leaf_values(std::vector<double>& values) const {
-        if (newton() || (params_.reg_lambda == 0.0 && params_.reg_alpha == 0.0)) return;
-        for (double& v : values) v = shrink_leaf_value(v);
-    }
-
     static double sigmoid_like(double f) { return 1.0 / (1.0 + std::exp(-f)); }
 
     // P(positive class) from a binary raw score. The exponential loss's raw
@@ -858,56 +910,68 @@ private:
 
     // Mean loss over `rows`, sample-weighted when weights are given -- the
     // same objective the trees and leaf values optimise, for train_score_
-    // and the early-stopping validation loss.
+    // and the early-stopping validation loss. Each row's loss is computed in
+    // row blocks on `pool` (into `terms`), and the weighted sum is then taken
+    // serially in row order, so the result does not depend on the pool.
     double compute_loss(const std::vector<std::vector<double>>& y_enc, const std::vector<std::vector<double>>& F,
                          const std::vector<std::uint32_t>& rows, std::size_t n_outputs,
-                         const VectorView* sample_weight) const {
+                         const VectorView* sample_weight, ThreadPool* pool, std::vector<double>& terms) const {
         if (rows.empty()) return 0.0;
+        terms.resize(rows.size());
+        for_blocks(pool, rows.size(), [&](std::size_t r0, std::size_t r1) {
+            for (std::size_t r = r0; r < r1; ++r) terms[r] = row_loss(y_enc, F, rows[r], n_outputs);
+        });
         double weighted_total = 0.0, total_weight = 0.0;
-        for (auto i : rows) {
-            double total = 0.0;
-            switch (params_.loss) {
-                case GBLoss::LogLoss:
-                    if (n_outputs == 1) {
-                        double p = std::min(std::max(sigmoid_like(F[0][i]), 1e-12), 1.0 - 1e-12);
-                        total += -(y_enc[0][i] * std::log(p) + (1 - y_enc[0][i]) * std::log(1 - p));
-                    } else {
-                        double max_f = F[0][i];
-                        for (std::size_t k = 1; k < n_outputs; ++k) max_f = std::max(max_f, F[k][i]);
-                        double sum = 0.0;
-                        for (std::size_t k = 0; k < n_outputs; ++k) sum += std::exp(F[k][i] - max_f);
-                        for (std::size_t k = 0; k < n_outputs; ++k) {
-                            if (y_enc[k][i] > 0.5) total += -(F[k][i] - max_f - std::log(sum));
-                        }
-                    }
-                    break;
-                case GBLoss::Exponential:
-                    total += std::exp(-y_enc[0][i] * F[0][i]);
-                    break;
-                case GBLoss::SquaredError:
-                    total += (y_enc[0][i] - F[0][i]) * (y_enc[0][i] - F[0][i]);
-                    break;
-                case GBLoss::AbsoluteError:
-                    total += std::abs(y_enc[0][i] - F[0][i]);
-                    break;
-                case GBLoss::Huber: {
-                    double diff = y_enc[0][i] - F[0][i];
-                    total += std::abs(diff) <= params_.huber_delta
-                        ? 0.5 * diff * diff
-                        : params_.huber_delta * (std::abs(diff) - 0.5 * params_.huber_delta);
-                    break;
-                }
-                case GBLoss::Quantile: {
-                    double diff = y_enc[0][i] - F[0][i];
-                    total += diff >= 0 ? params_.quantile_alpha * diff : (params_.quantile_alpha - 1.0) * diff;
-                    break;
-                }
-            }
-            const double w = sample_weight ? (*sample_weight)[i] : 1.0;
-            weighted_total += w * total;
+        for (std::size_t r = 0; r < rows.size(); ++r) {
+            const double w = sample_weight ? (*sample_weight)[rows[r]] : 1.0;
+            weighted_total += w * terms[r];
             total_weight += w;
         }
         return total_weight > 0.0 ? weighted_total / total_weight : 0.0;
+    }
+
+    // The loss of row i (summed over the outputs of a multiclass model).
+    double row_loss(const std::vector<std::vector<double>>& y_enc, const std::vector<std::vector<double>>& F,
+                    std::size_t i, std::size_t n_outputs) const {
+        double total = 0.0;
+        switch (params_.loss) {
+            case GBLoss::LogLoss:
+                if (n_outputs == 1) {
+                    double p = std::min(std::max(sigmoid_like(F[0][i]), 1e-12), 1.0 - 1e-12);
+                    total += -(y_enc[0][i] * std::log(p) + (1 - y_enc[0][i]) * std::log(1 - p));
+                } else {
+                    double max_f = F[0][i];
+                    for (std::size_t k = 1; k < n_outputs; ++k) max_f = std::max(max_f, F[k][i]);
+                    double sum = 0.0;
+                    for (std::size_t k = 0; k < n_outputs; ++k) sum += std::exp(F[k][i] - max_f);
+                    for (std::size_t k = 0; k < n_outputs; ++k) {
+                        if (y_enc[k][i] > 0.5) total += -(F[k][i] - max_f - std::log(sum));
+                    }
+                }
+                break;
+            case GBLoss::Exponential:
+                total += std::exp(-y_enc[0][i] * F[0][i]);
+                break;
+            case GBLoss::SquaredError:
+                total += (y_enc[0][i] - F[0][i]) * (y_enc[0][i] - F[0][i]);
+                break;
+            case GBLoss::AbsoluteError:
+                total += std::abs(y_enc[0][i] - F[0][i]);
+                break;
+            case GBLoss::Huber: {
+                double diff = y_enc[0][i] - F[0][i];
+                total += std::abs(diff) <= params_.huber_delta
+                    ? 0.5 * diff * diff
+                    : params_.huber_delta * (std::abs(diff) - 0.5 * params_.huber_delta);
+                break;
+            }
+            case GBLoss::Quantile: {
+                double diff = y_enc[0][i] - F[0][i];
+                total += diff >= 0 ? params_.quantile_alpha * diff : (params_.quantile_alpha - 1.0) * diff;
+                break;
+            }
+        }
+        return total;
     }
 
     // F += learning_rate * (tree t's raw score for row i of X), predicting
@@ -918,18 +982,31 @@ private:
         F += params_.learning_rate * raw;
     }
 
+    // Threads to predict with (n_jobs), when `work` (rows x trees) is large
+    // enough to be worth starting them; nullptr otherwise.
+    std::unique_ptr<ThreadPool> predict_pool(std::size_t work) const {
+        constexpr std::size_t kMinParallelWork = std::size_t{1} << 18;
+        const std::size_t threads = resolve_n_jobs(params_.n_jobs);
+        if (threads < 2 || work < kMinParallelWork) return nullptr;
+        return std::make_unique<ThreadPool>(threads);
+    }
+
     // Raw scores of every fitted tree. Rows are processed in blocks across
-    // all trees; each F[k][i] still accumulates trees in round order.
+    // all trees (blocks in parallel, n_jobs); each F[k][i] still accumulates
+    // trees in round order.
     std::vector<std::vector<double>> accumulate_scores(const MatrixView& X) const {
         const std::size_t n = X.n_rows();
         std::vector<std::vector<double>> F = init_score_matrix(n);
-        for (std::size_t b = 0; b < n; b += kPredictRowBlock) {
-            const std::size_t e = std::min(n, b + kPredictRowBlock);
-            for (std::size_t t = 0; t < trees_.size(); ++t) {
-                std::size_t k = t % n_outputs_;
-                for (std::size_t i = b; i < e; ++i) add_tree_score(t, X, i, F[k][i]);
+        auto pool = predict_pool(n * trees_.size());
+        for_blocks(pool.get(), n, [&](std::size_t r0, std::size_t r1) {
+            for (std::size_t b = r0; b < r1; b += kPredictRowBlock) {
+                const std::size_t e = std::min(r1, b + kPredictRowBlock);
+                for (std::size_t t = 0; t < trees_.size(); ++t) {
+                    std::size_t k = t % n_outputs_;
+                    for (std::size_t i = b; i < e; ++i) add_tree_score(t, X, i, F[k][i]);
+                }
             }
-        }
+        });
         return F;
     }
 

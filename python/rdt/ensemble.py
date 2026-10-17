@@ -42,7 +42,7 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 
 from . import RDT, _rdt_native
-from ._validation import check_X, check_X_y, check_sample_weight, check_tree_method
+from ._validation import check_X, check_X_y, check_hist_subtraction, check_sample_weight, check_tree_method
 
 __all__ = ["RandomForestRDT", "GradientBoostingRDT"]
 
@@ -204,6 +204,18 @@ class RandomForestRDT:
         ``rdt.RDT``. Not implemented for ``criterion='mae'``.
     max_bin : int, default=256
         Maximum bins per feature with ``tree_method='hist'`` (2 to 65536).
+    hist_subtraction : bool, default=True
+        With ``tree_method='hist'``: below the root, each candidate feature's
+        histograms are built only for the smaller child of every split and
+        the sibling's derived as parent minus child (histogram subtraction,
+        as in XGBoost and LightGBM); see ``rdt.RDT``. Split scores can differ
+        from ``hist_subtraction=False`` in the last bits, so an exact tie
+        between two splits may be resolved the other way.
+    max_hist_cache_mb : float, default=1024
+        Memory (MiB) for the histograms kept for ``hist_subtraction`` (the
+        current and the previous depth's together, per tree being fitted --
+        up to ``n_jobs`` trees are fitted at once); features beyond it are
+        built directly. See ``rdt.RDT``.
 
     Attributes (after fitting)
     ---------------------------
@@ -252,6 +264,8 @@ class RandomForestRDT:
         tree_method: str = "exact",
         max_bin: int = 256,
         colsample_bylevel: float = 1.0,
+        hist_subtraction: bool = True,
+        max_hist_cache_mb: float = 1024,
     ):
         self.task = task.lower()
         if self.task not in ("classification", "regression"):
@@ -284,6 +298,7 @@ class RandomForestRDT:
         self.presort = presort
         self.tree_method, self.max_bin = check_tree_method(tree_method, max_bin, self.criterion)
         self.colsample_bylevel = _check_colsample_bylevel(colsample_bylevel)
+        self.hist_subtraction, self.max_hist_cache_mb = check_hist_subtraction(hist_subtraction, max_hist_cache_mb)
 
         self.estimators_: List[RDT] = []
         self.feature_importances_ = None
@@ -316,7 +331,8 @@ class RandomForestRDT:
             self.bootstrap, max_samples_fraction, self.oob_score,
             _resolve_random_state(self.random_state), _resolve_n_jobs(self.n_jobs),
             max_samples_count, presort=self.presort, tree_method=self.tree_method, max_bin=self.max_bin,
-            colsample_bylevel=self.colsample_bylevel,
+            colsample_bylevel=self.colsample_bylevel, hist_subtraction=self.hist_subtraction,
+            max_hist_cache_mb=self.max_hist_cache_mb,
         )
         if hist:
             model.fit_hist(X, y, sample_weight)
@@ -335,7 +351,8 @@ class RandomForestRDT:
                 tree, task=self.task, criterion=self.criterion, max_depth=self.max_depth,
                 min_samples_split=self.min_samples_split, min_samples_leaf=self.min_samples_leaf,
                 min_impurity_decrease=self.min_impurity_decrease, n_features=len(feature_subsets[i]),
-                tree_method=self.tree_method, max_bin=self.max_bin,
+                tree_method=self.tree_method, max_bin=self.max_bin, hist_subtraction=self.hist_subtraction,
+                max_hist_cache_mb=self.max_hist_cache_mb,
             )
             for i, tree in enumerate(self._model.estimators_)
         ]
@@ -468,6 +485,18 @@ class GradientBoostingRDT:
         per-class trees in parallel instead. See ``rdt.RDT``.
     max_bin : int, default=256
         Maximum bins per feature with ``tree_method='hist'`` (2 to 65536).
+    hist_subtraction : bool, default=True
+        With ``tree_method='hist'``: below the root, each candidate feature's
+        histograms are built only for the smaller child of every split and
+        the sibling's derived as parent minus child (histogram subtraction,
+        as in XGBoost and LightGBM); see ``rdt.RDT``. Split scores can differ
+        from ``hist_subtraction=False`` in the last bits, so an exact tie
+        between two splits may be resolved the other way.
+    max_hist_cache_mb : float, default=1024
+        Memory (MiB) for the histograms kept for ``hist_subtraction`` (the
+        current and the previous depth's together, per tree being fitted --
+        a multiclass round fits up to ``min(n_jobs, n_classes)`` trees at
+        once); features beyond it are built directly. See ``rdt.RDT``.
     scale_pos_weight : float, optional
         XGBoost-style: multiplies the positive class's (``classes_[1]``)
         sample weight. Binary classification only.
@@ -478,9 +507,13 @@ class GradientBoostingRDT:
         Only used when loss='quantile'; the target quantile.
     random_state : int, optional
     n_jobs : int, optional
-        Threads for a multiclass round's per-class trees (independent within
-        a round); boosting rounds themselves are inherently sequential.
-        None = 1, -1 = all available hardware threads.
+        Threads. A multiclass round fits its per-class trees in parallel; a
+        round with one tree (binary, regression) scores its features in
+        parallel (``tree_method='hist'``). Each round's per-row passes
+        (gradients, routing every row to the new tree's leaf, score updates,
+        losses) and prediction run in row blocks on the threads too. Boosting
+        rounds themselves are sequential, and no result depends on
+        ``n_jobs``. None = 1, -1 = all available hardware threads.
     presort : bool, default=True
         Split search implementation. True (default) sorts each feature once
         per fit and scores every node of a depth in one pass. False sorts
@@ -503,7 +536,12 @@ class GradientBoostingRDT:
         fitted (round by round; a multiclass round fits one tree per class, in
         ``classes_`` order). Features are column indices of the ``X`` passed
         to ``fit`` (mapped through each tree's column subset).
-
+    depth_improvements_ : list of dict
+        One dict per tree (in the order of ``depth_features_``),
+        ``{depth: improvement}``: what the depth's split scored -- the total
+        Newton gain of its nodes (XGBoost's ``total_gain``) with
+        ``split_criterion='newton'``, else the weighted impurity decrease.
+        ``feature_importances_`` sums these per feature.
     level_features_ : list of dict
         One dict per tree (in the order of ``depth_features_``),
         ``{depth: [columns]}``: the candidate columns of each depth the tree
@@ -551,6 +589,8 @@ class GradientBoostingRDT:
         tree_method: str = "exact",
         max_bin: int = 256,
         colsample_bylevel: float = 1.0,
+        hist_subtraction: bool = True,
+        max_hist_cache_mb: float = 1024,
     ):
         self.task = task.lower()
         if self.task not in ("classification", "regression"):
@@ -619,11 +659,13 @@ class GradientBoostingRDT:
         self.presort = presort
         self.tree_method, self.max_bin = check_tree_method(tree_method, max_bin)
         self.colsample_bylevel = _check_colsample_bylevel(colsample_bylevel)
+        self.hist_subtraction, self.max_hist_cache_mb = check_hist_subtraction(hist_subtraction, max_hist_cache_mb)
 
         self.feature_importances_ = None
         self.train_score_ = None
         self.n_estimators_ = None
         self.depth_features_ = None
+        self.depth_improvements_ = None
         self.n_features_ = None
         self.n_classes_ = None
         self.classes_ = None
@@ -668,7 +710,8 @@ class GradientBoostingRDT:
             split_criterion=self.split_criterion,
             min_child_weight=float(self.min_child_weight) if self.split_criterion == "newton" else 1.0,
             max_delta_step=float(self.max_delta_step), tree_method=self.tree_method, max_bin=self.max_bin,
-            colsample_bylevel=self.colsample_bylevel,
+            colsample_bylevel=self.colsample_bylevel, hist_subtraction=self.hist_subtraction,
+            max_hist_cache_mb=self.max_hist_cache_mb,
         )
         if hist:
             model.fit_hist(X, y, sample_weight)
@@ -680,6 +723,7 @@ class GradientBoostingRDT:
         self.train_score_ = np.array(self._model.train_score_)
         self.n_estimators_ = self._model.n_estimators_fitted_
         self.depth_features_ = [dict(d) for d in self._model.depth_features_]
+        self.depth_improvements_ = [dict(d) for d in self._model.depth_improvements_]
         return self
 
     @property

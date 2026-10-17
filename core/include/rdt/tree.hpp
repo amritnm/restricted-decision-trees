@@ -146,15 +146,18 @@ public:
     // binned row of X as its split bin does (BinnedMatrix::split_point), so
     // predicting with the raw X routes every row as its bins did. `pool` (may
     // be nullptr) scores a depth's features in parallel; the result does not
-    // depend on it. Not available for MAE.
+    // depend on it. Not available for MAE. `arena` (may be nullptr) holds the
+    // subtraction caches; a caller fitting many trees one after another can
+    // pass the same one to reuse its memory.
     void fit_binned(const BinnedView& X, const VectorView& y, const VectorView* sample_weight = nullptr,
                     const std::vector<double>* classes = nullptr, const VectorView* hessian = nullptr,
-                    ThreadPool* pool = nullptr) {
+                    ThreadPool* pool = nullptr, HistArena* arena = nullptr) {
         if (params_.criterion == Criterion::MAE) {
             throw std::invalid_argument("tree_method='hist' does not support criterion='mae'");
         }
         std::vector<std::uint32_t> root_indices = begin_fit(X.n_cols, X.n_rows, y, sample_weight, classes, hessian);
-        root_ = build_tree(IndexedMatrixView(), X.n_rows, y, sample_weight, std::move(root_indices), nullptr, &X, pool);
+        HistArena own_arena;
+        root_ = build_tree_hist(X, y, sample_weight, std::move(root_indices), pool, arena ? *arena : own_arena);
         hessian_ = nullptr;
     }
 
@@ -339,13 +342,17 @@ private:
         return root_indices;
     }
 
-    static bool all_same_label(const VectorView& y, const std::vector<std::uint32_t>& indices) {
-        if (indices.empty()) return true;
+    static bool all_same_label(const VectorView& y, const std::uint32_t* indices, std::size_t n) {
+        if (n == 0) return true;
         double first = y[indices[0]];
-        for (auto idx : indices) {
-            if (y[idx] != first) return false;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (y[indices[i]] != first) return false;
         }
         return true;
+    }
+
+    static bool all_same_label(const VectorView& y, const std::vector<std::uint32_t>& indices) {
+        return all_same_label(y, indices.data(), indices.size());
     }
 
     bool should_split(const Node& node, int depth) const {
@@ -355,10 +362,16 @@ private:
     }
 
     void make_leaf(Node& node, const VectorView& y, const VectorView* sample_weight) const {
+        make_leaf(node, node.indices.data(), node.indices.size(), y, sample_weight);
+    }
+
+    // make_leaf from the node's rows indices[0..n) (ascending).
+    void make_leaf(Node& node, const std::uint32_t* indices, std::size_t n, const VectorView& y,
+                   const VectorView* sample_weight) const {
         node.has_value = true;
         if (newton()) {
             double G = 0.0, H = 0.0;
-            node_sums(node, y, G, H);
+            node_sums(indices, n, y, G, H);
             node.value = newton_leaf_weight(G, H, params_.newton);
             return;
         }
@@ -366,7 +379,8 @@ private:
             std::vector<double> seen_labels;
             std::unordered_map<double, std::size_t> label_to_pos;
             std::vector<double> weighted_counts;
-            for (auto idx : node.indices) {
+            for (std::size_t i = 0; i < n; ++i) {
+                const std::uint32_t idx = indices[i];
                 double v = y[idx];
                 double w = sample_weight ? (*sample_weight)[idx] : 1.0;
                 auto it = label_to_pos.find(v);
@@ -396,7 +410,8 @@ private:
             }
         } else {
             double sum = 0.0, total_weight = 0.0;
-            for (auto idx : node.indices) {
+            for (std::size_t i = 0; i < n; ++i) {
+                const std::uint32_t idx = indices[i];
                 double w = sample_weight ? (*sample_weight)[idx] : 1.0;
                 sum += w * y[idx];
                 total_weight += w;
@@ -413,15 +428,18 @@ private:
         double gain_sum = 0.0; // Newton: sum of the splitting nodes' gains
         std::vector<char> found;
         std::vector<double> threshold;
-        std::vector<std::uint32_t> split_bin; // hist: node k's rows with bin <= split_bin[k] go left
     };
 
     // Newton: a node's gradient / hessian totals, summed over its rows in
     // row order (independent of the feature being scored).
     void node_sums(const Node& node, const VectorView& g, double& G, double& H) const {
-        for (auto idx : node.indices) {
-            G += g[idx];
-            H += (*hessian_)[idx];
+        node_sums(node.indices.data(), node.indices.size(), g, G, H);
+    }
+
+    void node_sums(const std::uint32_t* indices, std::size_t n, const VectorView& g, double& G, double& H) const {
+        for (std::size_t i = 0; i < n; ++i) {
+            G += g[indices[i]];
+            H += (*hessian_)[indices[i]];
         }
     }
 
@@ -533,80 +551,6 @@ private:
         return best;
     }
 
-    // Histogram search (tree_method='hist', hist.hpp): the same choice rule as
-    // the other searches. Each feature's per-node results are computed by
-    // one task (features are split into contiguous chunks across `pool`) and
-    // reduced here in feature order, so the result does not depend on the
-    // number of threads.
-    DepthChoice find_optimal_feature_hist(
-        const BinnedView& X, const VectorView& y, const VectorView* sample_weight,
-        const std::vector<Node*>& nodes, const std::vector<double>& node_share,
-        const std::vector<double>& node_g, const std::vector<double>& node_h,
-        const std::vector<std::int32_t>& cls, HistScanner& scanner, ThreadPool* pool,
-        const std::vector<std::uint32_t>& candidates) const {
-
-        std::vector<const std::vector<std::uint32_t>*> node_rows(nodes.size());
-        for (std::size_t k = 0; k < nodes.size(); ++k) node_rows[k] = &nodes[k]->indices;
-        scanner.begin_depth(X, node_rows, y, newton() ? nullptr : sample_weight, hessian_, cls.data(), &node_g, &node_h);
-
-        // results[i]: candidate i's per-node splits.
-        const std::size_t n_cand = candidates.size();
-        std::vector<std::vector<HistSplit>> results(n_cand);
-        const std::size_t n_chunks = pool ? std::min(n_cand, 4 * pool->size()) : 1;
-        run_tasks(pool, n_chunks, [&](std::size_t c) {
-            HistScanner::Scratch scratch;
-            const std::size_t i0 = n_cand * c / n_chunks, i1 = n_cand * (c + 1) / n_chunks;
-            for (std::size_t i = i0; i < i1; ++i) scanner.score_feature(X, candidates[i], results[i], scratch);
-        });
-
-        DepthChoice best;
-        std::size_t best_i = 0;
-        for (std::size_t i = 0; i < n_cand; ++i) {
-            const std::size_t f = candidates[i];
-            std::vector<HistSplit>& splits = results[i];
-            double total_improvement = 0.0, gain_sum = 0.0;
-            bool valid_split_found = false;
-            for (std::size_t k = 0; k < splits.size(); ++k) {
-                splits[k].found = add_node_score(splits[k].found, splits[k].improvement, node_share[k],
-                                                 total_improvement, gain_sum);
-                if (splits[k].found) valid_split_found = true;
-            }
-            if (valid_split_found && total_improvement > best.total_improvement) {
-                best.total_improvement = total_improvement;
-                best.gain_sum = gain_sum;
-                best.feature = static_cast<int>(f);
-                best_i = i;
-            }
-        }
-        const std::size_t best_f = static_cast<std::size_t>(std::max(best.feature, 0));
-        if (best.feature >= 0) {
-            best.found.assign(nodes.size(), 0);
-            best.threshold.assign(nodes.size(), 0.0);
-            best.split_bin.assign(nodes.size(), 0);
-            for (std::size_t k = 0; k < nodes.size(); ++k) {
-                const HistSplit& sp = results[best_i][k];
-                if (!sp.found) continue;
-                best.found[k] = 1;
-                const auto point = X.m->split_point(X.col(best_f), sp.lo_bin, sp.hi_bin);
-                best.threshold[k] = point.first;
-                best.split_bin[k] = point.second;
-            }
-        }
-        return best;
-    }
-
-    // split_indices by bins: rows of `indices` with bin <= split_bin go left.
-    static void split_indices_binned(const BinnedView& X, const std::vector<std::uint32_t>& indices, int feature,
-                                     std::uint32_t split_bin, std::vector<std::uint32_t>& left,
-                                     std::vector<std::uint32_t>& right) {
-        left.clear();
-        right.clear();
-        for (auto idx : indices) {
-            if (X.bin(idx, static_cast<std::size_t>(feature)) <= split_bin) left.push_back(idx);
-            else right.push_back(idx);
-        }
-    }
-
     void release_indices(Node& node) const {
         if (params_.retain_indices) return;
         std::vector<std::uint32_t>().swap(node.indices);
@@ -619,19 +563,22 @@ private:
     }
 
     static double total_weight(const Node& node, const VectorView* sample_weight) {
-        if (!sample_weight) return static_cast<double>(node.indices.size());
+        return total_weight(node.indices.data(), node.indices.size(), sample_weight);
+    }
+
+    static double total_weight(const std::uint32_t* indices, std::size_t n, const VectorView* sample_weight) {
+        if (!sample_weight) return static_cast<double>(n);
         double w = 0.0;
-        for (auto idx : node.indices) w += (*sample_weight)[idx];
+        for (std::size_t i = 0; i < n; ++i) w += (*sample_weight)[indices[i]];
         return w;
     }
 
-    // `X` (exact search) or `binned` (hist search) supplies the features of
-    // the n_rows tree rows.
+    // The exact search's tree (presorted or per-node); `X` supplies the
+    // features of the n_rows tree rows.
     std::unique_ptr<Node> build_tree(const IndexedMatrixView& X, std::size_t n_rows, const VectorView& y,
                                       const VectorView* sample_weight,
                                       std::vector<std::uint32_t> root_indices,
-                                      const PresortedView* presorted,
-                                      const BinnedView* binned = nullptr, ThreadPool* pool = nullptr) {
+                                      const PresortedView* presorted) {
         auto root = std::make_unique<Node>();
         root->n_samples = root_indices.size();
         root->indices = std::move(root_indices);
@@ -662,24 +609,6 @@ private:
                 if (params_.task == Task::Classification) {
                     r.cls = static_cast<std::int32_t>(
                         std::lower_bound(classes_.begin(), classes_.end(), y[idx]) - classes_.begin());
-                }
-            }
-        }
-
-        // Hist search state: the scanner and each row's class index.
-        std::unique_ptr<HistScanner> hist_scanner;
-        std::vector<std::int32_t> row_class;
-        if (binned) {
-            hist_scanner = std::make_unique<HistScanner>(params_.criterion, params_.min_samples_leaf, classes_.size(),
-                                                         params_.newton);
-            if (params_.task == Task::Classification) {
-                row_class.assign(n_rows, 0);
-                for (auto idx : root->indices) {
-                    auto it = std::lower_bound(classes_.begin(), classes_.end(), y[idx]);
-                    if (it == classes_.end() || !(*it == y[idx])) {
-                        throw std::invalid_argument("RDTModel::fit_binned: y contains a label that is not a class");
-                    }
-                    row_class[idx] = static_cast<std::int32_t>(it - classes_.begin());
                 }
             }
         }
@@ -719,10 +648,7 @@ private:
             }
 
             DepthChoice choice;
-            if (binned) {
-                choice = find_optimal_feature_hist(*binned, y, sample_weight, nodes_to_split, node_share, node_g, node_h,
-                                                   row_class, *hist_scanner, pool, candidates);
-            } else if (presorted) {
+            if (presorted) {
                 for (std::size_t k = 0; k < nodes_to_split.size(); ++k) {
                     for (auto idx : nodes_to_split[k]->indices) scan_rows[idx].node = static_cast<std::int32_t>(k);
                 }
@@ -759,13 +685,7 @@ private:
                 double threshold = choice.threshold[k];
 
                 std::vector<std::uint32_t> left_indices, right_indices;
-                if (binned) {
-                    split_indices_binned(*binned, node->indices, best_feature, choice.split_bin[k], left_indices,
-                                         right_indices);
-                    node->split_bin = static_cast<std::int32_t>(choice.split_bin[k]);
-                } else {
-                    split_indices(X, node->indices, best_feature, threshold, left_indices, right_indices);
-                }
+                split_indices(X, node->indices, best_feature, threshold, left_indices, right_indices);
 
                 if (left_indices.empty() || right_indices.empty()) {
                     finish_leaf(*node, y, sample_weight);
@@ -795,6 +715,418 @@ private:
             if (!node->has_value) finish_leaf(*node, y, sample_weight);
         }
 
+        return root;
+    }
+
+    // Entries [begin, end) of item `item` (a node), for per-row parallel work.
+    struct RowBlock {
+        std::size_t item, begin, end;
+    };
+    static constexpr std::size_t kHistRowBlock = 8192;
+
+    // The entries [range(i).first, range(i).second) of items i = 0..n-1, in
+    // blocks of at most kHistRowBlock entries, in item and entry order.
+    template <class Range>
+    static std::vector<RowBlock> row_blocks(std::size_t n, Range&& range) {
+        std::vector<RowBlock> out;
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::pair<std::size_t, std::size_t> r = range(i);
+            for (std::size_t b = r.first; b < r.second; b += kHistRowBlock) {
+                out.push_back({i, b, std::min(r.second, b + kHistRowBlock)});
+            }
+        }
+        return out;
+    }
+
+    // The histogram search's tree (fit_binned): the same greedy choice per
+    // depth and the same node arithmetic as build_tree, on the bins.
+    //
+    // The tree's rows are kept partitioned by node: each node of the current
+    // depth owns a contiguous range of the row arrays (its view rows and their
+    // bin-matrix rows), ascending -- the order node->indices has in
+    // build_tree -- so every per-node sum runs in the same order as there. A
+    // split node's range becomes its children's ranges by a stable partition.
+    // Per-node work (leaf values, totals) runs in parallel over nodes, per-row
+    // work (statistics, the partition) over fixed blocks of rows, and the
+    // features are scored in parallel (HistScanner); none of it depends on the
+    // number of threads.
+    std::unique_ptr<Node> build_tree_hist(const BinnedView& X, const VectorView& y, const VectorView* sample_weight,
+                                          std::vector<std::uint32_t> root_indices, ThreadPool* pool,
+                                          HistArena& arena) {
+        const std::size_t m = root_indices.size();
+        auto root = std::make_unique<Node>();
+        root->n_samples = m;
+        const double root_weight = total_weight(root_indices.data(), m, sample_weight);
+        const bool classification = params_.task == Task::Classification;
+        const bool mse = params_.criterion == Criterion::MSE;
+        const bool subtraction = params_.hist_subtraction;
+
+        // Each row's class index (classification).
+        std::vector<std::int32_t> row_class;
+        if (classification) {
+            row_class.assign(X.n_rows, 0);
+            for (auto idx : root_indices) {
+                auto it = std::lower_bound(classes_.begin(), classes_.end(), y[idx]);
+                if (it == classes_.end() || !(*it == y[idx])) {
+                    throw std::invalid_argument("RDTModel::fit_binned: y contains a label that is not a class");
+                }
+                row_class[idx] = static_cast<std::int32_t>(it - classes_.begin());
+            }
+        }
+        HistScanner scanner(params_.criterion, params_.min_samples_leaf, classes_.size(), params_.newton);
+        const std::size_t S = scanner.n_stats(), RS = scanner.row_stats();
+
+        // The row arrays, double-buffered across depths: each entry's view
+        // row and bin-matrix row; and the depth's per-entry statistics.
+        std::vector<std::uint32_t> vrow[2], mrow[2];
+        vrow[0] = std::move(root_indices);
+        mrow[0].resize(m);
+        for_blocks(pool, m, [&](std::size_t e0, std::size_t e1) {
+            for (std::size_t e = e0; e < e1; ++e) mrow[0][e] = static_cast<std::uint32_t>(X.row(vrow[0][e]));
+        });
+        vrow[1].resize(m);
+        mrow[1].resize(m);
+        int cur = 0;
+        std::vector<double> stat(m * RS);
+        std::vector<std::int32_t> cls(classification ? m : 0);
+
+        struct LevelNode {
+            Node* node;
+            std::size_t begin, end; // entries of the row arrays
+            std::int32_t parent;    // index of its parent among the previous depth's scored nodes
+            double parent_center;   // MSE: the parent's weighted mean
+        };
+        auto keep_indices = [&](Node& node, const std::uint32_t* rows, std::size_t n) {
+            node.has_indices = params_.retain_indices;
+            if (params_.retain_indices) node.indices.assign(rows, rows + n);
+        };
+        keep_indices(*root, vrow[0].data(), m);
+        std::vector<LevelNode> level = {{root.get(), 0, m, -1, 0.0}};
+        auto level_size = [&](std::size_t l) { return level[l].end - level[l].begin; };
+        auto leaf = [&](const LevelNode& ln) {
+            make_leaf(*ln.node, vrow[cur].data() + ln.begin, ln.end - ln.begin, y, sample_weight);
+        };
+
+        if (subtraction && params_.max_depth > 1) {
+            // The most the two caches in use at once can take: depth d keeps
+            // at most min(2^d, m / min_samples_split) nodes' histograms of
+            // (at most) every column of the bins, for d < max_depth - 1. (All
+            // columns, not this tree's: the bound is then the same for every
+            // tree of an ensemble, which reuses one arena without growing it.)
+            std::size_t row_bytes = 0;
+            for (std::size_t c = 0; c < X.m->n_cols(); ++c) {
+                const std::size_t nb = X.m->n_bins(c);
+                if (nb >= 2) row_bytes += nb * (S * sizeof(double) + sizeof(std::uint32_t));
+            }
+            const std::size_t max_nodes = m / static_cast<std::size_t>(std::max(params_.min_samples_split, 2)) + 1;
+            auto nodes_at = [&](int d) { return d >= 62 ? max_nodes : std::min(std::size_t{1} << d, max_nodes); };
+            // (Each feature's histograms are padded to a kAlign block.)
+            const std::size_t pad = HistCache::kAlign * X.m->n_cols();
+            std::size_t need = 0;
+            for (int d = 0; d + 1 < params_.max_depth; ++d) {
+                need = std::max(need, (nodes_at(d) + (d > 0 ? nodes_at(d - 1) : 0)) * row_bytes + 2 * pad);
+                if (d > 0 && nodes_at(d - 1) == max_nodes) break; // deeper depths need no more
+            }
+            arena.reserve(std::min(need, params_.max_hist_cache_bytes));
+        }
+        LevelSampler level_sampler(params_, n_features_);
+        // Histogram subtraction: the next depth's candidates (drawn one depth
+        // early, from the same sequence of draws) and the cached histograms of
+        // the previous depth's scored nodes.
+        std::vector<std::uint32_t> next_candidates;
+        bool have_next = false;
+        HistCache prev_cache;
+        std::vector<std::vector<HistSplit>> results;
+        for (int depth = 0; depth < params_.max_depth; ++depth) {
+            if (level.empty()) break;
+            const std::uint32_t* V = vrow[cur].data();
+
+            // Nodes too small to split, or (impurity criteria) of a single
+            // label, become leaves; the others are scored.
+            std::vector<char> is_scored(level.size(), 0);
+            run_balanced(pool, level.size(), level_size, [&](std::size_t l) {
+                const LevelNode& ln = level[l];
+                const std::size_t n = ln.end - ln.begin;
+                if (static_cast<int>(n) >= params_.min_samples_split &&
+                    (newton() || !all_same_label(y, V + ln.begin, n))) {
+                    is_scored[l] = 1;
+                } else {
+                    leaf(ln);
+                }
+            });
+            std::vector<std::size_t> scored; // level index of each scored node
+            std::vector<std::int32_t> scored_index(level.size(), -1);
+            for (std::size_t l = 0; l < level.size(); ++l) {
+                if (!is_scored[l]) continue;
+                scored_index[l] = static_cast<std::int32_t>(scored.size());
+                scored.push_back(l);
+            }
+            if (scored.empty()) break;
+            const std::vector<std::uint32_t> candidates = have_next ? std::move(next_candidates) : level_sampler.next();
+            have_next = false;
+            ++n_searched_depths_;
+            const std::size_t K = scored.size();
+            auto scored_size = [&](std::size_t k) { return level_size(scored[k]); };
+            // Subtraction, at a depth below the root where the previous depth
+            // kept some candidate's histograms: statistics centred at the
+            // parent's mean (MSE), and computed for unscored siblings as well,
+            // which a group may build to derive its scored child. A depth with
+            // nothing to subtract (max_hist_cache_bytes = 0, or no candidate
+            // kept, e.g. with colsample_bylevel) is the direct build's, bit for
+            // bit.
+            const bool sub_depth = subtraction && depth > 0 &&
+                                   std::any_of(candidates.begin(), candidates.end(),
+                                               [&](std::uint32_t f) { return prev_cache.slot(f) >= 0; });
+
+            // The scored nodes' per-entry statistics (as HistDepth describes
+            // them) and per-node totals, both in row order, and each node's
+            // share of the training weight.
+            std::vector<double> center(mse ? K : 0, 0.0);
+            if (mse) {
+                // Targets are centred at each node's weighted mean, as the
+                // exact search centres them.
+                run_balanced(pool, K, scored_size, [&](std::size_t k) {
+                    const LevelNode& ln = level[scored[k]];
+                    double raw = 0.0, wsum = 0.0;
+                    for (std::size_t e = ln.begin; e < ln.end; ++e) {
+                        const double wi = sample_weight ? (*sample_weight)[V[e]] : 1.0;
+                        raw += wi * y[V[e]];
+                        wsum += wi;
+                    }
+                    center[k] = wsum > 0.0 ? raw / wsum : 0.0;
+                });
+            }
+            // The level nodes whose entries get statistics: the scored ones,
+            // and with subtraction every node (siblings of scored ones).
+            std::vector<std::size_t> stat_nodes;
+            for (std::size_t l = 0; l < level.size(); ++l) {
+                if (scored_index[l] >= 0 || sub_depth) stat_nodes.push_back(l);
+            }
+            // MSE: the centre of each level node's statistics.
+            std::vector<double> stat_center(mse ? level.size() : 0, 0.0);
+            for (std::size_t l = 0; mse && l < level.size(); ++l) {
+                stat_center[l] = sub_depth ? level[l].parent_center : scored_index[l] >= 0 ? center[scored_index[l]] : 0.0;
+            }
+            const std::vector<RowBlock> stat_blocks = row_blocks(stat_nodes.size(), [&](std::size_t i) {
+                return std::make_pair(level[stat_nodes[i]].begin, level[stat_nodes[i]].end);
+            });
+            run_balanced(pool, stat_blocks.size(), [&](std::size_t b) { return stat_blocks[b].end - stat_blocks[b].begin; },
+                         [&](std::size_t b) {
+                const RowBlock& rb = stat_blocks[b];
+                for (std::size_t e = rb.begin; e < rb.end; ++e) {
+                    const std::uint32_t i = V[e];
+                    if (newton()) {
+                        stat[2 * e] = y[i];
+                        stat[2 * e + 1] = (*hessian_)[i];
+                    } else if (mse) {
+                        const double wi = sample_weight ? (*sample_weight)[i] : 1.0;
+                        const double d = y[i] - stat_center[stat_nodes[rb.item]];
+                        stat[3 * e] = wi * d;
+                        stat[3 * e + 1] = wi * d * d;
+                        stat[3 * e + 2] = wi;
+                    } else {
+                        stat[e] = sample_weight ? (*sample_weight)[i] : 1.0;
+                        cls[e] = row_class[i];
+                    }
+                }
+            });
+            std::vector<double> totals(K * S, 0.0), node_share(K, 0.0);
+            std::vector<std::size_t> sizes(K);
+            run_balanced(pool, K, scored_size, [&](std::size_t k) {
+                const LevelNode& ln = level[scored[k]];
+                double* t = totals.data() + k * S;
+                if (classification) {
+                    for (std::size_t e = ln.begin; e < ln.end; ++e) t[static_cast<std::size_t>(cls[e])] += stat[e];
+                } else if (mse && sub_depth) {
+                    // The statistics are centred at the parent's mean; the
+                    // totals at the node's own, as without subtraction.
+                    for (std::size_t e = ln.begin; e < ln.end; ++e) {
+                        const double wi = sample_weight ? (*sample_weight)[V[e]] : 1.0;
+                        const double d = y[V[e]] - center[k];
+                        const double s[3] = {wi * d, wi * d * d, wi};
+                        for (std::size_t si = 0; si < 3; ++si) t[si] += s[si];
+                    }
+                } else {
+                    for (std::size_t e = ln.begin; e < ln.end; ++e) {
+                        for (std::size_t s = 0; s < S; ++s) t[s] += stat[e * S + s];
+                    }
+                }
+                sizes[k] = ln.end - ln.begin;
+                node_share[k] =
+                    root_weight > 0.0 ? total_weight(V + ln.begin, ln.end - ln.begin, sample_weight) / root_weight : 0.0;
+            });
+
+            // Score every candidate for every scored node.
+            HistDepth hd;
+            hd.mrow = mrow[cur].data();
+            hd.stat = stat.data();
+            hd.cls = cls.data();
+            hd.n_nodes = K;
+            for (std::size_t l = 0; l < level.size(); l += (depth == 0 ? 1 : 2)) {
+                HistGroup g;
+                g.parent = level[l].parent;
+                for (std::size_t c = 0; c < (depth == 0 ? 1u : 2u); ++c) {
+                    g.begin[c] = level[l + c].begin;
+                    g.end[c] = level[l + c].end;
+                    g.node[c] = scored_index[l + c];
+                }
+                if (g.node[0] >= 0 || g.node[1] >= 0) hd.groups.push_back(g);
+            }
+            if (mse && sub_depth) {
+                hd.recenter.resize(K);
+                for (std::size_t k = 0; k < K; ++k) hd.recenter[k] = center[k] - level[scored[k]].parent_center;
+            }
+            // The histograms to keep for the next depth: candidates that are
+            // also candidates there, in candidate order, while the two depths'
+            // caches together fit in the budget.
+            HistCache next_cache;
+            const bool keep = subtraction && depth + 1 < params_.max_depth;
+            if (keep) {
+                next_candidates = level_sampler.next();
+                have_next = true;
+                next_cache = HistCache(n_features_, K, S);
+                std::vector<char> is_next(n_features_, 0);
+                for (std::uint32_t f : next_candidates) is_next[f] = 1;
+                const std::size_t budget = params_.max_hist_cache_bytes;
+                std::size_t used = prev_cache.bytes();
+                for (std::uint32_t f : candidates) {
+                    const std::size_t nb = X.m->n_bins(X.col(f));
+                    const std::size_t b = HistCache::bytes_for(K, nb, S);
+                    if (!is_next[f] || nb < 2 || used > budget || b > budget - used) continue;
+                    next_cache.add(f, nb);
+                    used += b;
+                }
+                arena.place(prev_cache, next_cache);
+            }
+            scanner.begin_depth(std::move(sizes), std::move(totals));
+            scanner.score(X, hd, candidates, sub_depth ? &prev_cache : nullptr, keep ? &next_cache : nullptr, results,
+                          pool);
+            prev_cache = std::move(next_cache);
+
+            // The depth's choice, reduced in candidate order.
+            DepthChoice best;
+            std::size_t best_i = 0;
+            for (std::size_t i = 0; i < candidates.size(); ++i) {
+                std::vector<HistSplit>& splits = results[i];
+                double total_improvement = 0.0, gain_sum = 0.0;
+                bool valid_split_found = false;
+                for (std::size_t k = 0; k < splits.size(); ++k) {
+                    splits[k].found = add_node_score(splits[k].found, splits[k].improvement, node_share[k],
+                                                     total_improvement, gain_sum);
+                    if (splits[k].found) valid_split_found = true;
+                }
+                if (valid_split_found && total_improvement > best.total_improvement) {
+                    best.total_improvement = total_improvement;
+                    best.gain_sum = gain_sum;
+                    best.feature = static_cast<int>(candidates[i]);
+                    best_i = i;
+                }
+            }
+            // scikit-learn's rule: split unless improvement + EPSILON < min_impurity_decrease.
+            // (Newton: gamma has already gated each node.)
+            if (best.feature < 0 || (!newton() && best.total_improvement + std::numeric_limits<double>::epsilon() <
+                                                      params_.min_impurity_decrease)) {
+                run_balanced(pool, K, scored_size, [&](std::size_t k) { leaf(level[scored[k]]); });
+                break;
+            }
+            depth_features_[depth] = best.feature;
+            depth_improvements_[depth] = newton() ? best.gain_sum : best.total_improvement;
+
+            // Split: a stable partition of each splitting node's entries
+            // (bin <= split_bin first), in two passes over fixed row blocks.
+            const std::size_t best_col = X.col(static_cast<std::size_t>(best.feature));
+            const BinnedMatrix::ColumnReader column = X.m->column(best_col);
+            std::vector<char> splits_node(K, 0);
+            std::vector<std::uint32_t> split_bin(K, 0);
+            std::vector<double> threshold(K, 0.0);
+            for (std::size_t k = 0; k < K; ++k) {
+                const HistSplit& sp = results[best_i][k];
+                if (!sp.found) continue;
+                splits_node[k] = 1;
+                const auto point = X.m->split_point(best_col, sp.lo_bin, sp.hi_bin);
+                threshold[k] = point.first;
+                split_bin[k] = point.second;
+            }
+            const std::vector<RowBlock> part_blocks = row_blocks(K, [&](std::size_t k) {
+                return splits_node[k] ? std::make_pair(level[scored[k]].begin, level[scored[k]].end)
+                                      : std::make_pair(std::size_t{0}, std::size_t{0});
+            });
+            auto block_size = [&](std::size_t b) { return part_blocks[b].end - part_blocks[b].begin; };
+            std::vector<std::size_t> block_left(part_blocks.size(), 0);
+            const std::uint32_t* M = mrow[cur].data();
+            run_balanced(pool, part_blocks.size(), block_size, [&](std::size_t b) {
+                const RowBlock& rb = part_blocks[b];
+                const std::uint32_t sb = split_bin[rb.item];
+                std::size_t n_left = 0;
+                for (std::size_t e = rb.begin; e < rb.end; ++e) n_left += column(M[e]) <= sb ? 1 : 0;
+                block_left[b] = n_left;
+            });
+            std::vector<std::size_t> node_left(K, 0), left_pos(part_blocks.size()), right_pos(part_blocks.size());
+            for (std::size_t b = 0; b < part_blocks.size(); ++b) node_left[part_blocks[b].item] += block_left[b];
+            {
+                std::vector<std::size_t> next_left(K), next_right(K);
+                for (std::size_t k = 0; k < K; ++k) {
+                    next_left[k] = level[scored[k]].begin;
+                    next_right[k] = level[scored[k]].begin + node_left[k];
+                }
+                for (std::size_t b = 0; b < part_blocks.size(); ++b) {
+                    const std::size_t k = part_blocks[b].item;
+                    left_pos[b] = next_left[k];
+                    right_pos[b] = next_right[k];
+                    next_left[k] += block_left[b];
+                    next_right[k] += block_size(b) - block_left[b];
+                }
+            }
+            const int nxt = 1 - cur;
+            run_balanced(pool, part_blocks.size(), block_size, [&](std::size_t b) {
+                const RowBlock& rb = part_blocks[b];
+                const std::uint32_t sb = split_bin[rb.item];
+                std::size_t l = left_pos[b], r = right_pos[b];
+                for (std::size_t e = rb.begin; e < rb.end; ++e) {
+                    const std::size_t to = column(M[e]) <= sb ? l++ : r++;
+                    vrow[nxt][to] = V[e];
+                    mrow[nxt][to] = M[e];
+                }
+            });
+
+            std::vector<LevelNode> next_level;
+            std::vector<std::size_t> leaves;
+            for (std::size_t k = 0; k < K; ++k) {
+                const LevelNode& ln = level[scored[k]];
+                Node* node = ln.node;
+                if (!splits_node[k]) {
+                    leaves.push_back(k);
+                    continue;
+                }
+                node->split_bin = static_cast<std::int32_t>(split_bin[k]);
+                const std::size_t n = ln.end - ln.begin, n_left = node_left[k];
+                if (n_left == 0 || n_left == n) {
+                    leaves.push_back(k);
+                    continue;
+                }
+                node->is_split = true;
+                node->split_feature = best.feature;
+                node->split_threshold = threshold[k];
+                node->left = std::make_unique<Node>();
+                node->left->n_samples = n_left;
+                node->right = std::make_unique<Node>();
+                node->right->n_samples = n - n_left;
+                const double c = mse ? center[k] : 0.0;
+                next_level.push_back({node->left.get(), ln.begin, ln.begin + n_left, static_cast<std::int32_t>(k), c});
+                next_level.push_back({node->right.get(), ln.begin + n_left, ln.end, static_cast<std::int32_t>(k), c});
+            }
+            run_balanced(pool, leaves.size(), [&](std::size_t i) { return scored_size(leaves[i]); },
+                         [&](std::size_t i) { leaf(level[scored[leaves[i]]]); });
+            cur = nxt;
+            level = std::move(next_level);
+            run_balanced(pool, level.size(), level_size, [&](std::size_t l) {
+                keep_indices(*level[l].node, vrow[cur].data() + level[l].begin, level[l].end - level[l].begin);
+            });
+        }
+
+        run_balanced(pool, level.size(), level_size, [&](std::size_t l) {
+            if (!level[l].node->has_value) leaf(level[l]);
+        });
         return root;
     }
 };

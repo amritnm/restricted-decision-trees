@@ -79,6 +79,17 @@ def check_tree_method(tree_method, max_bin, criterion: Optional[str] = None) -> 
     return tree_method, int(max_bin)
 
 
+def check_hist_subtraction(hist_subtraction, max_hist_cache_mb) -> Tuple[bool, float]:
+    """Validate ``hist_subtraction`` / ``max_hist_cache_mb``."""
+    if not isinstance(hist_subtraction, (bool, np.bool_)):
+        raise ValueError(f"hist_subtraction must be a bool, got {hist_subtraction!r}")
+    if isinstance(max_hist_cache_mb, (bool, np.bool_)) or not isinstance(max_hist_cache_mb, (int, float, np.integer,
+                                                                                             np.floating)) \
+            or not np.isfinite(max_hist_cache_mb) or max_hist_cache_mb < 0:
+        raise ValueError(f"max_hist_cache_mb must be a finite number >= 0, got {max_hist_cache_mb!r}")
+    return bool(hist_subtraction), float(max_hist_cache_mb)
+
+
 def check_sample_weight(sample_weight, n_samples: int, name: str = "sample_weight") -> np.ndarray:
     """Return the weights as a C-contiguous float64 1D array of length
     ``n_samples``, or raise ValueError unless they are finite, non-negative

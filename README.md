@@ -133,7 +133,7 @@ See `examples/ensemble_usage.py` for a fuller, runnable example.
 
 ## API reference
 
-### `rdt.RDT(task="classification", criterion=None, max_depth=5, min_samples_split=2, min_samples_leaf=1, min_impurity_decrease=0.0, presort=True, tree_method="exact", max_bin=256, n_jobs=None)`
+### `rdt.RDT(task="classification", criterion=None, max_depth=5, min_samples_split=2, min_samples_leaf=1, min_impurity_decrease=0.0, presort=True, tree_method="exact", max_bin=256, n_jobs=None, hist_subtraction=True, max_hist_cache_mb=1024)`
 
 **Parameters**
 
@@ -156,6 +156,9 @@ See `examples/ensemble_usage.py` for a fuller, runnable example.
 - `max_bin` — maximum bins per feature for `tree_method="hist"` (2–65536,
   default 256).
 - `n_jobs` — threads for the `tree_method="hist"` search (None = 1).
+- `hist_subtraction`, `max_hist_cache_mb` — histogram subtraction for
+  `tree_method="hist"` and the memory it may keep (see
+  [Histogram split search](#histogram-split-search-tree_methodhist)).
 
 **Methods**
 
@@ -193,7 +196,7 @@ Bagging ensemble: `n_estimators`, `task`, `criterion`, `max_depth`,
 `min_impurity_decrease` (alias `gamma`), `max_features` (alias
 `colsample_bytree`), `bootstrap`, `max_samples`, `oob_score`, `class_weight`
 (`'balanced'` or dict), `random_state`, `n_jobs`, `presort`, `tree_method`,
-`max_bin`, `colsample_bylevel`. `max_samples` follows
+`max_bin`, `colsample_bylevel`, `hist_subtraction`, `max_hist_cache_mb`. `max_samples` follows
 scikit-learn: an int is the number of rows drawn per tree, a float is a
 fraction of `n_samples`, `None` means `n_samples`. After fitting:
 `estimators_` (list of `RDT`, individually introspectable),
@@ -223,7 +226,9 @@ early-stopping validation loss. Parameters: `n_estimators`, `task`, `loss` (clas
 `early_stopping_rounds`), `tol`, `reg_alpha`, `reg_lambda`,
 `scale_pos_weight` (binary only), `huber_delta`, `quantile_alpha`,
 `random_state`, `n_jobs`, `presort`, `split_criterion`, `max_delta_step`,
-`tree_method`, `max_bin`, `colsample_bylevel`.
+`tree_method`, `max_bin`, `colsample_bylevel`, `hist_subtraction`,
+`max_hist_cache_mb`. After fitting, `depth_improvements_` holds each tree's
+per-depth improvement (the total Newton gain with `split_criterion="newton"`).
 Classification needs at least two classes in `y`.
 
 `split_criterion="newton"` grows each round's tree the XGBoost way: per-row
@@ -286,18 +291,38 @@ and `max_bin` (default 256, 2–65536):
 - **Binning**, once per `fit`, from the training rows with positive weight
   (for gradient boosting, after the early-stopping split): a feature with at
   most `max_bin` distinct values gets one bin per value, otherwise
-  approximately equal-count bins. All rows are binned and stored column-major
-  as `uint8` (every feature as `uint16` when any feature has more than 256
-  bins). `X` may be float32 or float64, C or Fortran order, a strided view or
-  an `np.memmap`: it is read in place, a block of columns at a time — never
-  copied — and not read again after binning (boosting updates its training
-  scores, and the forest its OOB score, through the bins).
-- **Search:** at each depth, each feature's histograms for all of the depth's
-  nodes are built in one pass over its bin column and swept with the same
+  approximately equal-count bins. All rows are binned and stored as `uint8`
+  (every feature as `uint16` when any feature has more than 256 bins), in
+  row blocks of 16 features (a row's bins of a block side by side). `X` may be
+  float32 or float64, C or Fortran order, a strided view or an `np.memmap`:
+  it is read in place, a block of columns at a time — never copied — and not
+  read again after binning (boosting updates its training scores, and the
+  forest its OOB score, through the bins).
+- **Search:** the tree keeps its rows partitioned by node. At each depth, a
+  node's histograms are built over its own rows, for the 16 features of a
+  bin block in one pass (so they stay in cache), and swept with the same
   criterion arithmetic as the exact search (Gini, entropy, MSE, and the
-  gradient boosting criteria `friedman_mse` and `newton`); features are
-  scored in parallel when `n_jobs > 1` (a single tree, or a boosting round
-  with one tree), and the result does not depend on `n_jobs`.
+  gradient boosting criteria `friedman_mse` and `newton`). Features, and the
+  per-depth row bookkeeping, run in parallel when `n_jobs > 1` (a single
+  tree, or a boosting round with one tree); the result does not depend on
+  `n_jobs`.
+- **Histogram subtraction** (`hist_subtraction=True`, the default): below
+  the root, each feature's histograms are built only for the smaller child
+  of every split, and its sibling's are derived as parent minus child from
+  the previous depth's histograms, as XGBoost and LightGBM do. This builds
+  roughly a third of the rows at each depth below the root. The histograms
+  are kept for the features scored at both depths, within
+  `max_hist_cache_mb` (default 1024 MiB) for the current and the previous
+  depth together (about `nodes * sum(bins) * 20` bytes per depth for
+  `newton`); the other features are built directly. The budget is per tree
+  being fitted: a random forest fits up to `n_jobs` trees at once, a
+  multiclass boosting round up to `min(n_jobs, n_classes)`. Derived sums are
+  rounded differently, so split scores can differ from
+  `hist_subtraction=False` in the last bits and an exact tie between two
+  splits may go the other way; otherwise the trees are the same.
+  `hist_subtraction=False` builds every histogram directly, and so does a
+  depth with nothing kept to subtract from (`max_hist_cache_mb=0` is
+  `hist_subtraction=False` bit for bit).
 - **Thresholds:** a split between a node's adjacent non-empty bins `lo < hi`
   uses the midpoint between the largest training value in bin `lo` and the
   smallest in bin `hi` — the exact search's threshold (the midpoint between
@@ -313,10 +338,9 @@ and `max_bin` (default 256, 2–65536):
 - **Memory** (besides `X`; no presorted columns): the bins, 1 byte per row
   and feature (2 when any feature has more than 256 bins); 40 bytes per bin
   and feature for the cuts and bin extents; while binning, one sorted column
-  of training values per thread (8 bytes per training row); and, per depth,
-  36 bytes per row of the tree for MSE / `friedman_mse` (28 for `newton`, 24
-  for Gini / entropy) plus each thread's histograms (nodes × bins × (4 + 8·s)
-  bytes, `s` = 3, 2 or the number of classes); a forest grows `n_jobs` trees
+  of training values per thread (8 bytes per training row); 32-48 bytes per
+  training row of search state; and the subtraction cache (at most
+  `max_hist_cache_mb` per tree being fitted). A forest grows `n_jobs` trees
   at a time, each with its own search state. Gradient boosting's per-row
   scores and gradients come on top, as with `"exact"`.
 
@@ -352,7 +376,11 @@ and `max_bin` (default 256, 2–65536):
   `predict` / `predict_proba` now return NumPy arrays (they returned lists).
 - `n_jobs` parallelizes across trees: Random Forest trees, and a multiclass
   boosting round's per-class trees. Binary / regression boosting fits one
-  tree per round, so it does not use extra threads.
+  tree per round; with `tree_method="hist"` that tree scores its features in
+  parallel. Gradient boosting also runs each round's per-row passes
+  (gradients, routing rows to the new leaves, score updates, losses) and its
+  predictions in row blocks on the `n_jobs` threads. No result depends on
+  `n_jobs`: per-row work is independent, and sums are taken in row order.
 
 ## How it works
 

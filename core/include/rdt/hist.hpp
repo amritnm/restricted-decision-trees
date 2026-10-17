@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -24,25 +25,36 @@
 // (split_threshold) between the largest training value in bin b and the
 // smallest in bin b + 1, and a value's bin is the number of cuts below it.
 // Every row of X (validation and zero-weight rows included) is binned with
-// these cuts and stored column-major as uint8 (every column as uint16 when
-// any column has more than 256 bins); each bin also records the extent of
-// its training values and of all of its values. X is read through a typed,
-// strided view (float32 or float64, any order, memory-mapped or not) a block
-// of columns at a time, without copying it, and never read again after
-// binning; computing the cuts sorts one column's training values at a time
-// per thread (8 bytes per training row; a few adjacent columns at once while
-// they fit in kBinningBufferBytes).
+// these cuts and stored as uint8 (every column as uint16 when any column has
+// more than 256 bins) in row blocks: the columns are taken kBinBlock at a
+// time, and a block holds each row's bins of its columns side by side. Each
+// bin also records the extent of its training values and of all of its
+// values. X is read through a typed, strided view (float32 or float64, any
+// order, memory-mapped or not) a block of columns at a time, without copying
+// it, and never read again after binning; computing the cuts sorts one
+// column's training values at a time per thread (8 bytes per training row; a
+// few adjacent columns at once while they fit in kBinningBufferBytes).
 //
-// Search. Per depth, each candidate feature's histograms are built for all of
-// the depth's nodes in one pass over its bin column (rows in ascending
-// order), then each node's bins are swept left to right with the criterion
-// arithmetic of the exact search (the same boundary rule, min_samples_leaf
-// counts, MSE centring, impurity / Newton gain expressions and strict '>' tie
-// order, lowest boundary first); a node's candidate boundaries lie between
-// its consecutive non-empty bins. Node totals are summed once per depth in
-// row order. Features may be scored in parallel; each feature's result is
-// computed by one thread and the depth's choice is reduced in feature order,
-// so results do not depend on the number of threads.
+// Search. The tree keeps its rows partitioned by node (each node's rows
+// contiguous and ascending, see RDTModel::build_tree_hist). Per depth, each
+// candidate feature's histogram is built for one node at a time, over that
+// node's rows in ascending order, for all of a bin block's candidate features
+// in the same pass, so a node's histograms stay in cache and its rows' bins
+// are read one cache line per row and block. A node's bins are then swept left
+// to right with the criterion arithmetic of the exact search (the same
+// boundary rule, min_samples_leaf counts, MSE centring, impurity / Newton gain
+// expressions and strict '>' tie order, lowest boundary first); its candidate
+// boundaries lie between its consecutive non-empty bins. Node totals are
+// summed in row order. Features are scored in parallel; each (feature, node)
+// result is computed by one thread and the depth's choice is reduced in
+// feature order, so results do not depend on the number of threads.
+//
+// Subtraction (TreeParams::hist_subtraction). Below the root, a feature whose
+// histograms of the previous depth were kept (HistCache) is built only for
+// the smaller child of each split, and the sibling's histogram is the
+// parent's minus that child's. Derived sums are rounded differently from
+// directly built ones, so split scores may differ in their last bits from the
+// direct build (exactly equal for unit-weight class counts).
 //
 // Thresholds. A split between a node's adjacent non-empty bins lo < hi gets
 // the exact search's threshold, the guarded midpoint of the largest training
@@ -95,11 +107,56 @@ constexpr std::size_t kBinningBufferBytes = std::size_t{8} << 20;
 // Runs f(0..n-1) on the pool when there is one with more than one thread.
 template <class F>
 void run_tasks(ThreadPool* pool, std::size_t n, F&& f) {
-    if (pool && n > 1) {
+    if (pool && pool->size() > 1 && n > 1) {
         pool->parallel_for(n, f);
     } else {
         for (std::size_t i = 0; i < n; ++i) f(i);
     }
+}
+
+// Runs f(k) for every k in [0, n): contiguous ranges of k, of about equal
+// total weight(k) (e.g. a node's row count), are run as one task each on the
+// pool. f(k) must not depend on which other k share its task.
+template <class W, class F>
+void run_balanced(ThreadPool* pool, std::size_t n, W&& weight, F&& f) {
+    if (!pool || pool->size() < 2 || n < 2) {
+        for (std::size_t k = 0; k < n; ++k) f(k);
+        return;
+    }
+    double total = 0.0;
+    for (std::size_t k = 0; k < n; ++k) total += static_cast<double>(weight(k)) + 1.0;
+    const double target = std::max(total / static_cast<double>(4 * pool->size()), 4096.0);
+    std::vector<std::size_t> bounds = {0};
+    double acc = 0.0;
+    for (std::size_t k = 0; k < n; ++k) {
+        acc += static_cast<double>(weight(k)) + 1.0;
+        if (acc >= target && k + 1 < n) {
+            bounds.push_back(k + 1);
+            acc = 0.0;
+        }
+    }
+    bounds.push_back(n);
+    run_tasks(pool, bounds.size() - 1, [&](std::size_t t) {
+        for (std::size_t k = bounds[t]; k < bounds[t + 1]; ++k) f(k);
+    });
+}
+
+// Runs f(begin, end) over [0, n) in fixed blocks of 16384, on the pool. For
+// per-element work, so the result does not depend on the pool.
+template <class F>
+void for_blocks(ThreadPool* pool, std::size_t n, F&& f) {
+    constexpr std::size_t kBlock = 16384;
+    const std::size_t n_blocks = (n + kBlock - 1) / kBlock;
+    run_tasks(pool, n_blocks, [&](std::size_t b) { f(b * kBlock, std::min(n, (b + 1) * kBlock)); });
+}
+
+// Prefetch the cache line at p for reading (a no-op where unsupported).
+inline void prefetch_read(const void* p) {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(p, 0, 3);
+#else
+    (void)p;
+#endif
 }
 
 // Cuts of one column from its (sorted) values, and each bin's smallest and
@@ -147,6 +204,11 @@ inline void column_cuts(const std::vector<double>& sorted, int max_bin, std::vec
     }
 }
 
+// Columns per row block of a BinnedMatrix (see the file comment): a node's
+// pass over its rows reads one row's bins of a block (16 or 32 bytes) at a
+// time, and builds that many features' histograms at once.
+constexpr std::size_t kBinBlock = 16;
+
 class BinnedMatrix {
 public:
     BinnedMatrix() = default;
@@ -158,7 +220,6 @@ public:
         n_rows_ = X.n_rows();
         n_cols_ = X.n_cols();
         const std::size_t block = std::max<std::size_t>(1, column_block(X));
-        const std::size_t n_blocks = (n_cols_ + block - 1) / block;
 
         // Pass 1: each column's cuts (and its bins' training-value extents)
         // from its sorted cut-row values. Each task (one per thread) owns one
@@ -212,14 +273,15 @@ public:
             data8_.resize(n_rows_ * n_cols_);
         }
 
-        // Pass 2: every row's bin, a block of columns at a time (rows in
+        // Pass 2: every row's bin, a row block of columns at a time (rows in
         // order), widening each bin's all-row extent by values outside the
         // cut rows.
-        run_tasks(pool, n_blocks, [&](std::size_t blk) {
-            const std::size_t c0 = blk * block;
-            const std::size_t nb = std::min(block, n_cols_ - c0);
+        run_tasks(pool, n_bin_blocks(), [&](std::size_t blk) {
+            const std::size_t c0 = blk * kBinBlock;
+            const std::size_t w = block_width(blk);
+            const std::size_t off = block_offset(blk);
             for (std::size_t r = 0; r < n_rows_; ++r) {
-                for (std::size_t j = 0; j < nb; ++j) {
+                for (std::size_t j = 0; j < w; ++j) {
                     const std::size_t c = c0 + j;
                     const double x = X(r, c);
                     const double* cb = cuts_.data() + cut_offset_[c];
@@ -230,9 +292,9 @@ public:
                     if (x < lo) lo = x;
                     if (x > hi) hi = x;
                     if (wide_) {
-                        data16_[c * n_rows_ + r] = static_cast<std::uint16_t>(b);
+                        data16_[off + r * w + j] = static_cast<std::uint16_t>(b);
                     } else {
-                        data8_[c * n_rows_ + r] = static_cast<std::uint8_t>(b);
+                        data8_[off + r * w + j] = static_cast<std::uint8_t>(b);
                     }
                 }
             }
@@ -244,10 +306,30 @@ public:
     bool wide() const { return wide_; }
     std::uint32_t n_bins(std::size_t col) const { return n_bins_[col]; }
     std::uint32_t bin(std::size_t row, std::size_t col) const {
-        return wide_ ? data16_[col * n_rows_ + row] : data8_[col * n_rows_ + row];
+        const std::size_t blk = col / kBinBlock;
+        const std::size_t i = block_offset(blk) + row * block_width(blk) + (col - blk * kBinBlock);
+        return wide_ ? data16_[i] : data8_[i];
     }
-    const std::uint8_t* column8(std::size_t col) const { return data8_.data() + col * n_rows_; }
-    const std::uint16_t* column16(std::size_t col) const { return data16_.data() + col * n_rows_; }
+    // Row blocks: block `blk` holds columns [blk * kBinBlock, + block_width(blk)),
+    // row r's bins at block8/16(blk) + r * block_width(blk).
+    std::size_t n_bin_blocks() const { return (n_cols_ + kBinBlock - 1) / kBinBlock; }
+    std::size_t block_width(std::size_t blk) const { return std::min(kBinBlock, n_cols_ - blk * kBinBlock); }
+    const std::uint8_t* block8(std::size_t blk) const { return data8_.data() + block_offset(blk); }
+    const std::uint16_t* block16(std::size_t blk) const { return data16_.data() + block_offset(blk); }
+    // Reads one column's bins: column(col)(row) == bin(row, col).
+    struct ColumnReader {
+        const std::uint8_t* p8;
+        const std::uint16_t* p16;
+        std::size_t width;
+        std::uint32_t operator()(std::size_t row) const {
+            return p16 ? p16[row * width] : p8[row * width];
+        }
+    };
+    ColumnReader column(std::size_t col) const {
+        const std::size_t blk = col / kBinBlock, j = col - blk * kBinBlock;
+        return wide_ ? ColumnReader{nullptr, block16(blk) + j, block_width(blk)}
+                     : ColumnReader{block8(blk) + j, nullptr, block_width(blk)};
+    }
     // x <= cut(col, b) exactly when bin(x) <= b, for b < n_bins(col) - 1.
     double cut(std::size_t col, std::uint32_t b) const { return cuts_[cut_offset_[col] + b]; }
     const double* cuts(std::size_t col) const { return cuts_.data() + cut_offset_[col]; }
@@ -281,6 +363,8 @@ private:
     std::vector<double> cuts_;
     // Per bin: the smallest / largest training (cut-row) value, and of all rows.
     std::vector<double> train_lo_, train_hi_, all_lo_, all_hi_;
+
+    std::size_t block_offset(std::size_t blk) const { return blk * kBinBlock * n_rows_; }
 };
 
 // A tree's rows / columns of a BinnedMatrix (nullptr maps = identity), as
@@ -315,6 +399,151 @@ struct HistSplit {
     std::uint32_t hi_bin = 0;
 };
 
+// The children of one node split at the previous depth (at depth 0, the root
+// alone). Child c holds entries [begin[c], end[c]) of the depth's row arrays
+// (HistDepth); node[c] is its index among the depth's scored nodes, or -1 when
+// it is not scored (it became a leaf).
+struct HistGroup {
+    std::int32_t parent = -1; // index among the previous depth's scored nodes (-1: the root)
+    std::size_t begin[2] = {0, 0};
+    std::size_t end[2] = {0, 0};
+    std::int32_t node[2] = {-1, -1};
+};
+
+// One depth's rows as the tree prepares them (RDTModel::build_tree_hist):
+// entry e is bin-matrix row mrow[e] with statistics stat[e * row_stats() ..]
+// (Newton: g, h; MSE: w*d, w*d^2, w with d = y - c; classification: the
+// weight, and the class in cls[e]). MSE centres c at the node's own weighted
+// mean, or -- with histogram subtraction, below the root -- at its parent's,
+// and recenter[k] (when not empty) is node k's mean minus its parent's.
+struct HistDepth {
+    const std::uint32_t* mrow = nullptr;
+    const double* stat = nullptr;
+    const std::int32_t* cls = nullptr;
+    std::vector<HistGroup> groups;
+    std::size_t n_nodes = 0;
+    std::vector<double> recenter;
+};
+
+// Histogram subtraction (TreeParams::hist_subtraction): one depth's scored
+// nodes' histograms of some features, kept so the next depth can derive a
+// child's histogram as parent - sibling. The features are added first; then
+// the cache is bound to memory of bytes() bytes (HistArena), and each
+// feature's histograms are filled by the task that scores it.
+class HistCache {
+public:
+    // Each feature's histograms start on their own cache line (the scoring
+    // threads write different features concurrently).
+    static constexpr std::size_t kAlign = 128;
+
+    HistCache() = default;
+    HistCache(std::size_t n_features, std::size_t n_nodes, std::size_t n_stats)
+        : slot_(n_features, -1), n_nodes_(n_nodes), n_stats_(n_stats) {}
+
+    // Bytes the histograms of n_nodes nodes of a feature with n_bins bins
+    // take in a cache (padded to a whole number of kAlign blocks).
+    static std::size_t bytes_for(std::size_t n_nodes, std::size_t n_bins, std::size_t n_stats) {
+        const std::size_t bytes = n_nodes * n_bins * (n_stats * sizeof(double) + sizeof(std::uint32_t));
+        return (bytes + kAlign - 1) / kAlign * kAlign;
+    }
+    void add(std::size_t feature, std::size_t n_bins) {
+        slot_[feature] = static_cast<std::int32_t>(entries_.size());
+        entries_.push_back(Entry{n_bins, bytes_});
+        bytes_ += bytes_for(n_nodes_, n_bins, n_stats_);
+    }
+    // Places the histograms at `base` (kAlign-aligned, bytes() bytes); a
+    // filled cache may be moved (its bytes copied) and bound again.
+    void bind(unsigned char* base) { base_ = base; }
+    unsigned char* base() const { return base_; }
+    // The feature's slot, or -1 when it is not kept.
+    std::int32_t slot(std::size_t feature) const { return slot_.empty() ? -1 : slot_[feature]; }
+    std::size_t bytes() const { return bytes_; }
+    double* hist(std::int32_t slot, std::size_t node) const {
+        const Entry& e = entries_[static_cast<std::size_t>(slot)];
+        return reinterpret_cast<double*>(base_ + e.offset) + node * e.n_bins * n_stats_;
+    }
+    std::uint32_t* count(std::int32_t slot, std::size_t node) const {
+        const Entry& e = entries_[static_cast<std::size_t>(slot)];
+        return reinterpret_cast<std::uint32_t*>(base_ + e.offset + n_nodes_ * e.n_bins * n_stats_ * sizeof(double)) +
+               node * e.n_bins;
+    }
+
+private:
+    struct Entry {
+        std::size_t n_bins;
+        std::size_t offset;
+    };
+    std::vector<std::int32_t> slot_; // per feature of the tree's view
+    std::vector<Entry> entries_;
+    unsigned char* base_ = nullptr;
+    std::size_t n_nodes_ = 0, n_stats_ = 0, bytes_ = 0;
+};
+
+// Memory for the subtraction caches of a tree's depths: one buffer, the
+// previous depth's cache at one end and the next depth's placed at the other,
+// so a fit holds at most what the two caches it uses at once take (and
+// reuses the same pages from depth to depth -- and from tree to tree, when a
+// gradient boosting fit passes the same arena to every round).
+class HistArena {
+public:
+    // Binds `next` beside `prev` (already bound in this arena, or empty),
+    // growing the buffer -- and moving prev's bytes -- if they do not fit.
+    void place(HistCache& prev, HistCache& next) {
+        const std::size_t p = prev.bytes(), n = next.bytes();
+        if (n == 0) return;
+        if (capacity_ < p + n) {
+            const std::size_t a = HistCache::kAlign;
+            const std::size_t cap = (std::max(p + n, capacity_ + capacity_ / 2) + a - 1) / a * a;
+            Buffer grown(cap);
+            if (p > 0) {
+                std::copy(prev.base(), prev.base() + p, grown.data());
+                prev.bind(grown.data());
+            }
+            buffer_ = std::move(grown);
+            capacity_ = cap;
+        }
+        unsigned char* start = buffer_.data();
+        // Ends are kAlign-aligned: capacities and cache sizes are multiples of kAlign.
+        if (p > 0 && prev.base() == start) {
+            next.bind(start + capacity_ - n);
+        } else {
+            next.bind(start);
+        }
+    }
+    // Makes the buffer at least `bytes` long, before a tree's first place()
+    // (nothing is kept then): one allocation per tree -- or per fit, when it
+    // is reused -- whose untouched pages cost nothing.
+    void reserve(std::size_t bytes) {
+        const std::size_t a = HistCache::kAlign;
+        bytes = (bytes + a - 1) / a * a;
+        if (capacity_ >= bytes) return;
+        buffer_ = Buffer();
+        buffer_ = Buffer(bytes);
+        capacity_ = bytes;
+    }
+    std::size_t capacity() const { return capacity_; }
+
+private:
+    // `bytes` of uninitialized memory starting at a kAlign boundary
+    // (over-allocated rather than aligned operator new, which older macOS
+    // deployment targets lack).
+    class Buffer {
+    public:
+        Buffer() = default;
+        explicit Buffer(std::size_t bytes) : raw_(new unsigned char[bytes + HistCache::kAlign]) {
+            const auto addr = reinterpret_cast<std::uintptr_t>(raw_.get());
+            data_ = raw_.get() + (HistCache::kAlign - addr % HistCache::kAlign) % HistCache::kAlign;
+        }
+        unsigned char* data() const { return data_; }
+
+    private:
+        std::unique_ptr<unsigned char[]> raw_;
+        unsigned char* data_ = nullptr;
+    };
+    Buffer buffer_;
+    std::size_t capacity_ = 0;
+};
+
 class HistScanner {
 public:
     HistScanner(Criterion criterion, int min_samples_leaf, std::size_t n_classes, const NewtonParams& newton)
@@ -323,77 +552,20 @@ public:
         n_stats_ = criterion == Criterion::MSE ? 3 : criterion == Criterion::Newton ? 2 : n_classes;
     }
 
-    // The depth's nodes (their rows, ascending view-row ids) and per-row
-    // inputs, indexed by view row: y (Newton: gradient), weights (nullptr = 1;
-    // Newton: unused), hessian (Newton), cls (classification: class index).
-    // Newton: node_g / node_h are the nodes' totals (summed in row order).
-    void begin_depth(const BinnedView& X, const std::vector<const std::vector<std::uint32_t>*>& nodes,
-                     const VectorView& y, const VectorView* w, const VectorView* hessian, const std::int32_t* cls,
-                     const std::vector<double>* node_g, const std::vector<double>* node_h) {
-        const std::size_t n_nodes = nodes.size();
-        node_size_.assign(n_nodes, 0);
-        std::vector<std::int32_t> node_of(X.n_rows, -1);
-        for (std::size_t k = 0; k < n_nodes; ++k) {
-            node_size_[k] = nodes[k]->size();
-            for (auto idx : *nodes[k]) node_of[idx] = static_cast<std::int32_t>(k);
-        }
-        std::size_t n_entries = 0;
-        for (std::size_t k = 0; k < n_nodes; ++k) n_entries += node_size_[k];
-        row_.clear();
-        node_.clear();
-        stat_.clear();
-        row_.reserve(n_entries);
-        node_.reserve(n_entries);
-        stat_.reserve(n_entries * n_stats_);
-        cls_.clear();
-        total_.assign(n_nodes * n_stats_, 0.0);
-        total_w_.assign(n_nodes, 0.0);
+    bool classification() const { return criterion_ != Criterion::MSE && criterion_ != Criterion::Newton; }
+    // Statistics per bin, and per row of HistDepth::stat.
+    std::size_t n_stats() const { return n_stats_; }
+    std::size_t row_stats() const { return classification() ? 1 : n_stats_; }
 
-        std::vector<double> center;
-        if (criterion_ == Criterion::MSE) {
-            // Targets are centred at each node's weighted mean (row order),
-            // as the exact search centres them.
-            std::vector<double> raw(n_nodes, 0.0), wsum(n_nodes, 0.0);
-            for (std::size_t i = 0; i < X.n_rows; ++i) {
-                if (node_of[i] < 0) continue;
-                const double wi = w ? (*w)[i] : 1.0;
-                raw[static_cast<std::size_t>(node_of[i])] += wi * y[i];
-                wsum[static_cast<std::size_t>(node_of[i])] += wi;
-            }
-            center.resize(n_nodes);
-            for (std::size_t k = 0; k < n_nodes; ++k) center[k] = wsum[k] > 0.0 ? raw[k] / wsum[k] : 0.0;
-        }
-        for (std::size_t i = 0; i < X.n_rows; ++i) {
-            if (node_of[i] < 0) continue;
-            const auto k = static_cast<std::size_t>(node_of[i]);
-            row_.push_back(static_cast<std::uint32_t>(X.row(i)));
-            node_.push_back(static_cast<std::uint32_t>(k));
-            double* t = total_.data() + k * n_stats_;
-            if (criterion_ == Criterion::MSE) {
-                const double wi = w ? (*w)[i] : 1.0;
-                const double d = y[i] - center[k];
-                const double s[3] = {wi * d, wi * d * d, wi};
-                for (std::size_t s_i = 0; s_i < 3; ++s_i) {
-                    stat_.push_back(s[s_i]);
-                    t[s_i] += s[s_i];
-                }
-            } else if (criterion_ == Criterion::Newton) {
-                stat_.push_back(y[i]);
-                stat_.push_back((*hessian)[i]);
-            } else {
-                const double wi = w ? (*w)[i] : 1.0;
-                stat_.push_back(wi);
-                cls_.push_back(cls[i]);
-                t[static_cast<std::size_t>(cls[i])] += wi;
-            }
-        }
-        if (criterion_ == Criterion::Newton) {
-            for (std::size_t k = 0; k < n_nodes; ++k) {
-                total_[k * 2] = (*node_g)[k];
-                total_[k * 2 + 1] = (*node_h)[k];
-            }
-        } else if (criterion_ != Criterion::MSE) {
-            for (std::size_t k = 0; k < n_nodes; ++k) {
+    // The depth's scored nodes: their row counts and totals (n_stats() per
+    // node, summed in row order: MSE sum w*d, w*d^2, w; Newton G, H; class
+    // weights).
+    void begin_depth(std::vector<std::size_t> node_size, std::vector<double> totals) {
+        node_size_ = std::move(node_size);
+        total_ = std::move(totals);
+        total_w_.assign(node_size_.size(), 0.0);
+        if (classification()) {
+            for (std::size_t k = 0; k < node_size_.size(); ++k) {
                 double tw = 0.0;
                 for (std::size_t c = 0; c < n_classes_; ++c) tw += total_[k * n_stats_ + c];
                 total_w_[k] = tw;
@@ -401,35 +573,50 @@ public:
         }
     }
 
-    struct Scratch {
-        std::vector<double> hist;
-        std::vector<std::uint32_t> count;
-        std::vector<double> left, right;
-    };
-
-    // Feature f's best split for every node of the depth into out[k].
-    void score_feature(const BinnedView& X, std::size_t f, std::vector<HistSplit>& out, Scratch& sc) const {
-        const std::size_t n_nodes = node_size_.size();
-        out.assign(n_nodes, HistSplit{});
-        const std::size_t col = X.col(f);
-        const std::size_t n_bins = X.m->n_bins(col);
-        if (n_bins < 2) return;
-        if (X.m->wide()) {
-            build(X.m->column16(col), n_bins, sc);
-        } else {
-            build(X.m->column8(col), n_bins, sc);
-        }
-        for (std::size_t k = 0; k < n_nodes; ++k) {
-            const double* h = sc.hist.data() + k * n_bins * n_stats_;
-            const std::uint32_t* cnt = sc.count.data() + k * n_bins;
-            if (criterion_ == Criterion::MSE) {
-                sweep_mse(h, cnt, n_bins, k, out[k]);
-            } else if (criterion_ == Criterion::Newton) {
-                sweep_newton(h, cnt, n_bins, k, out[k]);
+    // Every candidate's best split for every scored node of the depth:
+    // results[i][k] for candidates[i] (a column of X's view) and node k.
+    // `prev` (may be nullptr): the previous depth's cache -- a feature it
+    // keeps gets each group's smaller child built and the sibling derived;
+    // `next` (may be nullptr): the features to keep for the next depth.
+    void score(const BinnedView& X, const HistDepth& depth, const std::vector<std::uint32_t>& candidates,
+               const HistCache* prev, HistCache* next, std::vector<std::vector<HistSplit>>& results,
+               ThreadPool* pool) const {
+        const std::size_t n_cand = candidates.size();
+        results.resize(n_cand);
+        // Candidates grouped by bin block, in candidate order within a block
+        // (a column with a single bin has no split).
+        std::vector<std::vector<std::size_t>> by_block(X.m->n_bin_blocks());
+        for (std::size_t i = 0; i < n_cand; ++i) {
+            const std::size_t col = X.col(candidates[i]);
+            if (X.m->n_bins(col) >= 2) {
+                by_block[col / kBinBlock].push_back(i);
             } else {
-                sweep_classification(h, cnt, n_bins, k, out[k], sc);
+                results[i].assign(depth.n_nodes, HistSplit{});
             }
         }
+        // Tasks: a block's candidates, split further when there are too few
+        // blocks to keep the threads busy. Each (candidate, node) result is
+        // computed by one task, so the split does not change results.
+        std::vector<std::vector<std::size_t>> tasks;
+        std::size_t n_used = 0;
+        for (const auto& b : by_block) n_used += b.empty() ? 0 : 1;
+        const std::size_t want = pool && pool->size() > 1 ? 2 * pool->size() : 1;
+        const std::size_t parts = n_used > 0 && n_used < want ? (want + n_used - 1) / n_used : 1;
+        for (auto& b : by_block) {
+            if (b.empty()) continue;
+            const std::size_t np = std::min(parts, b.size());
+            for (std::size_t q = 0; q < np; ++q) {
+                tasks.emplace_back(b.begin() + static_cast<std::ptrdiff_t>(b.size() * q / np),
+                                   b.begin() + static_cast<std::ptrdiff_t>(b.size() * (q + 1) / np));
+            }
+        }
+        run_tasks(pool, tasks.size(), [&](std::size_t t) {
+            if (X.m->wide()) {
+                score_block<std::uint16_t>(X, depth, candidates, tasks[t], prev, next, results);
+            } else {
+                score_block<std::uint8_t>(X, depth, candidates, tasks[t], prev, next, results);
+            }
+        });
     }
 
 private:
@@ -438,52 +625,247 @@ private:
     std::size_t n_classes_;
     NewtonParams newton_;
     std::size_t n_stats_ = 0;
-    // The depth's rows (ascending view-row order): bin-matrix row, node, statistics.
-    std::vector<std::uint32_t> row_, node_;
-    std::vector<double> stat_;
-    std::vector<std::int32_t> cls_;
     std::vector<std::size_t> node_size_;
     std::vector<double> total_;   // per node: n_stats_ totals (MSE: sum w*d, w*d^2, w; Newton: G, H; classes)
     std::vector<double> total_w_; // classification: per-node total weight
+
+    // One feature's histogram for one node: n_bins x n_stats statistics and
+    // n_bins row counts.
+    struct HistRef {
+        double* h;
+        std::uint32_t* c;
+    };
+
+    // A block task's per-feature state.
+    struct BlockFeature {
+        std::size_t cand;      // index into candidates / results
+        std::uint32_t j;       // position in the bin block
+        std::size_t n_bins;
+        std::size_t scratch;   // offset of its two histograms in the task's scratch
+        std::int32_t prev;     // slot in the previous depth's cache, or -1
+        std::int32_t next;     // slot in the next depth's cache, or -1
+    };
+
+    struct SweepScratch {
+        std::vector<double> left, right;
+        std::vector<std::uint32_t> bins; // a node's non-empty bins, ascending
+    };
+
+    // The non-empty bins of a histogram, ascending, into sc.bins; returns
+    // their number. (Branch-free: which bins are empty is unpredictable.)
+    static std::size_t non_empty_bins(const std::uint32_t* cnt, std::size_t n_bins, SweepScratch& sc) {
+        if (sc.bins.size() < n_bins) sc.bins.resize(n_bins);
+        std::uint32_t* out = sc.bins.data();
+        std::size_t n = 0;
+        for (std::size_t b = 0; b < n_bins; ++b) {
+            out[n] = static_cast<std::uint32_t>(b);
+            n += cnt[b] != 0 ? 1 : 0;
+        }
+        return n;
+    }
+
+    template <class Bin>
+    static const Bin* block_data(const BinnedMatrix& m, std::size_t blk);
+
+    // Histograms of the features `feats` (positions j in the bin block) for
+    // the entries [e0, e1): a bin's statistics are added in entry order.
+    // hist[q] must be zero on entry.
+    template <class Bin>
+    void accumulate(const Bin* block, std::size_t width, const HistDepth& depth, std::size_t e0, std::size_t e1,
+                    const std::uint32_t* js, const HistRef* hist, std::size_t m) const {
+        constexpr std::size_t kAhead = 16; // rows of bin lines prefetched ahead
+        const std::uint32_t* mrow = depth.mrow;
+        if (criterion_ == Criterion::Newton) {
+            const double* st = depth.stat;
+            for (std::size_t e = e0; e < e1; ++e) {
+                if (e + kAhead < e1) prefetch_read(block + static_cast<std::size_t>(mrow[e + kAhead]) * width);
+                const Bin* rb = block + static_cast<std::size_t>(mrow[e]) * width;
+                const double g = st[2 * e], h = st[2 * e + 1];
+                for (std::size_t q = 0; q < m; ++q) {
+                    const std::size_t b = rb[js[q]];
+                    double* hb = hist[q].h + 2 * b;
+                    hb[0] += g;
+                    hb[1] += h;
+                    ++hist[q].c[b];
+                }
+            }
+        } else if (criterion_ == Criterion::MSE) {
+            const double* st = depth.stat;
+            for (std::size_t e = e0; e < e1; ++e) {
+                if (e + kAhead < e1) prefetch_read(block + static_cast<std::size_t>(mrow[e + kAhead]) * width);
+                const Bin* rb = block + static_cast<std::size_t>(mrow[e]) * width;
+                const double s0 = st[3 * e], s1 = st[3 * e + 1], s2 = st[3 * e + 2];
+                for (std::size_t q = 0; q < m; ++q) {
+                    const std::size_t b = rb[js[q]];
+                    double* hb = hist[q].h + 3 * b;
+                    hb[0] += s0;
+                    hb[1] += s1;
+                    hb[2] += s2;
+                    ++hist[q].c[b];
+                }
+            }
+        } else {
+            const std::size_t K = n_classes_;
+            const double* st = depth.stat;
+            const std::int32_t* cls = depth.cls;
+            for (std::size_t e = e0; e < e1; ++e) {
+                if (e + kAhead < e1) prefetch_read(block + static_cast<std::size_t>(mrow[e + kAhead]) * width);
+                const Bin* rb = block + static_cast<std::size_t>(mrow[e]) * width;
+                const double w = st[e];
+                const std::size_t c = static_cast<std::size_t>(cls[e]);
+                for (std::size_t q = 0; q < m; ++q) {
+                    const std::size_t b = rb[js[q]];
+                    hist[q].h[b * K + c] += w;
+                    ++hist[q].c[b];
+                }
+            }
+        }
+    }
+
+    void sweep(const HistRef& hr, std::size_t n_bins, std::size_t k, HistSplit& out, SweepScratch& sc) const {
+        if (criterion_ == Criterion::MSE) {
+            sweep_mse(hr.h, hr.c, n_bins, k, out, sc);
+        } else if (criterion_ == Criterion::Newton) {
+            sweep_newton(hr.h, hr.c, n_bins, k, out, sc);
+        } else {
+            sweep_classification(hr.h, hr.c, n_bins, k, out, sc);
+        }
+    }
+
+    // dst = parent - built, bin by bin (histogram subtraction).
+    void subtract(const HistRef& parent, const HistRef& built, const HistRef& dst, std::size_t n_bins) const {
+        const std::size_t n = n_bins * n_stats_;
+        for (std::size_t i = 0; i < n; ++i) dst.h[i] = parent.h[i] - built.h[i];
+        for (std::size_t b = 0; b < n_bins; ++b) dst.c[b] = parent.c[b] - built.c[b];
+    }
+
+    // MSE statistics centred at c, re-centred at c + delta.
+    static void recenter(const HistRef& hr, std::size_t n_bins, double delta) {
+        for (std::size_t b = 0; b < n_bins; ++b) {
+            double* h = hr.h + 3 * b;
+            const double s = h[0], w = h[2];
+            h[0] = s - delta * w;
+            h[1] = h[1] - 2.0 * delta * s + delta * delta * w;
+        }
+    }
+
+    // One task: the candidates `cand_idx` (all in one bin block), for every
+    // scored node of the depth, a group of siblings at a time. A candidate
+    // kept in `prev` builds the group's smaller child (or the only scored
+    // one, when it is the smaller) and derives the other from the parent; any
+    // other candidate builds each scored child.
+    template <class Bin>
+    void score_block(const BinnedView& X, const HistDepth& depth, const std::vector<std::uint32_t>& candidates,
+                     const std::vector<std::size_t>& cand_idx, const HistCache* prev, HistCache* next,
+                     std::vector<std::vector<HistSplit>>& results) const {
+        const std::size_t S = n_stats_;
+        const std::size_t blk = X.col(candidates[cand_idx[0]]) / kBinBlock;
+        const std::size_t width = X.m->block_width(blk);
+        const Bin* block = block_data<Bin>(*X.m, blk);
+        const std::size_t m = cand_idx.size();
+
+        std::vector<BlockFeature> feats(m);
+        std::size_t scratch_size = 0;
+        bool any_prev = false;
+        for (std::size_t q = 0; q < m; ++q) {
+            const std::size_t f = candidates[cand_idx[q]];
+            const std::size_t col = X.col(f);
+            feats[q] = {cand_idx[q], static_cast<std::uint32_t>(col - blk * kBinBlock), X.m->n_bins(col), scratch_size,
+                        prev ? prev->slot(f) : -1, next ? next->slot(f) : -1};
+            any_prev = any_prev || feats[q].prev >= 0;
+            scratch_size += 2 * feats[q].n_bins;
+            results[cand_idx[q]].assign(depth.n_nodes, HistSplit{});
+        }
+        std::vector<double> hist(scratch_size * S);
+        std::vector<std::uint32_t> count(scratch_size);
+        auto scratch = [&](std::size_t q, int side) {
+            const std::size_t off = feats[q].scratch + static_cast<std::size_t>(side) * feats[q].n_bins;
+            return HistRef{hist.data() + off * S, count.data() + off};
+        };
+        std::vector<HistRef> dest[2] = {std::vector<HistRef>(m), std::vector<HistRef>(m)};
+        std::vector<std::uint32_t> js(m);
+        std::vector<HistRef> refs(m);
+        SweepScratch sc;
+
+        for (const HistGroup& g : depth.groups) {
+            const std::size_t n_side[2] = {g.end[0] - g.begin[0], g.end[1] - g.begin[1]};
+            // The child the subtracted candidates build (-1: none).
+            int build = -1;
+            if (any_prev && g.parent >= 0) {
+                if (g.node[0] >= 0 && g.node[1] >= 0) {
+                    build = n_side[1] < n_side[0] ? 1 : 0;
+                } else {
+                    const int s = g.node[0] >= 0 ? 0 : 1;
+                    build = n_side[1 - s] < n_side[s] ? 1 - s : s;
+                }
+            }
+            for (int side = 0; side < 2; ++side) {
+                for (std::size_t q = 0; q < m; ++q) {
+                    dest[side][q] = g.node[side] >= 0 && feats[q].next >= 0
+                                        ? HistRef{next->hist(feats[q].next, static_cast<std::size_t>(g.node[side])),
+                                                  next->count(feats[q].next, static_cast<std::size_t>(g.node[side]))}
+                                        : scratch(q, side);
+                }
+            }
+            // Build: a scored child for the direct candidates, the chosen
+            // child for the subtracted ones.
+            for (int side = 0; side < 2; ++side) {
+                std::size_t n_build = 0;
+                for (std::size_t q = 0; q < m; ++q) {
+                    const bool subtracted = build >= 0 && feats[q].prev >= 0;
+                    if (subtracted ? side == build : g.node[side] >= 0) {
+                        js[n_build] = feats[q].j;
+                        refs[n_build] = dest[side][q];
+                        std::fill(refs[n_build].h, refs[n_build].h + feats[q].n_bins * S, 0.0);
+                        std::fill(refs[n_build].c, refs[n_build].c + feats[q].n_bins, 0u);
+                        ++n_build;
+                    }
+                }
+                if (n_build > 0 && n_side[side] > 0) {
+                    accumulate<Bin>(block, width, depth, g.begin[side], g.end[side], js.data(), refs.data(), n_build);
+                }
+            }
+            // Derive the other child, if it is scored.
+            if (build >= 0 && g.node[1 - build] >= 0) {
+                for (std::size_t q = 0; q < m; ++q) {
+                    if (feats[q].prev < 0) continue;
+                    const HistRef parent{prev->hist(feats[q].prev, static_cast<std::size_t>(g.parent)),
+                                         prev->count(feats[q].prev, static_cast<std::size_t>(g.parent))};
+                    subtract(parent, dest[build][q], dest[1 - build][q], feats[q].n_bins);
+                }
+            }
+            // Sweep the scored children.
+            for (int side = 0; side < 2; ++side) {
+                const std::int32_t k = g.node[side];
+                if (k < 0) continue;
+                const std::size_t ku = static_cast<std::size_t>(k);
+                for (std::size_t q = 0; q < m; ++q) {
+                    if (!depth.recenter.empty()) recenter(dest[side][q], feats[q].n_bins, depth.recenter[ku]);
+                    sweep(dest[side][q], feats[q].n_bins, ku, results[feats[q].cand][ku], sc);
+                }
+            }
+        }
+    }
 
     bool leaf_sizes_ok(std::size_t n_left, std::size_t n_total) const {
         const std::size_t n_right = n_total - n_left;
         return !(static_cast<int>(n_left) < min_samples_leaf_ || static_cast<int>(n_right) < min_samples_leaf_);
     }
 
-    // Histograms of all nodes in one pass over the rows. A bin's statistics
-    // are set by its first row and summed from then on, so only the counts
-    // need clearing.
-    template <class Bin>
-    void build(const Bin* column, std::size_t n_bins, Scratch& sc) const {
-        const std::size_t n_nodes = node_size_.size();
-        const std::size_t S = n_stats_;
-        sc.count.assign(n_nodes * n_bins, 0u);
-        if (sc.hist.size() < n_nodes * n_bins * S) sc.hist.resize(n_nodes * n_bins * S);
-        const bool classification = criterion_ != Criterion::MSE && criterion_ != Criterion::Newton;
-        for (std::size_t e = 0; e < row_.size(); ++e) {
-            const std::size_t slot = static_cast<std::size_t>(node_[e]) * n_bins + column[row_[e]];
-            double* h = sc.hist.data() + slot * S;
-            if (classification) {
-                if (sc.count[slot]++ == 0) std::fill(h, h + S, 0.0);
-                h[static_cast<std::size_t>(cls_[e])] += stat_[e];
-            } else if (sc.count[slot]++ == 0) {
-                for (std::size_t s = 0; s < S; ++s) h[s] = stat_[e * S + s];
-            } else {
-                for (std::size_t s = 0; s < S; ++s) h[s] += stat_[e * S + s];
-            }
-        }
-    }
-
-    void sweep_mse(const double* h, const std::uint32_t* cnt, std::size_t n_bins, std::size_t k, HistSplit& out) const {
+    // The sweeps visit a node's non-empty bins left to right; each boundary
+    // between consecutive ones is a candidate split.
+    void sweep_mse(const double* h, const std::uint32_t* cnt, std::size_t n_bins, std::size_t k, HistSplit& out,
+                   SweepScratch& sc) const {
+        const std::size_t n_used = non_empty_bins(cnt, n_bins, sc);
+        const std::uint32_t* used = sc.bins.data();
         const std::size_t n = node_size_[k];
         const double total_sum = total_[k * 3], total_sum_sq = total_[k * 3 + 1], total_weight = total_[k * 3 + 2];
         const double parent_impurity = mse_from_sums(total_sum, total_sum_sq, total_weight);
         double best_improvement = -std::numeric_limits<double>::infinity();
         double left_sum = 0.0, left_sum_sq = 0.0, left_weight = 0.0;
         std::size_t n_left = 0, prev = 0;
-        for (std::size_t b = 0; b < n_bins; ++b) {
-            if (cnt[b] == 0) continue;
+        for (std::size_t u = 0; u < n_used; ++u) {
+            const std::size_t b = used[u];
             if (n_left > 0 && leaf_sizes_ok(n_left, n)) {
                 double right_sum = total_sum - left_sum;
                 double right_sum_sq = total_sum_sq - left_sum_sq;
@@ -508,16 +890,18 @@ private:
         }
     }
 
-    void sweep_newton(const double* h, const std::uint32_t* cnt, std::size_t n_bins, std::size_t k,
-                      HistSplit& out) const {
+    void sweep_newton(const double* h, const std::uint32_t* cnt, std::size_t n_bins, std::size_t k, HistSplit& out,
+                      SweepScratch& sc) const {
+        const std::size_t n_used = non_empty_bins(cnt, n_bins, sc);
+        const std::uint32_t* used = sc.bins.data();
         const std::size_t n = node_size_[k];
         const double G = total_[k * 2], H = total_[k * 2 + 1];
         const double parent_score = newton_score(G, H, newton_);
         double best_gain = -std::numeric_limits<double>::infinity();
         double left_g = 0.0, left_h = 0.0;
         std::size_t n_left = 0, prev = 0;
-        for (std::size_t b = 0; b < n_bins; ++b) {
-            if (cnt[b] == 0) continue;
+        for (std::size_t u = 0; u < n_used; ++u) {
+            const std::size_t b = used[u];
             if (n_left > 0 && leaf_sizes_ok(n_left, n) && newton_children_valid(left_h, H - left_h, newton_)) {
                 const double gain = newton_split_gain(left_g, left_h, G, H, parent_score, newton_);
                 if (std::isfinite(gain) && gain > best_gain) {
@@ -541,7 +925,7 @@ private:
     }
 
     void sweep_classification(const double* h, const std::uint32_t* cnt, std::size_t n_bins, std::size_t k,
-                              HistSplit& out, Scratch& sc) const {
+                              HistSplit& out, SweepScratch& sc) const {
         const std::size_t n = node_size_[k];
         const std::size_t K = n_classes_;
         const double* total = total_.data() + k * K;
@@ -549,11 +933,13 @@ private:
         const double parent_impurity = class_impurity(total, total_weight);
         sc.left.assign(K, 0.0);
         sc.right.resize(K);
+        const std::size_t n_used = non_empty_bins(cnt, n_bins, sc);
+        const std::uint32_t* used = sc.bins.data();
         double best_improvement = -std::numeric_limits<double>::infinity();
         double left_weight = 0.0;
         std::size_t n_left = 0, prev = 0;
-        for (std::size_t b = 0; b < n_bins; ++b) {
-            if (cnt[b] == 0) continue;
+        for (std::size_t u = 0; u < n_used; ++u) {
+            const std::size_t b = used[u];
             if (n_left > 0 && leaf_sizes_ok(n_left, n)) {
                 for (std::size_t c = 0; c < K; ++c) sc.right[c] = total[c] - sc.left[c];
                 const double right_weight = total_weight - left_weight;
@@ -579,5 +965,14 @@ private:
         }
     }
 };
+
+template <>
+inline const std::uint8_t* HistScanner::block_data<std::uint8_t>(const BinnedMatrix& m, std::size_t blk) {
+    return m.block8(blk);
+}
+template <>
+inline const std::uint16_t* HistScanner::block_data<std::uint16_t>(const BinnedMatrix& m, std::size_t blk) {
+    return m.block16(blk);
+}
 
 } // namespace rdt

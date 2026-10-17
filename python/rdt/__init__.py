@@ -12,7 +12,7 @@ from typing import Optional
 import numpy as np
 
 from . import _rdt_native
-from ._validation import check_X, check_X_y, check_tree_method
+from ._validation import check_X, check_X_y, check_hist_subtraction, check_tree_method
 
 __all__ = ["RDT"]
 
@@ -69,8 +69,26 @@ class RDT:
         when any feature has more than 256 bins).
     n_jobs : int, optional
         Threads for the ``tree_method='hist'`` split search (features are
-        scored in parallel; the tree does not depend on it). None = 1,
-        -1 = all hardware threads.
+        scored, and each depth's rows partitioned, in parallel; the tree does
+        not depend on it). None = 1, -1 = all hardware threads.
+    hist_subtraction : bool, default=True
+        With ``tree_method='hist'``: below the root, each candidate feature's
+        histograms are built only for the smaller child of every split, and
+        the sibling's are derived as parent minus child from the previous
+        depth's histograms (XGBoost's and LightGBM's histogram subtraction),
+        which are kept for the features scored at both depths within
+        ``max_hist_cache_mb``; the other features are built directly.
+        Derived sums are rounded differently from directly built ones, so
+        split scores can differ from ``hist_subtraction=False`` in the last
+        bits and an exact tie between two splits may be resolved the other
+        way. False builds every histogram directly.
+    max_hist_cache_mb : float, default=1024
+        Memory (MiB) for the histograms kept for ``hist_subtraction``: those
+        of the current and the previous depth together stay within it. A
+        depth's take about ``nodes * sum(bins of the kept features) * 20``
+        bytes for gradient boosting (``newton``; ``8 * n_classes + 4`` per
+        bin for gini / entropy, 28 for mse); features beyond the budget are
+        built directly. 0 disables subtraction.
     """
 
     def __init__(
@@ -85,6 +103,8 @@ class RDT:
         tree_method: str = "exact",
         max_bin: int = 256,
         n_jobs: Optional[int] = None,
+        hist_subtraction: bool = True,
+        max_hist_cache_mb: float = 1024,
     ):
         self.task = task.lower()
         if self.task not in ("classification", "regression"):
@@ -107,6 +127,7 @@ class RDT:
         self.presort = presort
         self.tree_method, self.max_bin = check_tree_method(tree_method, max_bin, self.criterion)
         self.n_jobs = n_jobs
+        self.hist_subtraction, self.max_hist_cache_mb = check_hist_subtraction(hist_subtraction, max_hist_cache_mb)
 
         self.root = None
         self.n_features_ = None
@@ -121,7 +142,8 @@ class RDT:
     def _wrap_native(cls, model, *, task: str, criterion: str, max_depth: int,
                       min_samples_split: int, min_samples_leaf: int,
                       min_impurity_decrease: float, n_features: int,
-                      tree_method: str = "exact", max_bin: int = 256) -> "RDT":
+                      tree_method: str = "exact", max_bin: int = 256, hist_subtraction: bool = True,
+                      max_hist_cache_mb: float = 1024) -> "RDT":
         """Wrap an already-fitted native RDTModel (e.g. one sub-tree of an
         ensemble) for introspection -- .root, .depth_features_, .predict(),
         rdt.visualize compatibility -- without re-fitting."""
@@ -129,6 +151,7 @@ class RDT:
             task=task, criterion=criterion, max_depth=max_depth,
             min_samples_split=min_samples_split, min_samples_leaf=min_samples_leaf,
             min_impurity_decrease=min_impurity_decrease, tree_method=tree_method, max_bin=max_bin,
+            hist_subtraction=hist_subtraction, max_hist_cache_mb=max_hist_cache_mb,
         )
         self._model = model
         self.n_features_ = n_features
@@ -153,6 +176,7 @@ class RDT:
             self.min_samples_split, self.min_samples_leaf, self.min_impurity_decrease,
             presort=self.presort, tree_method=self.tree_method, max_bin=self.max_bin,
             n_jobs=1 if self.n_jobs is None else int(self.n_jobs),
+            hist_subtraction=self.hist_subtraction, max_hist_cache_mb=self.max_hist_cache_mb,
         )
         if hist:
             model.fit_hist(X, y, sample_weight)

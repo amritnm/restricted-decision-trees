@@ -23,7 +23,8 @@ jobs:
   test:
     name: ${{ matrix.os }} / Python ${{ matrix.python }}${{ matrix.slow && ' (+slow)' || '' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.slow && 60 || 40 }}
+    # Measured: ~1.5-2.5 min per job (build ~30 s, default suite ~35-55 s, slow ~40 s).
+    timeout-minutes: ${{ matrix.slow && 30 || 20 }}
     strategy:
       fail-fast: false
       matrix:

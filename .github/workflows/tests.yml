@@ -25,6 +25,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Measured: ~1.5-2.5 min per job (build ~30 s, default suite ~35-55 s, slow ~40 s).
     timeout-minutes: ${{ matrix.slow && 30 || 20 }}
+    defaults:
+      run:
+        shell: bash  # also on Windows (Git Bash), so every step reads the same
     strategy:
       fail-fast: false
       matrix:
@@ -38,6 +41,9 @@ jobs:
             python: "3.12"
           # aarch64 Linux: GCC with FMA available (see CMakeLists.txt).
           - os: ubuntu-24.04-arm
+            python: "3.12"
+          # MSVC: the release wheels include win_amd64.
+          - os: windows-latest
             python: "3.12"
     steps:
       - uses: actions/checkout@v4
@@ -78,3 +84,21 @@ jobs:
       - name: Run slow tests
         if: matrix.slow
         run: python -m pytest tests -m slow -ra --durations=15
+
+  wheel-smoke-windows:
+    # Builds one Windows wheel the way pypi-publish.yml does (same cibuildwheel
+    # pin), installs it in a clean environment and runs a few tests against it.
+    # Nothing is uploaded or published.
+    name: cibuildwheel smoke (windows, cp312)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test a wheel (not published)
+        uses: pypa/cibuildwheel@v2.21
+        env:
+          CIBW_BUILD: "cp312-win_amd64"
+          CIBW_BUILD_VERBOSITY: 1
+          CIBW_TEST_REQUIRES: pytest numpy scikit-learn
+          CIBW_TEST_COMMAND: pytest {project}/tests/test_rdt.py {project}/tests/test_ensemble.py -ra

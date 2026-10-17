@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "restricted-decision-trees"
-version = "0.2.0"
+version = "0.3.0"
 description = "Native C++ implementation of Restricted Decision Trees (RDT), with Random Forest and Gradient Boosting ensembles"
 readme = "README.md"
 license = { file = "LICENSE" }

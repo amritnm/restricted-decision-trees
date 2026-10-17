@@ -36,6 +36,9 @@ jobs:
             slow: true
           - os: macos-latest
             python: "3.12"
+          # aarch64 Linux: GCC with FMA available (see CMakeLists.txt).
+          - os: ubuntu-24.04-arm
+            python: "3.12"
     steps:
       - uses: actions/checkout@v4
 

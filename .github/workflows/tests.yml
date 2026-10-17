@@ -80,36 +80,6 @@ jobs:
         if: matrix.python != '3.10'
         run: python -c "import xgboost; print('xgboost', xgboost.__version__)"
 
-      - name: "TEMPORARY (to be reverted): memory-test measurements"
-        if: runner.os == 'Windows'
-        run: |
-          cat > "$RUNNER_TEMP/mem_all.py" <<'PYEOF'
-          # Runs every subprocess memory script in tests/ and prints growth vs the test's bound (MiB).
-          import re, subprocess, sys, textwrap
-          import importlib, os
-          sys.path.insert(0, os.path.abspath("tests"))
-          def script(path, name):
-              return getattr(importlib.import_module(os.path.basename(path)[:-3]), name)
-          def run(body, *args):
-              return [int(v) for v in subprocess.run([sys.executable, "-c", body, *map(str, args)], capture_output=True, text=True, check=True).stdout.split()]
-          M = 2**20
-          for kind in ("gb", "rf"):
-              g, xb = run(script("tests/test_performance_contracts.py", "_PREDICT_MEMORY_SCRIPT"), kind)
-              print(f"predict_does_not_copy_X[{kind}]: growth {g/M:.1f} < bound {0.2*xb/M:.1f}")
-          for kind, layout in (("gb", "f64C"), ("rf", "f32F")):
-              g, xb = run(script("tests/test_hist.py", "_FIT_MEMORY_SCRIPT"), kind, layout)
-              print(f"hist_fit_does_not_copy_X[{kind}-{layout}]: growth {g/M:.1f} < bound {(20000*1000 + 0.5*xb)/M:.1f}")
-          g, xb = run(script("tests/test_hist.py", "_TALL_FIT_MEMORY_SCRIPT"))
-          print(f"hist_binning_buffers_stay_small_on_tall_X: growth {g/M:.1f} < bound {(500000*64 + 0.75*xb)/M:.1f}")
-          g, xb = run(script("tests/test_eval_set.py", "_EVAL_MEMORY_SCRIPT"))
-          print(f"hist_float32_eval_set_is_not_copied: growth {g/M:.1f} < bound {0.25*xb/M:.1f}")
-          d, b, u = (run(script("tests/test_hist_subtraction.py", "_CACHE_MEMORY_SCRIPT"), mb)[0] / M for mb in (0, 32, 4096))
-          print(f"cache_budget_bounds_memory: direct {d:.1f} bounded {b:.1f} (< {d+48:.1f}) unbounded {u:.1f} (> {d+100:.1f})")
-          d, b = (run(script("tests/test_hist_subtraction.py", "_MULTICLASS_MEMORY_SCRIPT"), mb)[0] / M for mb in (0, 64))
-          print(f"multiclass_cache_budget: direct {d:.1f} bounded {b:.1f} (< {d+96:.1f})")
-          PYEOF
-          for i in 1 2; do python "$RUNNER_TEMP/mem_all.py"; done
-
       - name: Run tests
         run: python -m pytest tests -ra --durations=15
 

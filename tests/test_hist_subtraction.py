@@ -326,22 +326,37 @@ def test_colsample_bylevel_draws_do_not_change():
         assert set(_compare_models(kind, a, b)) <= {"same", "tie"}
 
 
+# Growth of the peak RSS is only the fit's own if nothing freed before it raised the peak: where the
+# allocator returns freed pages to the OS (glibc), the fit grows into that headroom unmeasured, while
+# macOS keeps them resident for the fit to reuse. So these scripts fill X in blocks (the same values
+# as rng.standard_normal((n, p)).astype(np.float32), without its float64 temporary) and warm up
+# without a cache (a cached warm-up fit frees its arena). Before that, Linux measured 0 MiB of growth
+# with a 32 MiB budget and ~40 MiB without one (so the bound could not fail there), and macOS counted
+# none of the budgeted cache (it reused the warm-up's pages).
 _CACHE_MEMORY_SCRIPT = textwrap.dedent("""
     import resource, sys
     import numpy as np
     from rdt.ensemble import GradientBoostingRDT
 
     def peak():
+        if sys.platform.startswith("linux"):
+            # VmHWM: this process's own peak. Linux carries ru_maxrss across execve, so it would
+            # start at the RSS of the (pytest) process that forked this one.
+            with open("/proc/self/status") as f:
+                return next(int(line.split()[1]) for line in f if line.startswith("VmHWM:")) * 1024
         r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         return r if sys.platform == "darwin" else r * 1024
 
     rng = np.random.default_rng(0)
     n, p = 20000, 400
-    X = rng.standard_normal((n, p)).astype(np.float32)
+    X = np.empty((n, p), dtype=np.float32)  # filled in blocks (see above)
+    for i in range(0, n, 500):
+        X[i:i + 500] = rng.standard_normal((500, p))
     y = (X[:, 0] + X[:, 1] > 0).astype(float)
-    m = GradientBoostingRDT(n_estimators=1, max_depth=10, split_criterion="newton", tree_method="hist",
-                            random_state=0, min_child_weight=0, max_hist_cache_mb=float(sys.argv[1]))
-    m.fit(X[:200], y[:200])  # warm up allocators and imports
+    kw = dict(n_estimators=1, max_depth=10, split_criterion="newton", tree_method="hist", random_state=0,
+              min_child_weight=0)
+    GradientBoostingRDT(max_hist_cache_mb=0, **kw).fit(X[:200], y[:200])  # warm up allocators and imports
+    m = GradientBoostingRDT(max_hist_cache_mb=float(sys.argv[1]), **kw)
     before = peak()
     m.fit(X, y)
     print(peak() - before)
@@ -359,9 +374,11 @@ def test_cache_budget_bounds_memory():
     # The full cache of this tree is ~200 MiB (depth 8 keeps ~256 nodes x 400 features x 256 bins
     # x 20 B for depth 9). A budget bounds what the cache adds to the peak (one buffer per depth,
     # freed as soon as the next depth is scored).
+    # Measured (macOS arm64 and Linux): direct ~10 MiB, bounded ~direct + 32 MiB, unbounded ~150 MiB.
     direct, bounded, unbounded = growth(0), growth(32), growth(4096)
     assert bounded < direct + (32 + 16) * 2**20, (direct / 2**20, bounded / 2**20)
-    assert unbounded > bounded + 100 * 2**20, (bounded / 2**20, unbounded / 2**20)
+    # Without a budget the cache adds far more than the bound above allows, so that bound has teeth.
+    assert unbounded > direct + 100 * 2**20, (direct / 2**20, unbounded / 2**20)
 
 
 _MULTICLASS_MEMORY_SCRIPT = textwrap.dedent("""
@@ -370,16 +387,24 @@ _MULTICLASS_MEMORY_SCRIPT = textwrap.dedent("""
     from rdt.ensemble import GradientBoostingRDT
 
     def peak():
+        if sys.platform.startswith("linux"):
+            # VmHWM: this process's own peak. Linux carries ru_maxrss across execve, so it would
+            # start at the RSS of the (pytest) process that forked this one.
+            with open("/proc/self/status") as f:
+                return next(int(line.split()[1]) for line in f if line.startswith("VmHWM:")) * 1024
         r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         return r if sys.platform == "darwin" else r * 1024
 
     rng = np.random.default_rng(0)
     n, p = 20000, 200
-    X = rng.standard_normal((n, p)).astype(np.float32)
+    X = np.empty((n, p), dtype=np.float32)  # filled in blocks (see above)
+    for i in range(0, n, 500):
+        X[i:i + 500] = rng.standard_normal((500, p))
     y = np.digitize(X[:, 0] + X[:, 1] + rng.standard_normal(n), [-1.2, -0.4, 0.4, 1.2]).astype(float)
-    m = GradientBoostingRDT(n_estimators=2, max_depth=10, split_criterion="newton", tree_method="hist",
-                            random_state=0, min_child_weight=0, n_jobs=1, max_hist_cache_mb=float(sys.argv[1]))
-    m.fit(X[:300], y[:300])  # warm up allocators and imports
+    kw = dict(n_estimators=2, max_depth=10, split_criterion="newton", tree_method="hist", random_state=0,
+              min_child_weight=0, n_jobs=1)
+    GradientBoostingRDT(max_hist_cache_mb=0, **kw).fit(X[:300], y[:300])  # warm up allocators and imports
+    m = GradientBoostingRDT(max_hist_cache_mb=float(sys.argv[1]), **kw)
     before = peak()
     m.fit(X, y)
     print(peak() - before)

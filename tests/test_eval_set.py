@@ -559,6 +559,11 @@ _EVAL_MEMORY_SCRIPT = textwrap.dedent("""
     from rdt.ensemble import GradientBoostingRDT
 
     def peak():
+        if sys.platform.startswith("linux"):
+            # VmHWM: this process's own peak. Linux carries ru_maxrss across execve, so it would
+            # start at the RSS of the (pytest) process that forked this one.
+            with open("/proc/self/status") as f:
+                return next(int(line.split()[1]) for line in f if line.startswith("VmHWM:")) * 1024
         r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         return r if sys.platform == "darwin" else r * 1024
 

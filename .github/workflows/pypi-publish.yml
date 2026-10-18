@@ -12,12 +12,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Concrete runner labels (not -latest) so a release is built on a known
+        # image: x86_64 manylinux, win_amd64 (VS 2026 toolset) and macOS arm64.
+        os: [ubuntu-24.04, windows-2025-vs2026, macos-26]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.21
+        uses: pypa/cibuildwheel@v4.2.1
         env:
           # cp39 dropped: EOL upstream, and it's also the specific version
           # that failed to cross-build for macOS arm64 in CI (see commit
@@ -25,23 +27,32 @@ jobs:
           CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
           CIBW_SKIP: "*-musllinux* *_i686 *-win32 pp*"
           CIBW_BUILD_VERBOSITY: 1
+          # cibuildwheel 3/4 changed these defaults; pin the 2.x behaviour so
+          # the wheels stay as released in 0.3.0:
+          # - manylinux2014 (manylinux_2_17) instead of manylinux_2_28
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
+          # - `pip wheel` instead of `python -m build`
+          CIBW_BUILD_FRONTEND: pip
+          # - no Windows repair step instead of delvewheel (which would bundle
+          #   msvcp140.dll into the wheel)
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: ""
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
 
   build_sdist:
     name: Build sdist
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
       - run: pip install build
       - run: python -m build --sdist --outdir dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -50,21 +61,21 @@ jobs:
     name: Publish to TestPyPI
     if: github.event_name == 'workflow_dispatch'
     needs: [build_wheels, build_sdist]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: testpypi
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.1
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.1
         with:
           name: sdist
           path: dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@v1.14.2
         with:
           repository-url: https://test.pypi.org/legacy/
 
@@ -72,18 +83,18 @@ jobs:
     name: Publish to PyPI
     if: github.event_name == 'release'
     needs: [build_wheels, build_sdist]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: pypi
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.1
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.1
         with:
           name: sdist
           path: dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@v1.14.2

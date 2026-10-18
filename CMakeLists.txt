@@ -8,6 +8,16 @@ add_library(rdt_core INTERFACE)
 target_include_directories(rdt_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/core/include)
 target_compile_features(rdt_core INTERFACE cxx_std_17)
 
+# GCC defaults to -ffp-contract=fast: wherever the target has FMA (every
+# aarch64 build, for one) it fuses a multiply and an add into one FMA -- one
+# rounding instead of two -- even across statements. The exact and hist split
+# searches then round the same sums differently, so hist stops equalling exact
+# bit for bit on few-valued data (test_hist_honours_the_level_subsets failed
+# on aarch64 Linux), and results drift from the x86_64 builds, which have no
+# FMA at GCC's default -march. Clang (whose default contracts only within one
+# expression) and MSVC are left alone.
+target_compile_options(rdt_core INTERFACE $<$<CXX_COMPILER_ID:GNU>:-ffp-contract=off>)
+
 # thread_pool.hpp uses std::thread; on Linux/macOS (GCC/Clang) that needs an
 # explicit pthread link, unlike MSVC where it's implicit -- without this, the
 # core builds fine (header-only) but linking anything against it fails on

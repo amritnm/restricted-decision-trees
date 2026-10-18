@@ -15,16 +15,14 @@ from rdt import RDT
 from rdt.ensemble import GradientBoostingRDT, RandomForestRDT
 from rdt.visualize import export_tree_dict, print_tree
 
+from _peak_rss import PEAK_RSS, require_peak_rss  # tests/_peak_rss.py
+
 
 # --------------------------------------------------------------------------- no copies of X
-_PREDICT_MEMORY_SCRIPT = textwrap.dedent("""
-    import resource, sys
+_PREDICT_MEMORY_SCRIPT = PEAK_RSS + textwrap.dedent("""
+    import sys
     import numpy as np
     from rdt.ensemble import GradientBoostingRDT, RandomForestRDT
-
-    def peak():
-        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return r if sys.platform == "darwin" else r * 1024
 
     kind = sys.argv[1]
     rng = np.random.default_rng(0)
@@ -48,7 +46,7 @@ _PREDICT_MEMORY_SCRIPT = textwrap.dedent("""
 
 @pytest.mark.parametrize("kind", ["gb", "rf"])
 def test_predict_does_not_copy_X(kind):
-    pytest.importorskip("resource")
+    require_peak_rss()
     out = subprocess.run([sys.executable, "-c", _PREDICT_MEMORY_SCRIPT, kind],
                          capture_output=True, text=True, check=True).stdout.split()
     growth, x_bytes = int(out[0]), int(out[1])

@@ -46,9 +46,9 @@ jobs:
           - os: windows-latest
             python: "3.12"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -89,18 +89,21 @@ jobs:
 
   wheel-smoke-windows:
     # Builds one Windows wheel the way pypi-publish.yml does (same cibuildwheel
-    # pin), installs it in a clean environment and runs a few tests against it.
-    # Nothing is uploaded or published.
+    # pin and build options), installs it in a clean environment and runs a few
+    # tests against it. Nothing is uploaded or published.
     name: cibuildwheel smoke (windows, cp312)
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Build and test a wheel (not published)
-        uses: pypa/cibuildwheel@v2.21
+        uses: pypa/cibuildwheel@v4.2.1
         env:
           CIBW_BUILD: "cp312-win_amd64"
+          # Keep in sync with pypi-publish.yml (see the comments there).
+          CIBW_BUILD_FRONTEND: pip
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: ""
           CIBW_BUILD_VERBOSITY: 1
           CIBW_TEST_REQUIRES: pytest numpy scikit-learn
           CIBW_TEST_COMMAND: pytest {project}/tests/test_rdt.py {project}/tests/test_ensemble.py -ra
